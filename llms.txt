@@ -1,0 +1,196 @@
+# Sirr (سر) — Ephemeral Secret Vault
+
+Sirr is a self-hosted ephemeral secret vault with multi-tenant support.
+Single Rust binary, zero runtime dependencies, end-to-end encrypted.
+
+## What It Does
+
+- Store secrets with TTL (time-to-live) and/or read limits
+- Secrets auto-delete when expired or after N reads
+- Multi-tenant: organizations, principals, roles, and named API keys
+- Bearer token authentication, ChaCha20Poly1305 encryption at rest
+- File-based master key delivery for production (avoids env var exposure)
+- Audit logging for all secret operations
+- Patchable secrets (seal instead of burn, update value via PATCH)
+- CLI, HTTP API, Node.js SDK, Python SDK, .NET SDK, MCP server
+
+## Primary Use Cases
+
+- Share database credentials with AI assistants that auto-expire (read-once)
+- CI/CD tokens that burn after a single deploy
+- Team secret management with role-based access control
+- Contractor API access with automatic expiry
+- Team .env sync with rolling TTL
+
+## Authentication
+
+Two auth modes:
+- **Master key** (`SIRR_API_KEY`): full access, used for bootstrapping and public bucket writes
+- **Principal key** (Bearer token): org-scoped, role-based permissions, time-windowed
+
+## HTTP API — Public Bucket (backward compatible)
+
+Reads are unauthenticated. Writes require master key.
+
+POST   /secrets          Store a secret: {key, value, ttl_seconds?, max_reads?, delete?}
+GET    /secrets          List metadata (no values returned, requires master key)
+GET    /secrets/:key     Retrieve + decrement read counter (404 if expired/burned)
+HEAD   /secrets/:key     Check existence without consuming a read
+PATCH  /secrets/:key     Update value (only if delete=false, requires master key)
+DELETE /secrets/:key     Immediate delete (requires master key)
+POST   /prune            Delete all expired secrets now
+GET    /health           Health check (no auth required)
+
+## HTTP API — Org-Scoped (multi-tenant)
+
+All org routes require principal key auth (`Authorization: Bearer <key>`).
+
+### Org management (master key only)
+POST   /orgs                              Create org: {name}
+GET    /orgs                              List orgs
+DELETE /orgs/:org_id                      Delete org (must have no principals)
+
+### Principal management (master key only)
+POST   /orgs/:org_id/principals           Create principal: {name, role}
+GET    /orgs/:org_id/principals           List principals
+DELETE /orgs/:org_id/principals/:id       Delete principal (must have no keys)
+
+### Role management (master key only)
+POST   /orgs/:org_id/roles               Create custom role: {name, permissions}
+GET    /orgs/:org_id/roles               List roles
+DELETE /orgs/:org_id/roles/:name         Delete custom role
+
+### Self-service (any principal)
+GET    /me                                Current principal info + keys
+PATCH  /me                                Update display name / metadata
+POST   /me/keys                           Create named API key
+DELETE /me/keys/:key_id                   Delete own key
+
+### Org-scoped secrets (permission-based)
+POST   /orgs/:org_id/secrets              Create secret (CreateSecret perm)
+GET    /orgs/:org_id/secrets              List secrets (ListOrg or ListMy)
+GET    /orgs/:org_id/secrets/:key         Read secret (ReadOrg or ReadMy)
+HEAD   /orgs/:org_id/secrets/:key         Check secret (ReadOrg or ReadMy)
+PATCH  /orgs/:org_id/secrets/:key         Update sealed secret (PatchOrg or PatchMy)
+DELETE /orgs/:org_id/secrets/:key         Delete secret (DeleteOrg or DeleteMy)
+POST   /orgs/:org_id/prune               Prune expired (Prune perm)
+
+### Org audit & webhooks
+GET    /orgs/:org_id/audit                Query audit log (AuditRead perm)
+POST   /orgs/:org_id/webhooks            Register webhook (WebhookManage perm)
+GET    /orgs/:org_id/webhooks            List webhooks (WebhookManage perm)
+DELETE /orgs/:org_id/webhooks/:id        Delete webhook (WebhookManage perm)
+
+## Built-in Roles
+
+| Role   | Permissions         | Description                              |
+|--------|---------------------|------------------------------------------|
+| reader | rla                 | Read own secrets, list own, own account  |
+| writer | rlcpdam             | CRUD own secrets + manage account        |
+| admin  | rRlLcCpPaAmMdD      | Full org access, manage principals/roles |
+| owner  | rRlLcCpPaAmMSdD     | Admin + SirrAdmin (manage orgs)          |
+
+15 permission bits: r(ReadMy) R(ReadOrg) l(ListMy) L(ListOrg) c(CreateSecret) C(reserved)
+p(PatchMy) P(PatchOrg) a(AccountSelf) A(AccountAdmin) m(DeleteMy) M(DeleteOrg)
+d(Prune) D(AuditRead) S(SirrAdmin)
+
+## CLI
+
+sirrd serve                              Start server
+sirrd serve --init                       Start + auto-create default org/admin/keys
+sirr push KEY=value [--ttl 1h] [--reads 1] [--org ORG]
+sirr push .env [--ttl 24h] [--org ORG]  Push all keys from .env file
+sirr get KEY [--org ORG]                 Print value to stdout
+sirr pull .env [--org ORG]               Write all secrets to .env file
+sirr run [--org ORG] -- <cmd>            Exec command with secrets as env vars
+sirr share KEY [--org ORG]               Print URL reference
+sirr list [--org ORG]                    Show active secrets (metadata)
+sirr delete KEY [--org ORG]
+sirr prune [--org ORG]                   Delete all expired now
+sirr orgs list|create|delete             Org management (master key)
+sirr principals list|create|delete --org Manage principals (master key)
+sirr me info|keys|create-key|delete-key  Self-service (principal key)
+sirr audit [--org ORG]                   Query audit log
+sirr webhooks list|add|remove [--org ORG]
+
+## Environment Variables
+
+SIRR_API_KEY           Master key for server auth
+SIRR_LICENSE_KEY       License key for tier limits (get at sirrlock.com/pricing)
+SIRR_PORT              HTTP port (default: 39999)
+SIRR_HOST              Bind address (default: 0.0.0.0)
+SIRR_DATA_DIR          Storage dir (default: ~/.local/share/sirr/)
+SIRR_SERVER            CLI: server URL (default: sirr://localhost:39999)
+SIRR_TOKEN             CLI: bearer token
+SIRR_ORG               CLI/MCP: org ID for multi-tenant mode
+ENABLE_PUBLIC_BUCKET   Set to false to disable legacy /secrets routes (default: true)
+SIRR_AUTOINIT          Set to true to auto-create org/admin on first boot
+
+## SDKs
+
+### Node.js (@sirr/sdk)
+import { SirrClient } from '@sirr/sdk'
+const c = new SirrClient({ server: '...', token: '...', org: 'my-org' })
+await c.push('KEY', 'value', { ttl: 3600, reads: 1 })
+const v = await c.get('KEY')
+await c.me()
+await c.createOrg({ name: 'team' })
+
+### Python (sirr)
+from sirr import SirrClient
+c = SirrClient(server='...', token='...', org='my-org')
+c.push('KEY', 'value', ttl=3600, max_reads=1)
+v = c.get('KEY')
+c.me()
+c.create_org(name='team')
+
+### .NET (Sirr.Client)
+var client = new SirrClient(new SirrOptions { Server = "...", Token = "...", Org = "my-org" });
+await client.PushAsync("KEY", "value");
+var v = await client.GetAsync("KEY");
+await client.GetMeAsync();
+
+## MCP Server (@sirrlock/mcp)
+
+Configure in .mcp.json with SIRR_SERVER, SIRR_TOKEN, and optionally SIRR_ORG.
+Tools: get_secret, push_secret, list_secrets, delete_secret, prune_secrets,
+       sirr_me, sirr_create_key, sirr_delete_key
+
+## Security Model
+
+- Master key delivered via file or env var (SIRR_API_KEY)
+- ChaCha20Poly1305 encrypts each secret value with a random per-record nonce
+- Encryption key is a random 32-byte file (sirr.key), generated on first boot
+- Metadata (TTL, read count) stored plaintext for efficient expiry scanning
+- Constant-time bearer token comparison prevents timing attacks
+- Org isolation: principals can only access secrets in their own org
+- Ownership enforcement: *My permissions restrict access to own secrets only
+- Key binding: secrets can restrict which named keys can read them (allowed_keys)
+- Audit logging on all CRUD operations
+- No telemetry, no phone-home
+
+## Storage
+
+- sirr.db   — redb embedded key-value database (single file)
+- sirr.key  — 32-byte encryption key, generated on first run
+
+## Licensing
+
+BSL 1.1: source-available, converts to Apache 2.0 on February 20, 2028.
+
+| Tier        | Orgs | Principals | Price      |
+|-------------|------|------------|------------|
+| Solo (free) | 1    | 1          | $0         |
+| Solo+       | 1    | 5          | $199/year  |
+| Team        | 1    | unlimited  | $499/year  |
+| Business    | unlimited | unlimited | $1,999/year |
+
+License keys at: https://sirrlock.com/pricing
+
+## Repository Layout
+
+crates/sirr-server/   Rust library: axum server, redb store, crypto, auth, org handlers
+crates/sirr/          Rust binary: CLI client (clap + reqwest)
+crates/sirrd/         Rust binary: server daemon
+Dockerfile            FROM scratch + musl binary
+docker-compose.yml    Production setup with key file mount

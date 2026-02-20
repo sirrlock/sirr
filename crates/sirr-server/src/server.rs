@@ -1,0 +1,744 @@
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use axum::{
+    extract::Request,
+    middleware,
+    middleware::Next,
+    response::{IntoResponse, Response},
+    routing::{delete, get, head, patch, post},
+    Router,
+};
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::TraceLayer;
+use tracing::{info, warn};
+
+use crate::{
+    auth::{require_auth, require_master_key},
+    handlers::{
+        audit_events, create_secret, create_webhook, delete_secret, delete_webhook, get_secret,
+        head_secret, health, list_secrets, list_webhooks, patch_secret, prune_secrets,
+    },
+    license,
+    org_handlers::{
+        create_key, create_org, create_org_secret, create_org_webhook, create_principal,
+        create_role, delete_key, delete_org, delete_org_secret, delete_org_webhook,
+        delete_principal, delete_role, get_me, get_org_secret, head_org_secret, list_org_secrets,
+        list_org_webhooks, list_orgs, list_principals, list_roles, org_audit_events, patch_me,
+        patch_org_secret, prune_org_secrets,
+    },
+    AppState,
+};
+
+pub struct ServerConfig {
+    pub host: String,
+    pub port: u16,
+    pub api_key: Option<String>,
+    pub license_key: Option<String>,
+    pub data_dir: Option<PathBuf>,
+    pub sweep_interval: Duration,
+    pub cors_origins: Option<String>,
+    /// Comma-separated HTTP methods allowed in CORS responses ($SIRR_CORS_METHODS).
+    /// Only meaningful when `SIRR_CORS_ORIGINS` is also set.
+    /// Defaults to all methods when unset. Example: `GET,HEAD`.
+    pub cors_methods: Option<String>,
+    pub audit_retention_days: u64,
+    pub validation_url: String,
+    pub validation_cache_secs: u64,
+    /// Set `SIRR_HEARTBEAT=false` to disable instance heartbeat reporting.
+    pub heartbeat: bool,
+    /// Signing key for per-secret webhook URLs ($SIRR_WEBHOOK_SECRET).
+    pub webhook_secret: Option<String>,
+    /// Instance identifier for webhook event payloads ($SIRR_INSTANCE_ID).
+    pub instance_id: Option<String>,
+    /// Effective log level string shown in the startup banner.
+    pub log_level: String,
+    /// Set `NO_BANNER=1` to suppress the startup banner.
+    pub no_banner: bool,
+    /// When true, key names in /audit responses are hashed instead of returned verbatim.
+    /// Set `SIRR_AUDIT_REDACT_KEYS=1` to enable.
+    pub redact_audit_keys: bool,
+    /// Comma-separated URL prefixes allowed as per-secret webhook targets.
+    /// Empty (default) disables per-secret webhook_url entirely.
+    /// Example: `SIRR_WEBHOOK_ALLOWED_ORIGINS=https://hooks.example.com`
+    pub webhook_allowed_origins: String,
+    /// Comma-separated CIDR list of trusted reverse-proxy IPs ($SIRR_TRUSTED_PROXIES).
+    /// X-Forwarded-For / X-Real-IP are only trusted when the socket peer is in this list.
+    /// Empty string (default) means proxy headers are never trusted.
+    pub trusted_proxies: String,
+    /// Per-IP steady-state request rate (requests/second). $SIRR_RATE_LIMIT_PER_SECOND.
+    pub rate_limit_per_second: u64,
+    /// Per-IP burst allowance (tokens). $SIRR_RATE_LIMIT_BURST.
+    pub rate_limit_burst: u32,
+    /// Set when `SIRR_API_KEY` was absent and a key was auto-generated.
+    /// The value is the raw generated key, printed in the security notice.
+    pub auto_generated_key: Option<String>,
+    /// Set `NO_SECURITY_BANNER=1` to suppress the mandatory security notice
+    /// shown when a key is auto-generated.  Has no effect when `api_key` was
+    /// explicitly configured via `SIRR_API_KEY`.
+    pub no_security_banner: bool,
+    /// When true (default), the legacy public /secrets bucket routes are
+    /// enabled. Set `ENABLE_PUBLIC_BUCKET=false` or `0` to disable them
+    /// and only serve multi-tenant org-scoped routes.
+    pub enable_public_bucket: bool,
+    /// When true, auto-initialize with a default org and admin principal
+    /// if no orgs exist yet. Triggered by `--init` or `SIRR_AUTOINIT=true`.
+    pub auto_init: bool,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: std::env::var("SIRR_HOST").unwrap_or_else(|_| "0.0.0.0".into()),
+            port: std::env::var("SIRR_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(39999),
+            api_key: std::env::var("SIRR_API_KEY").ok(),
+            license_key: std::env::var("SIRR_LICENSE_KEY").ok(),
+            data_dir: std::env::var("SIRR_DATA_DIR").ok().map(PathBuf::from),
+            sweep_interval: Duration::from_secs(300),
+            cors_origins: std::env::var("SIRR_CORS_ORIGINS").ok(),
+            cors_methods: std::env::var("SIRR_CORS_METHODS").ok(),
+            audit_retention_days: std::env::var("SIRR_AUDIT_RETENTION_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
+            validation_url: std::env::var("SIRR_VALIDATION_URL")
+                .unwrap_or_else(|_| "https://sirrlock.com/api/validate".into()),
+            validation_cache_secs: std::env::var("SIRR_VALIDATION_CACHE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3600),
+            heartbeat: std::env::var("SIRR_HEARTBEAT")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true),
+            webhook_secret: std::env::var("SIRR_WEBHOOK_SECRET").ok(),
+            instance_id: std::env::var("SIRR_INSTANCE_ID").ok(),
+            log_level: std::env::var("SIRR_LOG_LEVEL").unwrap_or_else(|_| "warn".into()),
+            no_banner: std::env::var("NO_BANNER")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            webhook_allowed_origins: std::env::var("SIRR_WEBHOOK_ALLOWED_ORIGINS")
+                .unwrap_or_default(),
+            redact_audit_keys: std::env::var("SIRR_AUDIT_REDACT_KEYS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            trusted_proxies: std::env::var("SIRR_TRUSTED_PROXIES").unwrap_or_default(),
+            rate_limit_per_second: std::env::var("SIRR_RATE_LIMIT_PER_SECOND")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10),
+            rate_limit_burst: std::env::var("SIRR_RATE_LIMIT_BURST")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
+            auto_generated_key: None,
+            no_security_banner: std::env::var("NO_SECURITY_BANNER")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            enable_public_bucket: std::env::var("ENABLE_PUBLIC_BUCKET")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true),
+            auto_init: std::env::var("SIRR_AUTOINIT")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
+        }
+    }
+}
+
+/// Read a master key from a file, trimming surrounding whitespace.
+/// Fails if the file cannot be read or is empty after trimming.
+pub fn read_key_file(path: &std::path::Path) -> Result<String> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("read key file: {}", path.display()))?;
+    let key = content.trim().to_string();
+    if key.is_empty() {
+        anyhow::bail!("key file is empty: {}", path.display());
+    }
+    Ok(key)
+}
+
+/// Resolve the master key from `SIRR_MASTER_KEY_FILE` (preferred) or `SIRR_MASTER_KEY`.
+/// File-based delivery is recommended for production — env vars are visible via
+/// `docker inspect` and `/proc`.
+pub fn resolve_master_key() -> Result<String> {
+    if let Ok(path) = std::env::var("SIRR_MASTER_KEY_FILE") {
+        let key = read_key_file(std::path::Path::new(&path))?;
+        if std::env::var("SIRR_MASTER_KEY").is_ok() {
+            tracing::warn!("both SIRR_MASTER_KEY and SIRR_MASTER_KEY_FILE are set; using file");
+        }
+        return Ok(key);
+    }
+    std::env::var("SIRR_MASTER_KEY")
+        .context("SIRR_MASTER_KEY or SIRR_MASTER_KEY_FILE environment variable is required")
+}
+
+/// Resolve the data directory and load the persisted salt.
+/// Public so the CLI rotate command can reuse this logic.
+pub fn resolve_data_dir(data_dir: Option<&PathBuf>) -> Result<PathBuf> {
+    match data_dir {
+        Some(d) => {
+            std::fs::create_dir_all(d).context("create data dir")?;
+            Ok(d.clone())
+        }
+        None => {
+            let d = std::env::var("SIRR_DATA_DIR").ok().map(PathBuf::from);
+            match d {
+                Some(d) => {
+                    std::fs::create_dir_all(&d).context("create data dir")?;
+                    Ok(d)
+                }
+                None => crate::dirs::data_dir(),
+            }
+        }
+    }
+}
+
+pub async fn run(cfg: ServerConfig) -> Result<()> {
+    // Resolve data directory.
+    let data_dir = resolve_data_dir(cfg.data_dir.as_ref())?;
+
+    info!(data_dir = %data_dir.display(), "using data directory");
+
+    // Load or generate the encryption key.
+    // Read raw key bytes for instance ID generation (before they're wrapped).
+    let key_path = data_dir.join("sirr.key");
+    let enc_key = load_or_create_key(&data_dir)?;
+    let key_bytes_for_id = std::fs::read(&key_path).ok();
+
+    // Open redb store.
+    let db_path = data_dir.join("sirr.db");
+    let store = crate::store::Store::open(&db_path, enc_key).context("open store")?;
+
+    // Auto-init bootstrap: create default org + admin principal + keys if no orgs exist.
+    if cfg.auto_init {
+        auto_init_bootstrap(&store)?;
+    }
+
+    // Resolve instance ID for webhook payloads.
+    let webhook_instance_id = cfg
+        .instance_id
+        .clone()
+        .unwrap_or_else(|| gethostname().unwrap_or_else(|| "unknown".into()));
+
+    // Parse per-secret webhook URL allowlist.
+    let webhook_allowed_origins: Vec<String> = cfg
+        .webhook_allowed_origins
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let webhook_allowed_origins = std::sync::Arc::new(webhook_allowed_origins);
+
+    // Initialize webhook sender.
+    let webhook_sender = crate::webhooks::WebhookSender::new(
+        store.clone(),
+        webhook_instance_id,
+        cfg.webhook_secret.clone(),
+        webhook_allowed_origins.clone(),
+    );
+
+    // Spawn background sweeps (with webhook sender for expired events).
+    store
+        .clone()
+        .spawn_sweep(cfg.sweep_interval, Some(webhook_sender.clone()));
+    let retention_secs = (cfg.audit_retention_days * 86400) as i64;
+    store
+        .clone()
+        .spawn_audit_sweep(cfg.sweep_interval, retention_secs);
+
+    // Validate license key.
+    let lic_status = license::effective_status(cfg.license_key.as_deref());
+    match &lic_status {
+        license::LicenseStatus::Free => {
+            info!("running on free tier (Solo limits)");
+        }
+        license::LicenseStatus::Licensed(tier) => {
+            info!(?tier, "license key accepted");
+        }
+        license::LicenseStatus::Invalid(reason) => {
+            anyhow::bail!("invalid SIRR_LICENSE_KEY: {reason}");
+        }
+    }
+
+    // Print startup banner (before any values are moved into AppState).
+    print_banner(&cfg, &data_dir, &lic_status);
+    // Always printed when a key was auto-generated; bypasses NO_BANNER.
+    print_security_notice(&cfg);
+
+    // Derive the heartbeat endpoint from the validation URL base.
+    let heartbeat_url = cfg
+        .validation_url
+        .replace("/api/validate", "/api/instances/heartbeat");
+
+    // Set up online license validation if a license key is configured and format is valid.
+    let validator = if matches!(lic_status, license::LicenseStatus::Licensed(_)) {
+        if let Some(ref key) = cfg.license_key {
+            let v = crate::validator::OnlineValidator::new(
+                key.clone(),
+                cfg.validation_url,
+                cfg.validation_cache_secs,
+                259200, // 72-hour grace period
+            );
+            let valid = v.validate_startup(&store).await;
+            if !valid {
+                warn!("license rejected online — server will enforce free-tier limits above 100 secrets");
+            }
+            Some(v)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Spawn instance heartbeat if enabled and a license key is present.
+    if cfg.heartbeat {
+        if let (Some(ref license_key), Some(ref raw_bytes)) = (&cfg.license_key, &key_bytes_for_id)
+        {
+            let instance_id = crate::heartbeat::instance_id_from_key(raw_bytes);
+            info!(instance_id = %instance_id, "starting instance heartbeat");
+            crate::heartbeat::spawn_heartbeat(crate::heartbeat::HeartbeatConfig {
+                endpoint: heartbeat_url,
+                license_key: license_key.clone(),
+                instance_id,
+                store: store.clone(),
+            });
+        }
+    }
+
+    let trusted_proxies: Vec<ipnet::IpNet> = cfg
+        .trusted_proxies
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            s.parse().ok().or_else(|| {
+                // Plain IP address — treat as /32 or /128.
+                s.parse::<std::net::IpAddr>().ok().map(ipnet::IpNet::from)
+            })
+        })
+        .collect();
+    if !trusted_proxies.is_empty() {
+        info!(
+            proxies = ?trusted_proxies,
+            "X-Forwarded-For trusted for listed proxy CIDRs"
+        );
+    }
+
+    let enable_public_bucket = cfg.enable_public_bucket;
+
+    let state = AppState {
+        store,
+        api_key: cfg.api_key,
+        license: lic_status,
+        validator,
+        webhook_sender: Some(webhook_sender),
+        trusted_proxies: std::sync::Arc::new(trusted_proxies),
+        redact_audit_keys: cfg.redact_audit_keys,
+        webhook_allowed_origins,
+        enable_public_bucket,
+    };
+
+    // Per-IP rate limiting: configurable via SIRR_RATE_LIMIT_PER_SECOND / SIRR_RATE_LIMIT_BURST.
+    // Protects public endpoints from enumeration and write-amplification abuse.
+    let governor_conf = GovernorConfigBuilder::default()
+        .per_second(cfg.rate_limit_per_second)
+        .burst_size(cfg.rate_limit_burst)
+        .finish()
+        .expect("invalid rate-limit configuration");
+    // Periodically evict stale IP entries to bound memory usage.
+    let governor_limiter = governor_conf.limiter().clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            governor_limiter.retain_recent();
+        }
+    });
+
+    let cors = build_cors(cfg.cors_origins.as_deref(), cfg.cors_methods.as_deref());
+
+    // Public informational routes (no auth, CORS allowed).
+    let public = Router::new()
+        .route("/health", get(health))
+        .route("/robots.txt", get(robots_txt))
+        .route("/security.txt", get(security_txt))
+        .route("/.well-known/security.txt", get(security_txt))
+        .layer(cors.clone());
+
+    // Org-protected routes (require_auth middleware: master key or principal key).
+    let org_protected = Router::new()
+        // Org management
+        .route("/orgs", post(create_org))
+        .route("/orgs", get(list_orgs))
+        .route("/orgs/{org_id}", delete(delete_org))
+        // Principals
+        .route("/orgs/{org_id}/principals", post(create_principal))
+        .route("/orgs/{org_id}/principals", get(list_principals))
+        .route("/orgs/{org_id}/principals/{id}", delete(delete_principal))
+        // Roles
+        .route("/orgs/{org_id}/roles", post(create_role))
+        .route("/orgs/{org_id}/roles", get(list_roles))
+        .route("/orgs/{org_id}/roles/{name}", delete(delete_role))
+        // Principal self-service
+        .route("/me", get(get_me))
+        .route("/me", patch(patch_me))
+        .route("/me/keys", post(create_key))
+        .route("/me/keys/{key_id}", delete(delete_key))
+        // Org secrets
+        .route("/orgs/{org_id}/secrets", post(create_org_secret))
+        .route("/orgs/{org_id}/secrets", get(list_org_secrets))
+        .route("/orgs/{org_id}/secrets/{key}", get(get_org_secret))
+        .route("/orgs/{org_id}/secrets/{key}", head(head_org_secret))
+        .route("/orgs/{org_id}/secrets/{key}", patch(patch_org_secret))
+        .route("/orgs/{org_id}/secrets/{key}", delete(delete_org_secret))
+        .route("/orgs/{org_id}/prune", post(prune_org_secrets))
+        // Org audit + webhooks
+        .route("/orgs/{org_id}/audit", get(org_audit_events))
+        .route("/orgs/{org_id}/webhooks", post(create_org_webhook))
+        .route("/orgs/{org_id}/webhooks", get(list_org_webhooks))
+        .route("/orgs/{org_id}/webhooks/{id}", delete(delete_org_webhook))
+        .layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .layer(cors.clone());
+
+    // Build the merged app depending on whether the public bucket is enabled.
+    let app = if enable_public_bucket {
+        // Public bucket open routes: reads and creates carry NO CORS layer intentionally.
+        // Without Access-Control-Allow-Origin, browsers block cross-origin reads,
+        // preventing a malicious webpage from silently exfiltrating secrets.
+        // Non-browser clients (sirr CLI, curl) are unaffected.
+        // POST /secrets is also open: the secret key itself is the access token,
+        // so writes don't require the master key any more than reads do.
+        let secret_public = Router::new()
+            .route("/secrets", post(create_secret))
+            .route("/secrets/{key}", get(get_secret))
+            .route("/secrets/{key}", head(head_secret));
+
+        // Protected public bucket routes (require_master_key middleware).
+        let protected_public_bucket = Router::new()
+            .route("/secrets", get(list_secrets))
+            .route("/secrets/{key}", patch(patch_secret))
+            .route("/secrets/{key}", delete(delete_secret))
+            .route("/prune", post(prune_secrets))
+            .route("/audit", get(audit_events))
+            .route("/webhooks", post(create_webhook))
+            .route("/webhooks", get(list_webhooks))
+            .route("/webhooks/{id}", delete(delete_webhook))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_master_key,
+            ))
+            .layer(cors);
+
+        Router::new()
+            .merge(secret_public)
+            .merge(public)
+            .merge(protected_public_bucket)
+            .merge(org_protected)
+            .with_state(state)
+    } else {
+        Router::new()
+            .merge(public)
+            .merge(org_protected)
+            .with_state(state)
+    }
+    .layer(GovernorLayer::new(governor_conf))
+    .layer(middleware::from_fn(add_security_headers))
+    .layer(TraceLayer::new_for_http());
+
+    let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
+        .parse()
+        .context("invalid host/port")?;
+
+    info!(%addr, "sirr server listening");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .context("bind listener")?;
+
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("server error")
+}
+
+/// Auto-initialize with a default org, admin principal, and temporary keys.
+/// Only runs if no orgs exist yet.
+fn auto_init_bootstrap(store: &crate::store::Store) -> Result<()> {
+    use crate::store::org::{OrgRecord, PrincipalKeyRecord, PrincipalRecord};
+
+    // Check if any orgs exist already.
+    let orgs = store.list_orgs().context("list orgs for auto-init")?;
+    if !orgs.is_empty() {
+        info!("auto-init: orgs already exist, skipping bootstrap");
+        return Ok(());
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    // Generate IDs.
+    let org_id = format!("{:032x}", rand::random::<u128>());
+    let principal_id = format!("{:032x}", rand::random::<u128>());
+
+    // Create default org.
+    let org = OrgRecord {
+        id: org_id.clone(),
+        name: "default".to_string(),
+        metadata: std::collections::HashMap::new(),
+        created_at: now,
+    };
+    store.put_org(&org).context("auto-init: create org")?;
+
+    // Create admin principal.
+    let principal = PrincipalRecord {
+        id: principal_id.clone(),
+        org_id: org_id.clone(),
+        name: "admin".to_string(),
+        role: "admin".to_string(),
+        metadata: std::collections::HashMap::new(),
+        created_at: now,
+    };
+    store
+        .put_principal(&principal)
+        .context("auto-init: create principal")?;
+
+    // Create 2 temporary keys valid for 30 minutes.
+    let valid_before = now + 1800; // 30 minutes
+    let mut keys_output = Vec::new();
+
+    for i in 1..=2 {
+        // Generate a random API key and its SHA-256 hash.
+        let raw_key = {
+            let mut bytes = [0u8; 16];
+            rand::Rng::fill(&mut rand::thread_rng(), &mut bytes);
+            format!("sirr_key_{}", hex::encode(bytes))
+        };
+        let key_hash = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(raw_key.as_bytes()).to_vec()
+        };
+        let key_id = format!("{:016x}", rand::random::<u64>());
+
+        let key_record = PrincipalKeyRecord {
+            id: key_id.clone(),
+            principal_id: principal_id.clone(),
+            org_id: org_id.clone(),
+            name: format!("bootstrap-key-{i}"),
+            key_hash,
+            valid_after: now,
+            valid_before,
+            created_at: now,
+        };
+        store
+            .put_principal_key(&key_record)
+            .context("auto-init: create key")?;
+
+        keys_output.push((key_id, raw_key));
+    }
+
+    // Print bootstrap info to stdout.
+    eprintln!();
+    eprintln!("  ╔══════════════════════════════════════════════════════════════╗");
+    eprintln!("  ║  AUTO-INIT BOOTSTRAP                                       ║");
+    eprintln!("  ╚══════════════════════════════════════════════════════════════╝");
+    eprintln!();
+    eprintln!("  Default org created:");
+    eprintln!("    org_id:       {org_id}");
+    eprintln!("    name:         default");
+    eprintln!();
+    eprintln!("  Admin principal created:");
+    eprintln!("    principal_id: {principal_id}");
+    eprintln!("    name:         admin");
+    eprintln!("    role:         admin");
+    eprintln!();
+    eprintln!("  Temporary API keys (valid 30 minutes):");
+    for (kid, raw) in &keys_output {
+        eprintln!("    id={kid}  key={raw}");
+    }
+    eprintln!();
+    warn!("auto-init keys expire in 30 minutes — create permanent keys via `sirr me create-key`");
+    eprintln!();
+
+    Ok(())
+}
+
+fn load_or_create_key(data_dir: &std::path::Path) -> Result<crate::store::crypto::EncryptionKey> {
+    let key_path = data_dir.join("sirr.key");
+    if key_path.exists() {
+        let bytes = std::fs::read(&key_path).context("read sirr.key")?;
+        crate::store::crypto::load_key(&bytes).ok_or_else(|| {
+            anyhow::anyhow!(
+                "sirr.key is corrupt (expected 32 bytes, got {})",
+                bytes.len()
+            )
+        })
+    } else {
+        let key = crate::store::crypto::generate_key();
+        std::fs::write(&key_path, key.as_bytes()).context("write sirr.key")?;
+        info!("generated new encryption key");
+        Ok(key)
+    }
+}
+
+fn gethostname() -> Option<String> {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+fn print_banner(
+    cfg: &ServerConfig,
+    data_dir: &std::path::Path,
+    lic_status: &license::LicenseStatus,
+) {
+    if cfg.no_banner {
+        return;
+    }
+
+    let version = env!("CARGO_PKG_VERSION");
+    let addr = format!("http://{}:{}", cfg.host, cfg.port);
+
+    let token_source = if std::env::var("SIRR_MASTER_KEY_FILE").is_ok() {
+        "SIRR_MASTER_KEY_FILE"
+    } else {
+        "SIRR_MASTER_KEY"
+    };
+
+    let tier = match lic_status {
+        license::LicenseStatus::Free => "free  (Solo tier)".to_string(),
+        license::LicenseStatus::Licensed(ref t) => format!("licensed  ({t:?})"),
+        license::LicenseStatus::Invalid(_) => return,
+    };
+
+    // compact ASCII art: s i r r
+    eprintln!();
+    eprintln!("  ___ _          ");
+    eprintln!(" / __(_)_ _ _ _  ");
+    eprintln!(" \\__ \\ | '_| '_| ");
+    eprintln!(" |___/_|_| |_|   ");
+    eprintln!();
+    eprintln!("  sirr v{version}  ·  ephemeral secret vault");
+    eprintln!();
+    eprintln!("  address   {addr}");
+    eprintln!("  data      {}", data_dir.display());
+    eprintln!("  log       {}", cfg.log_level);
+    eprintln!("  token     {token_source}");
+    eprintln!("  tier      {tier}");
+    eprintln!();
+}
+
+/// Adds defensive security headers to every response and removes the `Server`
+/// header that would otherwise reveal the axum/hyper/tower stack.
+async fn add_security_headers(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    let h = response.headers_mut();
+    h.insert(
+        axum::http::header::HeaderName::from_static("x-content-type-options"),
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        axum::http::header::HeaderName::from_static("x-frame-options"),
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    h.insert(
+        axum::http::header::HeaderName::from_static("content-security-policy"),
+        axum::http::HeaderValue::from_static("default-src 'none'"),
+    );
+    h.remove(axum::http::header::SERVER);
+    response
+}
+
+/// Prints the mandatory security notice when a key was auto-generated.
+/// Bypasses `NO_BANNER`; only `NO_SECURITY_BANNER=1` can suppress it.
+fn print_security_notice(cfg: &ServerConfig) {
+    let Some(ref key) = cfg.auto_generated_key else {
+        return;
+    };
+    if cfg.no_security_banner {
+        return;
+    }
+    eprintln!();
+    eprintln!("  !! SECURITY NOTICE !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    eprintln!("  !!");
+    eprintln!("  !!  No SIRR_API_KEY was set.  A random key has been generated:");
+    eprintln!("  !!");
+    eprintln!("  !!    SIRR_API_KEY={key}");
+    eprintln!("  !!");
+    eprintln!("  !!  Copy this key and set it in your environment before exposing");
+    eprintln!("  !!  this server on any network.  It changes on every restart");
+    eprintln!("  !!  until you persist it as SIRR_API_KEY.");
+    eprintln!("  !!");
+    eprintln!("  !!  Suppress this notice: NO_SECURITY_BANNER=1");
+    eprintln!("  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    eprintln!();
+}
+
+async fn robots_txt() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        "User-agent: *\nDisallow: /\n",
+    )
+}
+
+async fn security_txt() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        concat!(
+            "Contact: mailto:security@sirr.dev\n",
+            "Expires: 2027-01-01T00:00:00.000Z\n",
+            "Preferred-Languages: en\n",
+            "Canonical: https://sirr.dev/.well-known/security.txt\n",
+            "Policy: https://sirr.dev/security\n",
+        ),
+    )
+}
+
+fn build_cors(origins: Option<&str>, methods: Option<&str>) -> CorsLayer {
+    // No origins configured → deny all cross-origin requests.
+    let Some(origins_str) = origins else {
+        return CorsLayer::new();
+    };
+
+    let allowed_origins: Vec<_> = origins_str
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+
+    // Parse SIRR_CORS_METHODS; fall back to all safe methods when unset.
+    let all_methods = [
+        http::Method::GET,
+        http::Method::HEAD,
+        http::Method::POST,
+        http::Method::PATCH,
+        http::Method::DELETE,
+        http::Method::OPTIONS,
+    ];
+    let allowed_methods: Vec<http::Method> = match methods {
+        None => all_methods.to_vec(),
+        Some(m) => m.split(',').filter_map(|s| s.trim().parse().ok()).collect(),
+    };
+
+    CorsLayer::new()
+        .allow_origin(allowed_origins)
+        .allow_methods(allowed_methods)
+        .allow_headers(Any)
+}
