@@ -1,0 +1,18 @@
+/target
+packages/mcp/dist
+packages/mcp/node_modules
+*.db
+*.salt
+.env
+client/
+.worktrees/
+
+# IDE
+.idea/
+
+# macOS
+.DS_Store
+
+# Local dev
+.claude/
+.playwright-mcp/
