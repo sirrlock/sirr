@@ -1,0 +1,31 @@
+# Business Source License 1.1
+
+## Parameters
+
+- **Licensor:** SirrVault
+- **Licensed Work:** Sirr
+- **Change Date:** 2028-02-20 (4 years from first release)
+- **Change License:** Apache License 2.0
+
+## Usage Grant
+
+The Licensor grants you the right to copy, modify, create derivative works, 
+redistribute, and make non-production use of the Licensed Work. The Licensor 
+grants you a limited production-use license if your use does not exceed 
+100 stored secrets per instance.
+
+Production use exceeding 100 secrets requires a commercial license from the Licensor.
+
+## Additional Use Grant
+
+You may make production use of the Licensed Work if:
+- Your use does not exceed 100 secrets per instance, OR
+- You have purchased a commercial license
+
+## Notice
+
+On the Change Date, the license automatically converts to Apache License 2.0.
+
+---
+
+Full BSL 1.1 text: https://mariadb.com/bsl11/
