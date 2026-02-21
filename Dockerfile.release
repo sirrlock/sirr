@@ -1,0 +1,16 @@
+# Dockerfile.release — used by CI with pre-built musl binaries
+FROM scratch
+ARG TARGETARCH
+COPY dist/${TARGETARCH}/sirr /sirr
+
+# Data directory — mount a volume here for persistence.
+VOLUME ["/data"]
+
+ENV SIRR_DATA_DIR=/data \
+    SIRR_HOST=0.0.0.0 \
+    SIRR_PORT=8080
+
+EXPOSE 8080
+
+ENTRYPOINT ["/sirr"]
+CMD ["serve"]

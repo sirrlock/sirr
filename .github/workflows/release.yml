@@ -178,12 +178,22 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: sirr-x86_64-unknown-linux-musl
-          path: dist
+          path: dist-x86_64
 
-      - name: Extract binary
+      - uses: actions/download-artifact@v4
+        with:
+          name: sirr-aarch64-unknown-linux-musl
+          path: dist-aarch64
+
+      - name: Prepare binaries
         run: |
-          tar xzf dist/sirr-x86_64-unknown-linux-musl.tar.gz -C dist
-          chmod +x dist/sirr
+          mkdir -p dist/amd64 dist/arm64
+          tar xzf dist-x86_64/sirr-x86_64-unknown-linux-musl.tar.gz -C dist/amd64
+          tar xzf dist-aarch64/sirr-aarch64-unknown-linux-musl.tar.gz -C dist/arm64
+          chmod +x dist/amd64/sirr dist/arm64/sirr
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -195,11 +205,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile.release
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: |
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}
             ghcr.io/${{ github.repository }}:latest
+            sirrvault/sirr:${{ github.ref_name }}
+            sirrvault/sirr:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
