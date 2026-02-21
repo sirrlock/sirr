@@ -70,27 +70,7 @@ async function sirrRequest<T>(
   return json as T;
 }
 
-// Parse a secret reference from natural language.
-// Supports:
-//   - "sirr:KEYNAME"          explicit prefix
-//   - "KEY#server"            legacy hash format (extracts KEY part)
-//   - bare key name           returned as-is
-function parseKeyRef(ref: string): string {
-  if (ref.startsWith("sirr:")) return ref.slice(5);
-  if (ref.includes("#")) return ref.split("#")[0]!;
-  return ref.trim();
-}
-
-function formatTtl(expiresAt: number | null): string {
-  if (expiresAt === null) return "no expiry";
-  const now = Math.floor(Date.now() / 1000);
-  const secs = expiresAt - now;
-  if (secs <= 0) return "expired";
-  if (secs < 60) return `${secs}s`;
-  if (secs < 3600) return `${Math.floor(secs / 60)}m`;
-  if (secs < 86400) return `${Math.floor(secs / 3600)}h`;
-  return `${Math.floor(secs / 86400)}d`;
-}
+import { parseKeyRef, formatTtl } from "./helpers";
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
 
