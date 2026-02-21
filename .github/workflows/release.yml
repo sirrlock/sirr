@@ -115,8 +115,8 @@ jobs:
             sirr-universal-apple-darwin.tar.gz
             sirr-universal-apple-darwin.tar.gz.sha256
 
-  publish-npm:
-    name: Publish npm packages
+  publish-mcp:
+    name: Publish @sirr/mcp
     runs-on: ubuntu-latest
 
     steps:
@@ -130,19 +130,7 @@ jobs:
       - name: Set version from tag
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          cd packages/node && npm version $VERSION --no-git-tag-version
-          cd ../mcp  && npm version $VERSION --no-git-tag-version
-
-      - run: npm ci
-        working-directory: packages/node
-
-      - run: npm run build
-        working-directory: packages/node
-
-      - run: npm publish --access public
-        working-directory: packages/node
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          cd packages/mcp && npm version $VERSION --no-git-tag-version
 
       - run: npm ci
         working-directory: packages/mcp
@@ -161,7 +149,7 @@ jobs:
     needs:
       - build-rust
       - macos-universal
-      - publish-npm
+      - publish-mcp
     permissions:
       contents: write
 

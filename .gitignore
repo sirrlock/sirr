@@ -1,6 +1,4 @@
 /target
-packages/node/dist
-packages/node/node_modules
 packages/mcp/dist
 packages/mcp/node_modules
 *.db

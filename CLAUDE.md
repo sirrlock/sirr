@@ -16,7 +16,7 @@ sirr/
 │   ├── sirr/                   # CLI binary (clap)
 │   └── sirr-server/            # Library: axum server, redb store, crypto
 ├── packages/
-│   ├── node/                   # @sirr/sdk — TypeScript fetch wrapper
+│   ├── node/                   # @sirr/node — TypeScript fetch wrapper
 │   └── mcp/                    # @sirr/mcp — MCP server for Claude Code
 ├── Formula/sirr.rb             # Homebrew formula
 ├── Dockerfile                  # FROM scratch + musl binary

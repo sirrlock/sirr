@@ -38,28 +38,6 @@ jobs:
       - name: test
         run: cargo test --all
 
-  node:
-    name: Node SDK
-    runs-on: ubuntu-latest
-
-    defaults:
-      run:
-        working-directory: packages/node
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: packages/node/package-lock.json
-
-      - run: npm ci
-      - run: npm run build
-      - run: npm test
-
   mcp:
     name: MCP Server
     runs-on: ubuntu-latest
