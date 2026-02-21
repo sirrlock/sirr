@@ -1,0 +1,92 @@
+# Sirr (سر) — Ephemeral Secret Vault
+
+Sirr is a self-hosted secret vault where every secret has an expiration date.
+Single Rust binary, zero runtime dependencies, end-to-end encrypted.
+
+## What It Does
+
+- Store secrets with TTL (time-to-live) and/or read limits
+- Secrets auto-delete when expired or after N reads
+- Bearer token authentication, ChaCha20Poly1305 encryption at rest
+- CLI, HTTP API, Node.js SDK, and MCP server for Claude Code
+
+## Primary Use Cases
+
+- Share database credentials with AI assistants that auto-expire (read-once)
+- CI/CD tokens that burn after a single deploy
+- Contractor API access with automatic expiry
+- Team .env sync with rolling TTL
+
+## HTTP API (requires `Authorization: Bearer <SIRR_MASTER_KEY>`)
+
+POST   /secrets          Store a secret: {key, value, ttl_seconds?, max_reads?}
+GET    /secrets          List metadata (no values returned)
+GET    /secrets/:key     Retrieve + decrement read counter (404 if expired/burned)
+DELETE /secrets/:key     Immediate delete
+POST   /prune            Delete all expired secrets now
+GET    /health           Health check (no auth required)
+
+## CLI
+
+sirr serve                              Start server (requires SIRR_MASTER_KEY)
+sirr push KEY=value [--ttl 1h] [--reads 1]
+sirr push .env [--ttl 24h]             Push all keys from .env file
+sirr get KEY                            Print value to stdout
+sirr pull .env                          Write all secrets to .env file
+sirr run -- <cmd>                       Exec command with secrets as env vars
+sirr share KEY                          Print URL reference for the secret
+sirr list                               Show active secrets (metadata)
+sirr delete KEY
+sirr prune                              Delete all expired now
+
+## Environment Variables
+
+SIRR_MASTER_KEY    Bearer token + Argon2id seed (required)
+SIRR_LICENSE_KEY   License key for >100 secrets (get at secretdrop.app/sirr)
+SIRR_PORT          HTTP port (default: 8080)
+SIRR_HOST          Bind address (default: 0.0.0.0)
+SIRR_DATA_DIR      Storage dir (default: ~/.local/share/sirr/)
+SIRR_SERVER        CLI: server URL (default: http://localhost:8080)
+SIRR_TOKEN         CLI: bearer token (same as SIRR_MASTER_KEY on server)
+
+## Node.js SDK
+
+import { SirrClient } from '@sirr/sdk'
+const c = new SirrClient({ server: '...', token: '...' })
+await c.push('KEY', 'value', { ttl: 3600, reads: 1 })
+const v = await c.get('KEY')           // null if gone
+await c.withSecrets(async () => { })   // inject as process.env
+
+## MCP Server (Claude Code)
+
+Package: @sirr/mcp
+Configure in .mcp.json with SIRR_SERVER and SIRR_TOKEN.
+Tools: get_secret, push_secret, list_secrets, delete_secret, prune_secrets
+
+## Security Model
+
+- Argon2id (64 MiB, 3 iterations) derives 32-byte key from SIRR_MASTER_KEY + salt
+- ChaCha20Poly1305 encrypts each secret value with a random per-record nonce
+- Metadata (TTL, read count) stored plaintext for efficient expiry scanning
+- Constant-time bearer token comparison prevents timing attacks
+- No telemetry, no phone-home
+
+## Storage
+
+- sirr.db   — redb embedded key-value database (single file)
+- sirr.salt — 32-byte Argon2id salt, generated on first run
+
+## Licensing
+
+BSL 1.1: free for ≤100 secrets/instance, commercial license required above that.
+Converts to Apache 2.0 on February 20, 2028.
+Get a license key at: https://secretdrop.app/sirr
+
+## Repository Layout
+
+crates/sirr-server/   Rust library: axum server, redb store, crypto
+crates/sirr/          Rust binary: CLI (clap)
+packages/node/        TypeScript SDK (@sirr/sdk)
+packages/mcp/         MCP server (@sirr/mcp) for Claude Code integration
+Formula/sirr.rb       Homebrew formula
+Dockerfile            FROM scratch + musl binary
