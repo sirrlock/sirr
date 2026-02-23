@@ -354,13 +354,11 @@ fn decode(bytes: &[u8]) -> Result<SecretRecord> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::crypto::{derive_key, generate_salt};
     use super::*;
     use tempfile::tempdir;
 
     fn make_store() -> (Store, tempfile::TempDir) {
-        let salt = generate_salt();
-        let key = derive_key("test-key", &salt).unwrap();
+        let key = super::super::crypto::generate_key();
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
         let store = Store::open(&path, key).unwrap();
