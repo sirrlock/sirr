@@ -10,6 +10,7 @@ use tracing::info;
 
 use crate::{
     license::{LicenseStatus, FREE_TIER_LIMIT},
+    store::GetResult,
     AppState,
 };
 
@@ -100,8 +101,13 @@ pub async fn create_secret(
 
 pub async fn get_secret(State(state): State<AppState>, Path(key): Path<String>) -> Response {
     match state.store.get(&key) {
-        Ok(Some(value)) => Json(json!({ "key": key, "value": value })).into_response(),
-        Ok(None) => (
+        Ok(GetResult::Value(value)) => Json(json!({ "key": key, "value": value })).into_response(),
+        Ok(GetResult::Sealed) => (
+            StatusCode::GONE,
+            Json(json!({"error": "secret is sealed — reads exhausted"})),
+        )
+            .into_response(),
+        Ok(GetResult::NotFound) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "not found or expired"})),
         )

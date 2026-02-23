@@ -12,6 +12,17 @@ use super::model::{SecretMeta, SecretRecord};
 
 const SECRETS: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");
 
+/// Result of a secret retrieval.
+#[derive(Debug, PartialEq)]
+pub enum GetResult {
+    /// Secret found and decrypted. Read counter was incremented.
+    Value(String),
+    /// Secret exists but is sealed (delete=false, reads exhausted).
+    Sealed,
+    /// Secret not found or TTL-expired.
+    NotFound,
+}
+
 /// Thread-safe handle to the redb store.
 #[derive(Clone)]
 pub struct Store {
@@ -80,8 +91,10 @@ impl Store {
     }
 
     /// Retrieve a secret's value, incrementing its read counter.
-    /// Returns `None` if the key doesn't exist or has expired / burned.
-    pub fn get(&self, secret_key: &str) -> Result<Option<String>> {
+    /// Returns `GetResult::NotFound` if the key doesn't exist or has expired / burned.
+    /// Returns `GetResult::Sealed` if the secret exists but reads are exhausted (delete=false).
+    /// Returns `GetResult::Value(value)` on success.
+    pub fn get(&self, secret_key: &str) -> Result<GetResult> {
         let now = Self::now();
 
         // We need a write transaction to atomically increment read_count.
@@ -95,16 +108,16 @@ impl Store {
                 table.get(secret_key)?.map(|guard| guard.value().to_vec());
 
             match raw_bytes {
-                None => None,
+                None => GetResult::NotFound,
                 Some(bytes) => {
                     let mut record: SecretRecord = decode(&bytes)?;
 
                     if record.is_expired(now) {
                         table.remove(secret_key)?;
                         debug!(key = %secret_key, "lazy-evicted expired secret");
-                        None
+                        GetResult::NotFound
                     } else if record.is_sealed() {
-                        None
+                        GetResult::Sealed
                     } else {
                         record.read_count += 1;
 
@@ -126,7 +139,7 @@ impl Store {
                             table.insert(secret_key, updated.as_slice())?;
                         }
 
-                        Some(value)
+                        GetResult::Value(value)
                     }
                 }
             }
@@ -358,18 +371,18 @@ mod tests {
     fn put_get_delete() {
         let (s, _dir) = make_store();
         s.put("MY_KEY", "my-value", None, None, true).unwrap();
-        assert_eq!(s.get("MY_KEY").unwrap(), Some("my-value".into()));
+        assert_eq!(s.get("MY_KEY").unwrap(), GetResult::Value("my-value".into()));
         assert!(s.delete("MY_KEY").unwrap());
-        assert_eq!(s.get("MY_KEY").unwrap(), None);
+        assert_eq!(s.get("MY_KEY").unwrap(), GetResult::NotFound);
     }
 
     #[test]
     fn read_limit_burn() {
         let (s, _dir) = make_store();
         s.put("BURN", "secret", None, Some(1), true).unwrap();
-        assert_eq!(s.get("BURN").unwrap(), Some("secret".into()));
-        // Second read should return None — record was burned.
-        assert_eq!(s.get("BURN").unwrap(), None);
+        assert_eq!(s.get("BURN").unwrap(), GetResult::Value("secret".into()));
+        // Second read should return NotFound — record was burned.
+        assert_eq!(s.get("BURN").unwrap(), GetResult::NotFound);
     }
 
     #[test]
@@ -377,7 +390,7 @@ mod tests {
         let (s, _dir) = make_store();
         // TTL = 0 means already expired.
         s.put("EXPIRED", "value", Some(0), None, true).unwrap();
-        assert_eq!(s.get("EXPIRED").unwrap(), None);
+        assert_eq!(s.get("EXPIRED").unwrap(), GetResult::NotFound);
     }
 
     #[test]
@@ -426,7 +439,7 @@ mod tests {
         s.get("P").unwrap(); // read_count = 1
         let meta = s.patch("P", Some("new"), None, None).unwrap().unwrap();
         assert_eq!(meta.read_count, 0); // reset
-        assert_eq!(s.get("P").unwrap(), Some("new".into()));
+        assert_eq!(s.get("P").unwrap(), GetResult::Value("new".into()));
     }
 
     #[test]
@@ -442,9 +455,9 @@ mod tests {
         let (s, _dir) = make_store();
         s.put("PS", "val", None, Some(1), false).unwrap();
         s.get("PS").unwrap(); // now sealed
-        assert!(s.get("PS").unwrap().is_none()); // sealed, can't read
+        assert_eq!(s.get("PS").unwrap(), GetResult::Sealed); // sealed, can't read
         s.patch("PS", None, Some(5), None).unwrap(); // unseal with new max_reads
-        assert_eq!(s.get("PS").unwrap(), Some("val".into())); // readable again
+        assert_eq!(s.get("PS").unwrap(), GetResult::Value("val".into())); // readable again
     }
 
     #[test]
@@ -452,5 +465,13 @@ mod tests {
         let (s, _dir) = make_store();
         let result = s.patch("NOPE", Some("val"), None, None).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn get_sealed_returns_sealed_variant() {
+        let (s, _dir) = make_store();
+        s.put("GS", "val", None, Some(1), false).unwrap();
+        assert!(matches!(s.get("GS").unwrap(), GetResult::Value(_)));
+        assert!(matches!(s.get("GS").unwrap(), GetResult::Sealed));
     }
 }
