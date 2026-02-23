@@ -15,9 +15,9 @@ struct Cli {
     #[arg(long, env = "SIRR_SERVER", default_value = "http://localhost:8080")]
     server: String,
 
-    /// Bearer token for server auth ($SIRR_TOKEN)
-    #[arg(long, env = "SIRR_TOKEN")]
-    token: Option<String>,
+    /// API key for write operations ($SIRR_API_KEY)
+    #[arg(long, env = "SIRR_API_KEY")]
+    api_key: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -45,6 +45,9 @@ enum Commands {
         /// Maximum number of reads before self-destructing
         #[arg(long)]
         reads: Option<u32>,
+        /// Keep the secret after reads are exhausted (enables PATCH)
+        #[arg(long)]
+        no_delete: bool,
     },
     /// Get a secret by key
     Get {
@@ -94,61 +97,49 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Serve { port, host } => cmd_serve(host, port).await,
 
-        Commands::Push { target, ttl, reads } => {
-            let token = require_token(&cli.token)?;
-            cmd_push(&cli.server, &token, &target, ttl.as_deref(), reads).await
+        Commands::Push {
+            target,
+            ttl,
+            reads,
+            no_delete,
+        } => {
+            cmd_push(
+                &cli.server,
+                &cli.api_key,
+                &target,
+                ttl.as_deref(),
+                reads,
+                !no_delete,
+            )
+            .await
         }
 
-        Commands::Get { key } => {
-            let token = require_token(&cli.token)?;
-            cmd_get(&cli.server, &token, &key).await
-        }
+        Commands::Get { key } => cmd_get(&cli.server, &key).await,
 
-        Commands::Pull { path } => {
-            let token = require_token(&cli.token)?;
-            cmd_pull(&cli.server, &token, &path).await
-        }
+        Commands::Pull { path } => cmd_pull(&cli.server, &cli.api_key, &path).await,
 
-        Commands::Run { command } => {
-            let token = require_token(&cli.token)?;
-            cmd_run(&cli.server, &token, &command).await
-        }
+        Commands::Run { command } => cmd_run(&cli.server, &cli.api_key, &command).await,
 
         Commands::Share { key } => {
             println!("{}/secrets/{}", cli.server.trim_end_matches('/'), key);
             Ok(())
         }
 
-        Commands::List => {
-            let token = require_token(&cli.token)?;
-            cmd_list(&cli.server, &token).await
-        }
+        Commands::List => cmd_list(&cli.server, &cli.api_key).await,
 
-        Commands::Delete { key } => {
-            let token = require_token(&cli.token)?;
-            cmd_delete(&cli.server, &token, &key).await
-        }
+        Commands::Delete { key } => cmd_delete(&cli.server, &cli.api_key, &key).await,
 
-        Commands::Prune => {
-            let token = require_token(&cli.token)?;
-            cmd_prune(&cli.server, &token).await
-        }
+        Commands::Prune => cmd_prune(&cli.server, &cli.api_key).await,
     }
 }
 
 // ── Command implementations ───────────────────────────────────────────────────
 
 async fn cmd_serve(host: String, port: u16) -> Result<()> {
-    let master_key = std::env::var("SIRR_MASTER_KEY")
-        .context("SIRR_MASTER_KEY environment variable is required")?;
-    if master_key.is_empty() {
-        anyhow::bail!("SIRR_MASTER_KEY must not be empty");
-    }
-
     let cfg = sirr_server::ServerConfig {
         host,
         port,
-        master_key,
+        api_key: std::env::var("SIRR_API_KEY").ok(),
         license_key: std::env::var("SIRR_LICENSE_KEY").ok(),
         data_dir: std::env::var("SIRR_DATA_DIR").ok().map(Into::into),
         ..Default::default()
@@ -159,17 +150,18 @@ async fn cmd_serve(host: String, port: u16) -> Result<()> {
 
 async fn cmd_push(
     server: &str,
-    token: &str,
+    api_key: &Option<String>,
     target: &str,
     ttl: Option<&str>,
     reads: Option<u32>,
+    delete: bool,
 ) -> Result<()> {
     let ttl_seconds = ttl.map(parse_duration).transpose()?;
 
     // Check if target looks like a file path (contains '/' or is a filename that exists).
     if !target.contains('=') {
         // Treat as .env file path.
-        return push_env_file(server, token, target, ttl_seconds, reads).await;
+        return push_env_file(server, api_key, target, ttl_seconds, reads, delete).await;
     }
 
     // KEY=value
@@ -177,17 +169,18 @@ async fn cmd_push(
         .split_once('=')
         .context("expected KEY=value or a .env file path")?;
 
-    push_one(server, token, key, value, ttl_seconds, reads).await?;
+    push_one(server, api_key, key, value, ttl_seconds, reads, delete).await?;
     println!("✓ pushed {key}");
     Ok(())
 }
 
 async fn push_env_file(
     server: &str,
-    token: &str,
+    api_key: &Option<String>,
     path: &str,
     ttl_seconds: Option<u64>,
     reads: Option<u32>,
+    delete: bool,
 ) -> Result<()> {
     let entries =
         dotenvy::from_filename_iter(path).with_context(|| format!("read .env file: {path}"))?;
@@ -195,7 +188,7 @@ async fn push_env_file(
     let mut count = 0usize;
     for entry in entries {
         let (key, value) = entry.context("parse .env entry")?;
-        push_one(server, token, &key, &value, ttl_seconds, reads).await?;
+        push_one(server, api_key, &key, &value, ttl_seconds, reads, delete).await?;
         println!("✓ pushed {key}");
         count += 1;
     }
@@ -205,11 +198,12 @@ async fn push_env_file(
 
 async fn push_one(
     server: &str,
-    token: &str,
+    api_key: &Option<String>,
     key: &str,
     value: &str,
     ttl_seconds: Option<u64>,
     max_reads: Option<u32>,
+    delete: bool,
 ) -> Result<()> {
     let client = Client::new();
     let body = serde_json::json!({
@@ -217,11 +211,11 @@ async fn push_one(
         "value": value,
         "ttl_seconds": ttl_seconds,
         "max_reads": max_reads,
+        "delete": delete,
     });
 
-    let resp = client
-        .post(format!("{}/secrets", server.trim_end_matches('/')))
-        .bearer_auth(token)
+    let req = client.post(format!("{}/secrets", server.trim_end_matches('/')));
+    let resp = with_auth(req, api_key)
         .json(&body)
         .send()
         .await
@@ -235,11 +229,10 @@ async fn push_one(
     Ok(())
 }
 
-async fn cmd_get(server: &str, token: &str, key: &str) -> Result<()> {
+async fn cmd_get(server: &str, key: &str) -> Result<()> {
     let client = Client::new();
     let resp = client
         .get(format!("{}/secrets/{}", server.trim_end_matches('/'), key))
-        .bearer_auth(token)
         .send()
         .await
         .context("HTTP request failed")?;
@@ -257,12 +250,12 @@ async fn cmd_get(server: &str, token: &str, key: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_pull(server: &str, token: &str, path: &str) -> Result<()> {
-    let metas = fetch_list(server, token).await?;
+async fn cmd_pull(server: &str, api_key: &Option<String>, path: &str) -> Result<()> {
+    let metas = fetch_list(server, api_key).await?;
     let mut lines = Vec::new();
 
     for meta in &metas {
-        let value = fetch_value(server, token, &meta.key).await?;
+        let value = fetch_value(server, &meta.key).await?;
         lines.push(format!("{}={}", meta.key, shell_escape(&value)));
     }
 
@@ -271,16 +264,16 @@ async fn cmd_pull(server: &str, token: &str, path: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_run(server: &str, token: &str, command: &[String]) -> Result<()> {
+async fn cmd_run(server: &str, api_key: &Option<String>, command: &[String]) -> Result<()> {
     if command.is_empty() {
         anyhow::bail!("no command provided after --");
     }
 
-    let metas = fetch_list(server, token).await?;
+    let metas = fetch_list(server, api_key).await?;
     let mut env_vars: HashMap<String, String> = HashMap::new();
 
     for meta in &metas {
-        if let Ok(value) = fetch_value(server, token, &meta.key).await {
+        if let Ok(value) = fetch_value(server, &meta.key).await {
             env_vars.insert(meta.key.clone(), value);
         }
     }
@@ -295,8 +288,8 @@ async fn cmd_run(server: &str, token: &str, command: &[String]) -> Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-async fn cmd_list(server: &str, token: &str) -> Result<()> {
-    let metas = fetch_list(server, token).await?;
+async fn cmd_list(server: &str, api_key: &Option<String>) -> Result<()> {
+    let metas = fetch_list(server, api_key).await?;
     if metas.is_empty() {
         println!("(no active secrets)");
         return Ok(());
@@ -321,16 +314,16 @@ async fn cmd_list(server: &str, token: &str) -> Result<()> {
             Some(max) => format!("{}/{} reads", m.read_count, max),
             None => format!("{} reads", m.read_count),
         };
-        println!("  {} — {} — {}", m.key, ttl_info, reads_info);
+        let delete_info = if m.delete { "" } else { " [patchable]" };
+        println!("  {} — {} — {}{}", m.key, ttl_info, reads_info, delete_info);
     }
     Ok(())
 }
 
-async fn cmd_delete(server: &str, token: &str, key: &str) -> Result<()> {
+async fn cmd_delete(server: &str, api_key: &Option<String>, key: &str) -> Result<()> {
     let client = Client::new();
-    let resp = client
-        .delete(format!("{}/secrets/{}", server.trim_end_matches('/'), key))
-        .bearer_auth(token)
+    let req = client.delete(format!("{}/secrets/{}", server.trim_end_matches('/'), key));
+    let resp = with_auth(req, api_key)
         .send()
         .await
         .context("HTTP request failed")?;
@@ -348,11 +341,10 @@ async fn cmd_delete(server: &str, token: &str, key: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_prune(server: &str, token: &str) -> Result<()> {
+async fn cmd_prune(server: &str, api_key: &Option<String>) -> Result<()> {
     let client = Client::new();
-    let resp = client
-        .post(format!("{}/prune", server.trim_end_matches('/')))
-        .bearer_auth(token)
+    let req = client.post(format!("{}/prune", server.trim_end_matches('/')));
+    let resp = with_auth(req, api_key)
         .send()
         .await
         .context("HTTP request failed")?;
@@ -370,10 +362,14 @@ async fn cmd_prune(server: &str, token: &str) -> Result<()> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn require_token(token: &Option<String>) -> Result<String> {
-    token
-        .clone()
-        .context("--token / SIRR_TOKEN is required for this command")
+fn with_auth(
+    builder: reqwest::RequestBuilder,
+    api_key: &Option<String>,
+) -> reqwest::RequestBuilder {
+    match api_key {
+        Some(key) => builder.bearer_auth(key),
+        None => builder,
+    }
 }
 
 /// Parse human duration strings like "1h", "30m", "7d", "5s" into seconds.
@@ -415,13 +411,13 @@ struct MetaItem {
     expires_at: Option<i64>,
     max_reads: Option<u32>,
     read_count: u32,
+    delete: bool,
 }
 
-async fn fetch_list(server: &str, token: &str) -> Result<Vec<MetaItem>> {
+async fn fetch_list(server: &str, api_key: &Option<String>) -> Result<Vec<MetaItem>> {
     let client = Client::new();
-    let resp = client
-        .get(format!("{}/secrets", server.trim_end_matches('/')))
-        .bearer_auth(token)
+    let req = client.get(format!("{}/secrets", server.trim_end_matches('/')));
+    let resp = with_auth(req, api_key)
         .send()
         .await
         .context("HTTP request failed")?;
@@ -437,11 +433,10 @@ async fn fetch_list(server: &str, token: &str) -> Result<Vec<MetaItem>> {
     Ok(metas)
 }
 
-async fn fetch_value(server: &str, token: &str, key: &str) -> Result<String> {
+async fn fetch_value(server: &str, key: &str) -> Result<String> {
     let client = Client::new();
     let resp = client
         .get(format!("{}/secrets/{}", server.trim_end_matches('/'), key))
-        .bearer_auth(token)
         .send()
         .await?;
 
