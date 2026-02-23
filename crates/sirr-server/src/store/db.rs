@@ -49,6 +49,7 @@ impl Store {
         value: &str,
         ttl_seconds: Option<u64>,
         max_reads: Option<u32>,
+        delete: bool,
     ) -> Result<()> {
         let now = Self::now();
         let expires_at = ttl_seconds.map(|ttl| now + ttl as i64);
@@ -63,6 +64,7 @@ impl Store {
             expires_at,
             max_reads,
             read_count: 0,
+            delete,
         };
 
         let bytes = encode(&record)?;
@@ -97,15 +99,15 @@ impl Store {
                 Some(bytes) => {
                     let mut record: SecretRecord = decode(&bytes)?;
 
-                    // Lazy expiry check.
                     if record.is_expired(now) {
                         table.remove(secret_key)?;
                         debug!(key = %secret_key, "lazy-evicted expired secret");
                         None
+                    } else if record.is_sealed() {
+                        None
                     } else {
                         record.read_count += 1;
 
-                        // Decrypt before potentially deleting the record.
                         let plaintext = super::crypto::decrypt(
                             &self.key,
                             &record.value_encrypted,
@@ -116,12 +118,10 @@ impl Store {
                         let value = String::from_utf8(plaintext)
                             .context("secret value is not valid UTF-8")?;
 
-                        // Check burn condition AFTER incrementing.
-                        if record.is_expired(now) {
+                        if record.is_burned() {
                             table.remove(secret_key)?;
                             debug!(key = %secret_key, "burned after final read");
                         } else {
-                            // Write back updated read_count.
                             let updated = encode(&record)?;
                             table.insert(secret_key, updated.as_slice())?;
                         }
@@ -165,6 +165,7 @@ impl Store {
                     expires_at: record.expires_at,
                     max_reads: record.max_reads,
                     read_count: record.read_count,
+                    delete: record.delete,
                 });
             }
         }
@@ -183,7 +184,7 @@ impl Store {
             for item in table.iter()? {
                 let (k, v) = item?;
                 let record: SecretRecord = decode(v.value())?;
-                if record.is_expired(now) {
+                if record.is_expired(now) || record.is_burned() {
                     keys.push(k.value().to_owned());
                 }
             }
@@ -253,7 +254,7 @@ mod tests {
     #[test]
     fn put_get_delete() {
         let (s, _dir) = make_store();
-        s.put("MY_KEY", "my-value", None, None).unwrap();
+        s.put("MY_KEY", "my-value", None, None, true).unwrap();
         assert_eq!(s.get("MY_KEY").unwrap(), Some("my-value".into()));
         assert!(s.delete("MY_KEY").unwrap());
         assert_eq!(s.get("MY_KEY").unwrap(), None);
@@ -262,7 +263,7 @@ mod tests {
     #[test]
     fn read_limit_burn() {
         let (s, _dir) = make_store();
-        s.put("BURN", "secret", None, Some(1)).unwrap();
+        s.put("BURN", "secret", None, Some(1), true).unwrap();
         assert_eq!(s.get("BURN").unwrap(), Some("secret".into()));
         // Second read should return None — record was burned.
         assert_eq!(s.get("BURN").unwrap(), None);
@@ -272,15 +273,15 @@ mod tests {
     fn ttl_expiry() {
         let (s, _dir) = make_store();
         // TTL = 0 means already expired.
-        s.put("EXPIRED", "value", Some(0), None).unwrap();
+        s.put("EXPIRED", "value", Some(0), None, true).unwrap();
         assert_eq!(s.get("EXPIRED").unwrap(), None);
     }
 
     #[test]
     fn list_excludes_expired() {
         let (s, _dir) = make_store();
-        s.put("LIVE", "v", Some(3600), None).unwrap();
-        s.put("DEAD", "v", Some(0), None).unwrap();
+        s.put("LIVE", "v", Some(3600), None, true).unwrap();
+        s.put("DEAD", "v", Some(0), None, true).unwrap();
         let metas = s.list().unwrap();
         assert!(metas.iter().any(|m| m.key == "LIVE"));
         assert!(!metas.iter().any(|m| m.key == "DEAD"));

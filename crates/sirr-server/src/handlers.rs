@@ -36,6 +36,7 @@ pub struct CreateRequest {
     pub value: String,
     pub ttl_seconds: Option<u64>,
     pub max_reads: Option<u32>,
+    pub delete: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -85,7 +86,7 @@ pub async fn create_secret(
 
     match state
         .store
-        .put(&body.key, &body.value, body.ttl_seconds, body.max_reads)
+        .put(&body.key, &body.value, body.ttl_seconds, body.max_reads, body.delete.unwrap_or(true))
     {
         Ok(()) => {
             info!(key = %body.key, "created secret");
