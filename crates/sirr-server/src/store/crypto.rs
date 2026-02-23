@@ -75,6 +75,23 @@ pub fn decrypt(key: &EncryptionKey, ciphertext: &[u8], nonce_bytes: &[u8; 12]) -
     Ok(plaintext)
 }
 
+/// Generate a random 32-byte encryption key (no Argon2id derivation).
+pub fn generate_key() -> EncryptionKey {
+    let mut key = [0u8; 32];
+    OsRng.fill_bytes(&mut key);
+    EncryptionKey(key)
+}
+
+/// Load an existing key from bytes, or return None if wrong length.
+pub fn load_key(bytes: &[u8]) -> Option<EncryptionKey> {
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(bytes);
+    Some(EncryptionKey(key))
+}
+
 /// Generate a fresh 32-byte random salt.
 pub fn generate_salt() -> [u8; 32] {
     let mut salt = [0u8; 32];
@@ -113,6 +130,15 @@ mod tests {
         let salt = generate_salt();
         let key = derive_key("test-master-key", &salt).unwrap();
         let plaintext = b"hello, sirr!";
+        let (ct, nonce) = encrypt(&key, plaintext).unwrap();
+        let pt = decrypt(&key, &ct, &nonce).unwrap();
+        assert_eq!(pt, plaintext);
+    }
+
+    #[test]
+    fn generate_key_round_trip() {
+        let key = generate_key();
+        let plaintext = b"test with generated key";
         let (ct, nonce) = encrypt(&key, plaintext).unwrap();
         let pt = decrypt(&key, &ct, &nonce).unwrap();
         assert_eq!(pt, plaintext);
