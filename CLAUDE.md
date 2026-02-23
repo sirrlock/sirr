@@ -41,48 +41,55 @@ cd packages/node && npm install && npm run build && npm test
 cd packages/mcp && npm install && npm run build
 
 # Run server locally
-SIRR_MASTER_KEY=dev ./target/release/sirr serve
+./target/release/sirr serve
+# Optionally protect writes: SIRR_API_KEY=my-key ./target/release/sirr serve
 ```
 
 ## Architecture
 
 ```
-SIRR_MASTER_KEY --Argon2id--> 32-byte encryption key (derived once at startup)
+sirr.key (random 32 bytes, generated on first boot)
 key + per-record nonce --ChaCha20Poly1305--> encrypted value stored in redb
 ```
 
-- `crates/sirr-server/src/store/crypto.rs` — Argon2id + ChaCha20Poly1305
-- `crates/sirr-server/src/store/db.rs` — redb open/read/write/prune (watch borrow lifetimes — AccessGuard must be dropped before mutating the table)
-- `crates/sirr-server/src/store/model.rs` — SecretRecord (bincode+serde)
-- `crates/sirr-server/src/server.rs` — axum router + salt management
-- `crates/sirr-server/src/auth.rs` — constant-time bearer token middleware
+- `crates/sirr-server/src/store/crypto.rs` — ChaCha20Poly1305 encrypt/decrypt + key generation
+- `crates/sirr-server/src/store/db.rs` — redb open/read/write/patch/head/prune + GetResult enum (watch borrow lifetimes — AccessGuard must be dropped before mutating the table)
+- `crates/sirr-server/src/store/model.rs` — SecretRecord with `delete` flag, is_expired/is_burned/is_sealed checks
+- `crates/sirr-server/src/server.rs` — axum router, CORS, key management (sirr.key)
+- `crates/sirr-server/src/auth.rs` — optional API key middleware (SIRR_API_KEY)
 - `crates/sirr/src/main.rs` — clap CLI dispatch + reqwest HTTP client
 
 ## Key Constraints
 
 - `AccessGuard` from redb borrows the table immutably. Always `.to_vec()` the bytes before any mutation on the same table.
-- `argon2::Error` and `password_hash::Error` don't implement `std::error::Error`. Use `.map_err(|e| anyhow::anyhow!("{e}"))` — not `.context()`.
 - License check: >100 active secrets requires a valid `SIRR_LICENSE_KEY`. The check runs at secret creation time, not at startup.
-- The `SIRR_MASTER_KEY` serves double duty: Argon2id seed AND bearer token. This is intentional — one env var to configure.
+- `delete` flag on SecretRecord: `true` (default) = burn on max_reads, `false` = seal (block reads, allow PATCH). PATCH only works on `delete=false` secrets.
+- `Store::get()` returns `GetResult` enum: `Value(String)`, `Sealed`, or `NotFound` — handler maps to 200, 410, 404.
+- Encryption key is a random 32-byte key stored as `sirr.key` (no more Argon2id derivation).
+- Auth is optional: `SIRR_API_KEY` env var protects write endpoints (POST/PATCH/DELETE/list). GET and HEAD are always public.
 
 ## Testing
 
 ```bash
-cargo test --all                   # 6 unit tests (crypto round-trip, TTL, burn, list)
+cargo test --all                   # 23 unit tests
 
 # Manual smoke test
-SIRR_MASTER_KEY=test ./target/release/sirr serve &
+./target/release/sirr serve &
 sleep 1
 
-# Store and retrieve
-sirr push DB_URL="postgres://..." --reads 1 --token test
-sirr get DB_URL --token test       # Returns value
-sirr get DB_URL --token test       # 404 — burned
+# Store and retrieve (burn after 1 read)
+sirr push DB_URL="postgres://..." --reads 1
+sirr get DB_URL                    # Returns value
+sirr get DB_URL                    # 404 — burned
+
+# Patchable secret (no auto-delete)
+sirr push CF_TOKEN=abc123 --reads 5 --no-delete
+sirr get CF_TOKEN                  # Returns value, read_count = 1
 
 # TTL test
-sirr push TEMP=val --ttl 2s --token test
+sirr push TEMP=val --ttl 2s
 sleep 3
-sirr get TEMP --token test         # 404 — expired
+sirr get TEMP                      # 404 — expired
 ```
 
 ## Pre-Commit Checklist
@@ -109,7 +116,6 @@ This applies to all packages — Rust crates, Node SDK, and MCP server.
 axum = "0.8"
 redb = "2"          # NOT v3 — API changed significantly
 bincode = "2" with serde feature
-argon2 = "0.5"
 chacha20poly1305 = "0.10"
 ```
 

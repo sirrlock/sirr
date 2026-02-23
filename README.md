@@ -67,25 +67,27 @@ This isn't paranoia. This is correct threat modeling for an age where your codin
 docker run -d \
   -p 8080:8080 \
   -v ./sirr-data:/data \
-  -e SIRR_MASTER_KEY="$(openssl rand -hex 32)" \
   ghcr.io/sirrvault/sirr
 ```
 
 Or as a binary:
 
 ```bash
-SIRR_MASTER_KEY=your-token ./sirr serve
+./sirr serve
+# Optionally protect writes: SIRR_API_KEY=my-key ./sirr serve
 ```
 
 ### Push and retrieve
 
 ```bash
-export SIRR_TOKEN=your-master-key
-
-# One-time credential
+# One-time credential (burns after 1 read)
 sirr push DB_URL="postgres://..." --reads 1 --ttl 1h
 sirr get DB_URL      # returns value
 sirr get DB_URL      # 404 — burned
+
+# Patchable secret (keeps the key, allows value updates)
+sirr push CF_TOKEN=abc123 --reads 5 --no-delete
+sirr get CF_TOKEN    # returns value, reads remaining: 4
 
 # Expiring .env for your team
 sirr push .env --ttl 24h
@@ -116,7 +118,7 @@ npm install -g @sirr/mcp
       "command": "sirr-mcp",
       "env": {
         "SIRR_SERVER": "http://localhost:8080",
-        "SIRR_TOKEN": "your-token"
+        "SIRR_API_KEY": "your-api-key"
       }
     }
   }
@@ -138,7 +140,7 @@ Claude: [calls push_secret("STRIPE_KEY", "sk_test_...", reads=1, ttl=1800)]
 ```python
 from sirr import SirrClient
 
-sirr = SirrClient(server="http://localhost:8080", token=os.environ["SIRR_TOKEN"])
+sirr = SirrClient(server="http://localhost:8080", api_key=os.environ.get("SIRR_API_KEY"))
 
 # Give an agent a one-use credential
 sirr.push("DB_URL", connection_string, reads=1, ttl=3600)
@@ -162,7 +164,7 @@ sirr.push("DB_URL", connection_string, reads=1, ttl=3600)
 
 ```bash
 # Push
-sirr push KEY=VALUE [--ttl <duration>] [--reads <n>]
+sirr push KEY=VALUE [--ttl <duration>] [--reads <n>] [--no-delete]
 sirr push .env [--ttl <duration>]          # push entire .env file
 
 # Retrieve
@@ -179,24 +181,54 @@ sirr share KEY                             # print reference URL
 
 TTL format: `30s`, `5m`, `2h`, `7d`, `30d`
 
+`--no-delete`: Secret is sealed (reads blocked) when `max_reads` is hit, but stays in the database. Can be updated via `PATCH /secrets/:key` and unsealed.
+
 ---
 
 ## HTTP API
 
-All routes except `/health` require `Authorization: Bearer <SIRR_MASTER_KEY>`.
+**Public routes** (no auth required):
+
+### `GET /secrets/:key`
+Retrieves value. Increments read counter. Burns or seals record if read limit reached.
+```json
+{ "key": "DB_URL", "value": "postgres://..." }
+// 404 if expired, burned, or not found
+// 410 if sealed (delete=false, reads exhausted)
+```
+
+### `HEAD /secrets/:key`
+Returns metadata via headers. Does NOT increment read counter.
+```
+X-Sirr-Read-Count: 3
+X-Sirr-Reads-Remaining: 7    (or "unlimited")
+X-Sirr-Delete: false
+X-Sirr-Created-At: 1700000000
+X-Sirr-Expires-At: 1700003600  (if TTL set)
+X-Sirr-Status: active          (or "sealed")
+// 200, 404 (not found), or 410 (sealed)
+```
+
+### `GET /health` → `{ "status": "ok" }`
+
+**Protected routes** (require `Authorization: Bearer <SIRR_API_KEY>` if `SIRR_API_KEY` is set):
 
 ### `POST /secrets`
 ```json
-{ "key": "DB_URL", "value": "postgres://...", "ttl_seconds": 3600, "max_reads": 1 }
+{ "key": "DB_URL", "value": "postgres://...", "ttl_seconds": 3600, "max_reads": 1, "delete": true }
+// delete defaults to true. Set false for patchable secrets.
 // 201: { "key": "DB_URL" }
 // 402: license required (>100 secrets without SIRR_LICENSE_KEY)
 ```
 
-### `GET /secrets/:key`
-Retrieves value. Increments read counter. Deletes record if read limit reached.
+### `PATCH /secrets/:key`
+Update value, max_reads, or TTL. Only works on `delete=false` secrets. Resets read_count to 0.
 ```json
-{ "key": "DB_URL", "value": "postgres://..." }
-// 404 if expired, burned, or not found
+{ "value": "new-value", "max_reads": 10, "ttl_seconds": 3600 }
+// All fields optional. Omitted fields keep current values.
+// 200: updated metadata
+// 409: cannot patch a delete=true secret
+// 404: not found or expired
 ```
 
 ### `GET /secrets`
@@ -204,14 +236,13 @@ Returns metadata only — values are never included in list responses.
 ```json
 {
   "secrets": [
-    { "key": "DB_URL", "created_at": 1700000000, "expires_at": 1700003600, "max_reads": 1, "read_count": 0 }
+    { "key": "DB_URL", "created_at": 1700000000, "expires_at": 1700003600, "max_reads": 1, "read_count": 0, "delete": true }
   ]
 }
 ```
 
 ### `DELETE /secrets/:key` → `{ "deleted": true }`
 ### `POST /prune` → `{ "pruned": 3 }`
-### `GET /health` → `{ "status": "ok" }`
 
 ---
 
@@ -219,11 +250,12 @@ Returns metadata only — values are never included in list responses.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SIRR_MASTER_KEY` | **required** | Bearer token + encryption key seed |
+| `SIRR_API_KEY` | — | Optional. Protects write endpoints (POST/PATCH/DELETE/list) |
 | `SIRR_LICENSE_KEY` | — | Required for >100 active secrets |
 | `SIRR_PORT` | `8080` | HTTP listen port |
 | `SIRR_HOST` | `0.0.0.0` | Bind address |
 | `SIRR_DATA_DIR` | platform default¹ | Storage directory |
+| `SIRR_CORS_ORIGINS` | `*` (all) | Comma-separated allowed origins |
 | `SIRR_LOG_LEVEL` | `info` | `trace` / `debug` / `info` / `warn` / `error` |
 
 **CLI / client variables:**
@@ -231,7 +263,7 @@ Returns metadata only — values are never included in list responses.
 | Variable | Default | Description |
 |---|---|---|
 | `SIRR_SERVER` | `http://localhost:8080` | Server base URL |
-| `SIRR_TOKEN` | — | Same value as `SIRR_MASTER_KEY` on the server |
+| `SIRR_API_KEY` | — | Same value as server's `SIRR_API_KEY` (for write ops) |
 
 ¹ `~/.local/share/sirr/` (Linux), `~/Library/Application Support/sirr/` (macOS), `%APPDATA%\sirr\` (Windows). Docker: mount `/data` and set `SIRR_DATA_DIR=/data`.
 
@@ -241,19 +273,18 @@ Returns metadata only — values are never included in list responses.
 
 ```
 CLI / Node SDK / Python SDK / .NET SDK / MCP Server
-              ↓  HTTP (bearer token)
+              ↓  HTTP (optional API key for writes)
          axum REST API (Rust)
               ↓
      redb embedded database (sirr.db)
               ↓
    ChaCha20Poly1305 encrypted values
-   (key = Argon2id(SIRR_MASTER_KEY + sirr.salt))
+   (key = random 32 bytes in sirr.key)
 ```
 
-- `SIRR_MASTER_KEY` → Argon2id (64 MiB, 3 iterations) → 32-byte encryption key, derived once at startup
+- `sirr.key` — random 32-byte encryption key, generated on first run, stored beside `sirr.db`
 - Per-record random 12-byte nonce; value field is encrypted, metadata is not
-- `SIRR_MASTER_KEY` doubles as the bearer token (constant-time comparison)
-- `sirr.salt` — 32 random bytes, generated on first run, stored beside `sirr.db`
+- Reads are public (no auth). Writes optionally protected by `SIRR_API_KEY`
 
 ---
 
@@ -272,7 +303,7 @@ CLI / Node SDK / Python SDK / .NET SDK / MCP Server
 License keys at [secretdrop.app/sirr](https://secretdrop.app/sirr).
 
 ```bash
-SIRR_LICENSE_KEY=sirr_lic_... SIRR_MASTER_KEY=... ./sirr serve
+SIRR_LICENSE_KEY=sirr_lic_... ./sirr serve
 ```
 
 ---
@@ -285,6 +316,7 @@ SIRR_LICENSE_KEY=sirr_lic_... SIRR_MASTER_KEY=... ./sirr serve
 - [ ] Audit log
 - [ ] Kubernetes operator
 - [ ] Terraform provider
+- [x] Patchable secrets (update value without changing key)
 - [ ] Secret versioning
 
 ---
