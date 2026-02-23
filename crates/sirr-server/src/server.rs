@@ -5,25 +5,30 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::{
     middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, head, patch, post},
     Router,
 };
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
 use crate::{
-    auth::require_auth,
-    handlers::{create_secret, delete_secret, get_secret, health, list_secrets, prune_secrets},
+    auth::require_api_key,
+    handlers::{
+        create_secret, delete_secret, get_secret, head_secret, health, list_secrets,
+        patch_secret, prune_secrets,
+    },
     license, AppState,
 };
 
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
-    pub master_key: String,
+    pub api_key: Option<String>,
     pub license_key: Option<String>,
     pub data_dir: Option<PathBuf>,
     pub sweep_interval: Duration,
+    pub cors_origins: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -34,10 +39,11 @@ impl Default for ServerConfig {
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(8080),
-            master_key: std::env::var("SIRR_MASTER_KEY").unwrap_or_default(),
+            api_key: std::env::var("SIRR_API_KEY").ok(),
             license_key: std::env::var("SIRR_LICENSE_KEY").ok(),
             data_dir: std::env::var("SIRR_DATA_DIR").ok().map(PathBuf::from),
             sweep_interval: Duration::from_secs(300),
+            cors_origins: std::env::var("SIRR_CORS_ORIGINS").ok(),
         }
     }
 }
@@ -54,12 +60,8 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
 
     info!(data_dir = %data_dir.display(), "using data directory");
 
-    // Load or generate the Argon2id salt.
-    let salt = load_or_create_salt(&data_dir)?;
-
-    // Derive encryption key from master key + salt.
-    let enc_key = crate::store::crypto::derive_key(&cfg.master_key, &salt)
-        .context("derive encryption key")?;
+    // Load or generate the encryption key.
+    let enc_key = load_or_create_key(&data_dir)?;
 
     // Open redb store.
     let db_path = data_dir.join("sirr.db");
@@ -87,23 +89,35 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
 
     let state = AppState {
         store,
-        master_key: cfg.master_key,
+        api_key: cfg.api_key,
         license: lic_status,
     };
 
-    // Build router.
+    let cors = build_cors(cfg.cors_origins.as_deref());
+
+    // Public routes (no auth required).
+    let public = Router::new()
+        .route("/health", get(health))
+        .route("/secrets/{key}", get(get_secret))
+        .route("/secrets/{key}", head(head_secret));
+
+    // Protected routes (API key required if configured).
     let protected = Router::new()
         .route("/secrets", get(list_secrets))
         .route("/secrets", post(create_secret))
-        .route("/secrets/:key", get(get_secret))
-        .route("/secrets/:key", delete(delete_secret))
+        .route("/secrets/{key}", patch(patch_secret))
+        .route("/secrets/{key}", delete(delete_secret))
         .route("/prune", post(prune_secrets))
-        .layer(middleware::from_fn_with_state(state.clone(), require_auth));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_api_key,
+        ));
 
     let app = Router::new()
-        .route("/health", get(health))
+        .merge(public)
         .merge(protected)
         .with_state(state)
+        .layer(cors)
         .layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
@@ -118,23 +132,46 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     axum::serve(listener, app).await.context("server error")
 }
 
-fn load_or_create_salt(data_dir: &std::path::Path) -> Result<[u8; 32]> {
-    let salt_path = data_dir.join("sirr.salt");
-    if salt_path.exists() {
-        let bytes = std::fs::read(&salt_path).context("read sirr.salt")?;
-        if bytes.len() != 32 {
-            anyhow::bail!(
-                "sirr.salt is corrupt (expected 32 bytes, got {})",
+fn load_or_create_key(
+    data_dir: &std::path::Path,
+) -> Result<crate::store::crypto::EncryptionKey> {
+    let key_path = data_dir.join("sirr.key");
+    if key_path.exists() {
+        let bytes = std::fs::read(&key_path).context("read sirr.key")?;
+        crate::store::crypto::load_key(&bytes).ok_or_else(|| {
+            anyhow::anyhow!(
+                "sirr.key is corrupt (expected 32 bytes, got {})",
                 bytes.len()
-            );
-        }
-        let mut salt = [0u8; 32];
-        salt.copy_from_slice(&bytes);
-        Ok(salt)
+            )
+        })
     } else {
-        let salt = crate::store::crypto::generate_salt();
-        std::fs::write(&salt_path, salt).context("write sirr.salt")?;
-        info!("generated new encryption salt");
-        Ok(salt)
+        let key = crate::store::crypto::generate_key();
+        std::fs::write(&key_path, key.as_bytes()).context("write sirr.key")?;
+        info!("generated new encryption key");
+        Ok(key)
+    }
+}
+
+fn build_cors(origins: Option<&str>) -> CorsLayer {
+    let cors = CorsLayer::new()
+        .allow_methods([
+            http::Method::GET,
+            http::Method::HEAD,
+            http::Method::POST,
+            http::Method::PATCH,
+            http::Method::DELETE,
+            http::Method::OPTIONS,
+        ])
+        .allow_headers(Any);
+
+    match origins {
+        Some(o) => {
+            let origins: Vec<_> = o
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            cors.allow_origin(origins)
+        }
+        None => cors.allow_origin(Any),
     }
 }

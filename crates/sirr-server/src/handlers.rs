@@ -116,6 +116,101 @@ pub async fn get_secret(State(state): State<AppState>, Path(key): Path<String>) 
     }
 }
 
+// ── Head ──────────────────────────────────────────────────────────────────────
+
+pub async fn head_secret(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+    match state.store.head(&key) {
+        Ok(Some((meta, sealed))) => {
+            let status = if sealed {
+                StatusCode::GONE
+            } else {
+                StatusCode::OK
+            };
+
+            let reads_remaining = match meta.max_reads {
+                Some(max) => (max.saturating_sub(meta.read_count)).to_string(),
+                None => "unlimited".to_string(),
+            };
+
+            let mut builder = Response::builder()
+                .status(status)
+                .header("X-Sirr-Read-Count", meta.read_count.to_string())
+                .header("X-Sirr-Reads-Remaining", reads_remaining)
+                .header("X-Sirr-Delete", meta.delete.to_string())
+                .header("X-Sirr-Created-At", meta.created_at.to_string());
+
+            if let Some(exp) = meta.expires_at {
+                builder = builder.header("X-Sirr-Expires-At", exp.to_string());
+            }
+
+            if sealed {
+                builder = builder.header("X-Sirr-Status", "sealed");
+            } else {
+                builder = builder.header("X-Sirr-Status", "active");
+            }
+
+            builder.body(axum::body::Body::empty()).unwrap()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "not found or expired"})),
+        )
+            .into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+// ── Patch ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct PatchRequest {
+    pub value: Option<String>,
+    pub max_reads: Option<u32>,
+    pub ttl_seconds: Option<u64>,
+}
+
+pub async fn patch_secret(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(body): Json<PatchRequest>,
+) -> Response {
+    if let Some(ref v) = body.value {
+        if v.len() > 1_048_576 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "value exceeds 1 MiB limit"})),
+            )
+                .into_response();
+        }
+    }
+
+    match state.store.patch(
+        &key,
+        body.value.as_deref(),
+        body.max_reads,
+        body.ttl_seconds,
+    ) {
+        Ok(Some(meta)) => Json(meta).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "not found or expired"})),
+        )
+            .into_response(),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("cannot patch") {
+                (
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": msg})),
+                )
+                    .into_response()
+            } else {
+                internal_error(e)
+            }
+        }
+    }
+}
+
 // ── Delete ────────────────────────────────────────────────────────────────────
 
 pub async fn delete_secret(State(state): State<AppState>, Path(key): Path<String>) -> Response {

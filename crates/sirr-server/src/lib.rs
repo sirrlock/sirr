@@ -9,8 +9,8 @@ pub mod store;
 #[derive(Clone)]
 pub struct AppState {
     pub store: store::Store,
-    /// The raw master key string, used for bearer-token comparison.
-    pub master_key: String,
+    /// Optional API key for write-protecting mutations.
+    pub api_key: Option<String>,
     /// Validated license status (set at startup).
     pub license: license::LicenseStatus,
 }
