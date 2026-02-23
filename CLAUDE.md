@@ -20,6 +20,7 @@ sirr/
 │   └── mcp/                    # @sirr/mcp — MCP server for Claude Code
 ├── Formula/sirr.rb             # Homebrew formula
 ├── Dockerfile                  # FROM scratch + musl binary
+├── docker-compose.yml          # Production setup with key file mount
 └── .github/workflows/
     ├── ci.yml                  # fmt + clippy + test (3 OS) + npm build/test
     └── release.yml             # cross-platform binaries + Docker + npm publish
@@ -64,11 +65,14 @@ key + per-record nonce --ChaCha20Poly1305--> encrypted value stored in redb
 - `argon2::Error` and `password_hash::Error` don't implement `std::error::Error`. Use `.map_err(|e| anyhow::anyhow!("{e}"))` — not `.context()`.
 - License check: >100 active secrets requires a valid `SIRR_LICENSE_KEY`. The check runs at secret creation time, not at startup.
 - The `SIRR_MASTER_KEY` serves double duty: Argon2id seed AND bearer token. This is intentional — one env var to configure.
+- **Master key delivery**: prefer `SIRR_MASTER_KEY_FILE` (file-based) over `SIRR_MASTER_KEY` (env var) in production. Env vars are visible via `docker inspect` and `/proc`.
+- **Record format versioning**: encoded records are prefixed with `[0x01, key_version]`. Legacy records (without prefix) are decoded as key_version 1. The first byte of a legacy bincode-encoded SecretRecord is always ≥ 16 (ChaCha20Poly1305 ciphertext length), so 0x01 is unambiguous.
+- **Key rotation**: `sirr rotate` re-encrypts all records offline. The Store holds the old key; the new key is passed to `Store::rotate()`. Key version increments from the current max found in the database.
 
 ## Testing
 
 ```bash
-cargo test --all                   # 6 unit tests (crypto round-trip, TTL, burn, list)
+cargo test --all                   # 8 unit tests (crypto round-trip, TTL, burn, list, key version, rotation)
 
 # Manual smoke test
 SIRR_MASTER_KEY=test ./target/release/sirr serve &

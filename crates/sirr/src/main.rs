@@ -77,6 +77,10 @@ enum Commands {
     },
     /// Delete all expired secrets immediately
     Prune,
+    /// Rotate the encryption key (offline). Re-encrypts all records with a new
+    /// master key. Requires SIRR_MASTER_KEY (or _FILE) for the current key and
+    /// SIRR_NEW_MASTER_KEY (or _FILE) for the replacement.
+    Rotate,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -133,16 +137,17 @@ async fn main() -> Result<()> {
             let token = require_token(&cli.token)?;
             cmd_prune(&cli.server, &token).await
         }
+
+        Commands::Rotate => cmd_rotate().await,
     }
 }
 
 // ── Command implementations ───────────────────────────────────────────────────
 
 async fn cmd_serve(host: String, port: u16) -> Result<()> {
-    let master_key = std::env::var("SIRR_MASTER_KEY")
-        .context("SIRR_MASTER_KEY environment variable is required")?;
+    let master_key = sirr_server::resolve_master_key()?;
     if master_key.is_empty() {
-        anyhow::bail!("SIRR_MASTER_KEY must not be empty");
+        anyhow::bail!("master key must not be empty");
     }
 
     let cfg = sirr_server::ServerConfig {
@@ -155,6 +160,53 @@ async fn cmd_serve(host: String, port: u16) -> Result<()> {
     };
 
     sirr_server::run(cfg).await
+}
+
+async fn cmd_rotate() -> Result<()> {
+    // Resolve the current (old) master key.
+    let old_master_key = sirr_server::resolve_master_key()
+        .context("current master key required for rotation")?;
+
+    // Resolve the new master key from SIRR_NEW_MASTER_KEY_FILE or SIRR_NEW_MASTER_KEY.
+    let new_master_key = if let Ok(path) = std::env::var("SIRR_NEW_MASTER_KEY_FILE") {
+        sirr_server::read_key_file(std::path::Path::new(&path))?
+    } else {
+        std::env::var("SIRR_NEW_MASTER_KEY")
+            .context("SIRR_NEW_MASTER_KEY or SIRR_NEW_MASTER_KEY_FILE is required")?
+    };
+    if new_master_key.is_empty() {
+        anyhow::bail!("new master key must not be empty");
+    }
+
+    // Resolve data directory and load salt.
+    let data_dir_env = std::env::var("SIRR_DATA_DIR").ok().map(Into::into);
+    let data_dir = sirr_server::resolve_data_dir(data_dir_env.as_ref())?;
+    let salt = sirr_server::load_or_create_salt(&data_dir)?;
+
+    // Derive both encryption keys.
+    let old_key = sirr_server::store::crypto::derive_key(&old_master_key, &salt)
+        .context("derive old encryption key")?;
+    let new_key = sirr_server::store::crypto::derive_key(&new_master_key, &salt)
+        .context("derive new encryption key")?;
+
+    // Open the store with the old key.
+    let db_path = data_dir.join("sirr.db");
+    let store = sirr_server::store::Store::open(&db_path, old_key).context("open store")?;
+
+    // Determine new key version (increment from current max).
+    let current_version = store.max_key_version()?;
+    let new_version = current_version
+        .checked_add(1)
+        .context("key version overflow (max 255 rotations)")?;
+
+    // Re-encrypt all records.
+    let count = store.rotate(&new_key, new_version)?;
+
+    println!("rotated {count} secret(s) to key version {new_version}");
+    println!(
+        "update SIRR_MASTER_KEY / SIRR_MASTER_KEY_FILE to the new key value before restarting the server"
+    );
+    Ok(())
 }
 
 async fn cmd_push(
