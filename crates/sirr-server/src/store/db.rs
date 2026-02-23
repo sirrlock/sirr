@@ -211,6 +211,109 @@ impl Store {
         Ok(removed)
     }
 
+    /// Retrieve metadata for a secret without incrementing read_count.
+    /// Returns (meta, is_sealed). Returns None if not found or TTL-expired.
+    pub fn head(&self, secret_key: &str) -> Result<Option<(SecretMeta, bool)>> {
+        let now = Self::now();
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SECRETS)?;
+
+        let raw_bytes: Option<Vec<u8>> =
+            table.get(secret_key)?.map(|guard| guard.value().to_vec());
+
+        match raw_bytes {
+            None => Ok(None),
+            Some(bytes) => {
+                let record: SecretRecord = decode(&bytes)?;
+                if record.is_expired(now) {
+                    return Ok(None);
+                }
+                let sealed = record.is_sealed();
+                Ok(Some((
+                    SecretMeta {
+                        key: secret_key.to_owned(),
+                        created_at: record.created_at,
+                        expires_at: record.expires_at,
+                        max_reads: record.max_reads,
+                        read_count: record.read_count,
+                        delete: record.delete,
+                    },
+                    sealed,
+                )))
+            }
+        }
+    }
+
+    /// Update an existing secret (only if delete=false).
+    /// Resets read_count to 0. Returns updated metadata.
+    /// Returns Err if the secret has delete=true.
+    /// Returns Ok(None) if not found or TTL-expired.
+    pub fn patch(
+        &self,
+        secret_key: &str,
+        new_value: Option<&str>,
+        new_max_reads: Option<u32>,
+        new_ttl_seconds: Option<u64>,
+    ) -> Result<Option<SecretMeta>> {
+        let now = Self::now();
+
+        let write_txn = self.db.begin_write()?;
+        let result = {
+            let mut table = write_txn.open_table(SECRETS)?;
+
+            let raw_bytes: Option<Vec<u8>> =
+                table.get(secret_key)?.map(|guard| guard.value().to_vec());
+
+            match raw_bytes {
+                None => Ok(None),
+                Some(bytes) => {
+                    let mut record: SecretRecord = decode(&bytes)?;
+
+                    if record.is_expired(now) {
+                        table.remove(secret_key)?;
+                        return Ok(None);
+                    }
+
+                    if record.delete {
+                        anyhow::bail!("cannot patch a secret with delete=true");
+                    }
+
+                    if let Some(val) = new_value {
+                        let (encrypted, nonce) =
+                            super::crypto::encrypt(&self.key, val.as_bytes())
+                                .context("encrypt patched value")?;
+                        record.value_encrypted = encrypted;
+                        record.nonce = nonce;
+                    }
+
+                    if let Some(max) = new_max_reads {
+                        record.max_reads = Some(max);
+                    }
+
+                    if let Some(ttl) = new_ttl_seconds {
+                        record.expires_at = Some(now + ttl as i64);
+                    }
+
+                    record.read_count = 0;
+
+                    let updated = encode(&record)?;
+                    table.insert(secret_key, updated.as_slice())?;
+
+                    Ok(Some(SecretMeta {
+                        key: secret_key.to_owned(),
+                        created_at: record.created_at,
+                        expires_at: record.expires_at,
+                        max_reads: record.max_reads,
+                        read_count: 0,
+                        delete: record.delete,
+                    }))
+                }
+            }
+        };
+        write_txn.commit()?;
+        result
+    }
+
     /// Spawn a background Tokio task that calls `prune()` every `interval`.
     pub fn spawn_sweep(self, interval: Duration) {
         tokio::spawn(async move {
@@ -285,5 +388,69 @@ mod tests {
         let metas = s.list().unwrap();
         assert!(metas.iter().any(|m| m.key == "LIVE"));
         assert!(!metas.iter().any(|m| m.key == "DEAD"));
+    }
+
+    #[test]
+    fn head_returns_meta_without_incrementing() {
+        let (s, _dir) = make_store();
+        s.put("H", "val", None, Some(5), true).unwrap();
+        let (meta, sealed) = s.head("H").unwrap().unwrap();
+        assert_eq!(meta.read_count, 0);
+        assert_eq!(meta.max_reads, Some(5));
+        assert!(!sealed);
+        let (meta2, _) = s.head("H").unwrap().unwrap();
+        assert_eq!(meta2.read_count, 0);
+    }
+
+    #[test]
+    fn head_returns_none_for_expired() {
+        let (s, _dir) = make_store();
+        s.put("HE", "val", Some(0), None, true).unwrap();
+        assert!(s.head("HE").unwrap().is_none());
+    }
+
+    #[test]
+    fn head_returns_sealed_status() {
+        let (s, _dir) = make_store();
+        s.put("HS", "val", None, Some(1), false).unwrap();
+        s.get("HS").unwrap(); // read once, hits limit
+        let (meta, sealed) = s.head("HS").unwrap().unwrap();
+        assert!(sealed);
+        assert_eq!(meta.read_count, 1);
+    }
+
+    #[test]
+    fn patch_updates_value_and_resets_count() {
+        let (s, _dir) = make_store();
+        s.put("P", "old", None, Some(5), false).unwrap();
+        s.get("P").unwrap(); // read_count = 1
+        let meta = s.patch("P", Some("new"), None, None).unwrap().unwrap();
+        assert_eq!(meta.read_count, 0); // reset
+        assert_eq!(s.get("P").unwrap(), Some("new".into()));
+    }
+
+    #[test]
+    fn patch_rejects_delete_true_secret() {
+        let (s, _dir) = make_store();
+        s.put("PD", "val", None, None, true).unwrap();
+        let err = s.patch("PD", Some("new"), None, None);
+        assert!(err.is_err()); // should error for delete=true
+    }
+
+    #[test]
+    fn patch_unseals_secret() {
+        let (s, _dir) = make_store();
+        s.put("PS", "val", None, Some(1), false).unwrap();
+        s.get("PS").unwrap(); // now sealed
+        assert!(s.get("PS").unwrap().is_none()); // sealed, can't read
+        s.patch("PS", None, Some(5), None).unwrap(); // unseal with new max_reads
+        assert_eq!(s.get("PS").unwrap(), Some("val".into())); // readable again
+    }
+
+    #[test]
+    fn patch_not_found() {
+        let (s, _dir) = make_store();
+        let result = s.patch("NOPE", Some("val"), None, None).unwrap();
+        assert!(result.is_none());
     }
 }
