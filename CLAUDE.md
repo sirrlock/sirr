@@ -20,6 +20,7 @@ sirr/
 │   └── mcp/                    # @sirr/mcp — MCP server for Claude Code
 ├── Formula/sirr.rb             # Homebrew formula
 ├── Dockerfile                  # FROM scratch + musl binary
+├── docker-compose.yml          # Production setup with key file mount
 └── .github/workflows/
     ├── ci.yml                  # fmt + clippy + test (3 OS) + npm build/test
     └── release.yml             # cross-platform binaries + Docker + npm publish

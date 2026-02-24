@@ -28,11 +28,18 @@ pub enum GetResult {
 pub struct Store {
     db: Arc<Database>,
     key: Arc<EncryptionKey>,
+    key_version: u8,
 }
 
 impl Store {
     /// Open (or create) the database at `path`, using `key` for encryption.
     pub fn open(path: &Path, key: EncryptionKey) -> Result<Self> {
+        Self::open_versioned(path, key, 1)
+    }
+
+    /// Open (or create) the database at `path`, using `key` with an explicit version tag.
+    /// The `key_version` is stored alongside each encrypted record to support key rotation.
+    pub fn open_versioned(path: &Path, key: EncryptionKey, key_version: u8) -> Result<Self> {
         let db = Database::create(path).context("open redb database")?;
 
         // Ensure the table exists.
@@ -43,6 +50,7 @@ impl Store {
         Ok(Self {
             db: Arc::new(db),
             key: Arc::new(key),
+            key_version,
         })
     }
 
@@ -78,7 +86,7 @@ impl Store {
             delete,
         };
 
-        let bytes = encode(&record)?;
+        let bytes = encode(&record, self.key_version)?;
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(SECRETS)?;
@@ -110,7 +118,7 @@ impl Store {
             match raw_bytes {
                 None => GetResult::NotFound,
                 Some(bytes) => {
-                    let mut record: SecretRecord = decode(&bytes)?;
+                    let (mut record, record_key_version) = decode(&bytes)?;
 
                     if record.is_expired(now) {
                         table.remove(secret_key)?;
@@ -170,7 +178,7 @@ impl Store {
         let mut metas = Vec::new();
         for item in table.iter()? {
             let (k, v) = item?;
-            let record: SecretRecord = decode(v.value())?;
+            let (record, _kv) = decode(v.value())?;
             if !record.is_expired(now) {
                 metas.push(SecretMeta {
                     key: k.value().to_owned(),
@@ -340,16 +348,123 @@ impl Store {
             }
         });
     }
+
+    /// Return the highest key version found across all stored records.
+    /// Returns 1 if the database is empty (legacy default).
+    pub fn max_key_version(&self) -> Result<u8> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SECRETS)?;
+        let mut max = 1u8;
+        for item in table.iter()? {
+            let (_k, v) = item?;
+            let (_record, kv) = decode(v.value())?;
+            max = max.max(kv);
+        }
+        Ok(max)
+    }
+
+    /// Re-encrypt all non-expired records with `new_key`, tagging them with
+    /// `new_key_version`. The current `self.key` is used to decrypt.
+    /// Returns the number of records rotated.
+    pub fn rotate(&self, new_key: &EncryptionKey, new_key_version: u8) -> Result<usize> {
+        let now = Self::now();
+
+        // Read pass: collect all raw bytes keyed by secret name.
+        let entries: Vec<(String, Vec<u8>)> = {
+            let read_txn = self.db.begin_read()?;
+            let table = read_txn.open_table(SECRETS)?;
+            let mut out = Vec::new();
+            for item in table.iter()? {
+                let (k, v) = item?;
+                out.push((k.value().to_owned(), v.value().to_vec()));
+            }
+            out
+        };
+
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        // Write pass: decrypt with old key, re-encrypt with new key.
+        let write_txn = self.db.begin_write()?;
+        let mut count = 0usize;
+        {
+            let mut table = write_txn.open_table(SECRETS)?;
+            for (key, raw_bytes) in &entries {
+                let (record, _old_version) = decode(raw_bytes)?;
+
+                // Skip expired records — they'll be pruned normally.
+                if record.is_expired(now) {
+                    continue;
+                }
+
+                // Decrypt with old key.
+                let plaintext = super::crypto::decrypt(
+                    &self.key,
+                    &record.value_encrypted,
+                    &record.nonce,
+                )
+                .context("decrypt for rotation")?;
+
+                // Re-encrypt with new key.
+                let (new_encrypted, new_nonce) =
+                    super::crypto::encrypt(new_key, &plaintext).context("encrypt for rotation")?;
+
+                let new_record = SecretRecord {
+                    value_encrypted: new_encrypted,
+                    nonce: new_nonce,
+                    created_at: record.created_at,
+                    expires_at: record.expires_at,
+                    max_reads: record.max_reads,
+                    read_count: record.read_count,
+                };
+
+                let new_bytes = encode(&new_record, new_key_version)?;
+                table.insert(key.as_str(), new_bytes.as_slice())?;
+                count += 1;
+            }
+        }
+        write_txn.commit()?;
+
+        info!(rotated = count, new_key_version, "key rotation complete");
+        Ok(count)
+    }
 }
 
-fn encode(record: &SecretRecord) -> Result<Vec<u8>> {
-    bincode::serde::encode_to_vec(record, bincode::config::standard()).context("bincode encode")
+/// Encode a SecretRecord in v2 format: `[RECORD_V2_MARKER, key_version] + bincode(record)`.
+fn encode(record: &SecretRecord, key_version: u8) -> Result<Vec<u8>> {
+    let payload =
+        bincode::serde::encode_to_vec(record, bincode::config::standard()).context("bincode encode")?;
+    let mut out = Vec::with_capacity(2 + payload.len());
+    out.push(RECORD_V2_MARKER);
+    out.push(key_version);
+    out.extend_from_slice(&payload);
+    Ok(out)
 }
 
-fn decode(bytes: &[u8]) -> Result<SecretRecord> {
-    let (record, _) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-        .context("bincode decode")?;
-    Ok(record)
+/// Decode bytes into `(SecretRecord, key_version)`.
+/// Handles both v2 format (prefixed) and legacy v1 format (raw bincode).
+fn decode(bytes: &[u8]) -> Result<(SecretRecord, u8)> {
+    if bytes.is_empty() {
+        anyhow::bail!("empty record");
+    }
+    if bytes[0] == RECORD_V2_MARKER {
+        // v2 format: [0x01, key_version, bincode...]
+        if bytes.len() < 3 {
+            anyhow::bail!("truncated v2 record");
+        }
+        let key_version = bytes[1];
+        let (record, _) =
+            bincode::serde::decode_from_slice(&bytes[2..], bincode::config::standard())
+                .context("bincode decode v2")?;
+        Ok((record, key_version))
+    } else {
+        // Legacy v1: raw bincode, no version prefix. Assume key_version = 1.
+        let (record, _) =
+            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                .context("bincode decode")?;
+        Ok((record, 1))
+    }
 }
 
 #[cfg(test)]

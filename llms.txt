@@ -8,6 +8,9 @@ Single Rust binary, zero runtime dependencies, end-to-end encrypted.
 - Store secrets with TTL (time-to-live) and/or read limits
 - Secrets auto-delete when expired or after N reads
 - Bearer token authentication, ChaCha20Poly1305 encryption at rest
+- File-based master key delivery for production (avoids env var exposure)
+- Key rotation with versioned records
+- Audit logging for all secret operations
 - CLI, HTTP API, Node.js SDK, and MCP server for Claude Code
 
 ## Primary Use Cases
@@ -28,7 +31,7 @@ GET    /health           Health check (no auth required)
 
 ## CLI
 
-sirr serve                              Start server (requires SIRR_MASTER_KEY)
+sirr serve                              Start server (requires SIRR_MASTER_KEY or _FILE)
 sirr push KEY=value [--ttl 1h] [--reads 1]
 sirr push .env [--ttl 24h]             Push all keys from .env file
 sirr get KEY                            Print value to stdout
@@ -38,16 +41,20 @@ sirr share KEY                          Print URL reference for the secret
 sirr list                               Show active secrets (metadata)
 sirr delete KEY
 sirr prune                              Delete all expired now
+sirr rotate                             Re-encrypt all records with a new master key
 
 ## Environment Variables
 
-SIRR_MASTER_KEY    Bearer token + Argon2id seed (required)
-SIRR_LICENSE_KEY   License key for >100 secrets (get at secretdrop.app/sirr)
-SIRR_PORT          HTTP port (default: 8080)
-SIRR_HOST          Bind address (default: 0.0.0.0)
-SIRR_DATA_DIR      Storage dir (default: ~/.local/share/sirr/)
-SIRR_SERVER        CLI: server URL (default: http://localhost:8080)
-SIRR_TOKEN         CLI: bearer token (same as SIRR_MASTER_KEY on server)
+SIRR_MASTER_KEY_FILE   Path to master key file (recommended for production)
+SIRR_MASTER_KEY        Bearer token + Argon2id seed (use _FILE in production)
+SIRR_LICENSE_KEY       License key for >100 secrets (get at secretdrop.app/sirr)
+SIRR_PORT              HTTP port (default: 8080)
+SIRR_HOST              Bind address (default: 0.0.0.0)
+SIRR_DATA_DIR          Storage dir (default: ~/.local/share/sirr/)
+SIRR_SERVER            CLI: server URL (default: http://localhost:8080)
+SIRR_TOKEN             CLI: bearer token (same as SIRR_MASTER_KEY on server)
+SIRR_NEW_MASTER_KEY_FILE   For `sirr rotate`: new key file
+SIRR_NEW_MASTER_KEY        For `sirr rotate`: new key value
 
 ## Node.js SDK
 
@@ -65,10 +72,15 @@ Tools: get_secret, push_secret, list_secrets, delete_secret, prune_secrets
 
 ## Security Model
 
-- Argon2id (64 MiB, 3 iterations) derives 32-byte key from SIRR_MASTER_KEY + salt
+- Master key delivered via file (SIRR_MASTER_KEY_FILE) or env var (SIRR_MASTER_KEY)
+- File-based delivery recommended — env vars visible via docker inspect and /proc
+- Argon2id (64 MiB, 3 iterations) derives 32-byte key from master key + salt
 - ChaCha20Poly1305 encrypts each secret value with a random per-record nonce
+- Each record tagged with key version for rotation support
 - Metadata (TTL, read count) stored plaintext for efficient expiry scanning
 - Constant-time bearer token comparison prevents timing attacks
+- Audit logging on all CRUD operations (structured tracing)
+- Key rotation via `sirr rotate` — re-encrypts all records atomically
 - No telemetry, no phone-home
 
 ## Storage
@@ -90,3 +102,4 @@ packages/node/        TypeScript SDK (@sirr/sdk)
 packages/mcp/         MCP server (@sirr/mcp) for Claude Code integration
 Formula/sirr.rb       Homebrew formula
 Dockerfile            FROM scratch + musl binary
+docker-compose.yml    Production setup with key file mount

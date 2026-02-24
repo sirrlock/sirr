@@ -15,4 +15,4 @@ pub struct AppState {
     pub license: license::LicenseStatus,
 }
 
-pub use server::{run, ServerConfig};
+pub use server::{load_or_create_salt, read_key_file, resolve_data_dir, resolve_master_key, run, ServerConfig};

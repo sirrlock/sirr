@@ -63,6 +63,23 @@ This isn't paranoia. This is correct threat modeling for an age where your codin
 
 ### Run the server
 
+**With a key file (recommended for production):**
+
+```bash
+# Generate the master key file once.
+openssl rand -hex 32 > master.key
+chmod 400 master.key
+
+docker run -d \
+  -p 8080:8080 \
+  -v ./sirr-data:/data \
+  -v ./master.key:/run/secrets/master.key:ro \
+  -e SIRR_MASTER_KEY_FILE=/run/secrets/master.key \
+  ghcr.io/sirrvault/sirr
+```
+
+Or with an environment variable (development only — visible via `docker inspect`):
+
 ```bash
 docker run -d \
   -p 8080:8080 \
@@ -177,6 +194,9 @@ sirr list                                  # metadata only, no values shown
 sirr delete KEY
 sirr prune                                 # delete all expired secrets now
 sirr share KEY                             # print reference URL
+
+# Key rotation (offline — stop the server first)
+sirr rotate                                # re-encrypts all records with new key
 ```
 
 TTL format: `30s`, `5m`, `2h`, `7d`, `30d`
@@ -258,12 +278,21 @@ Returns metadata only — values are never included in list responses.
 | `SIRR_CORS_ORIGINS` | `*` (all) | Comma-separated allowed origins |
 | `SIRR_LOG_LEVEL` | `info` | `trace` / `debug` / `info` / `warn` / `error` |
 
+One of `SIRR_MASTER_KEY_FILE` or `SIRR_MASTER_KEY` is required. If both are set, the file takes precedence. File-based key delivery is recommended for production because environment variables are visible via `docker inspect` and `/proc`.
+
 **CLI / client variables:**
 
 | Variable | Default | Description |
 |---|---|---|
 | `SIRR_SERVER` | `http://localhost:8080` | Server base URL |
 | `SIRR_API_KEY` | — | Same value as server's `SIRR_API_KEY` (for write ops) |
+
+**Key rotation variables** (used by `sirr rotate`):
+
+| Variable | Description |
+|---|---|
+| `SIRR_NEW_MASTER_KEY_FILE` | Path to file containing the new master key |
+| `SIRR_NEW_MASTER_KEY` | New master key value (prefer `_FILE`) |
 
 ¹ `~/.local/share/sirr/` (Linux), `~/Library/Application Support/sirr/` (macOS), `%APPDATA%\sirr\` (Windows). Docker: mount `/data` and set `SIRR_DATA_DIR=/data`.
 
@@ -313,7 +342,7 @@ SIRR_LICENSE_KEY=sirr_lic_... ./sirr serve
 - [ ] Web UI
 - [ ] Webhooks on expiry / burn
 - [ ] Team namespaces
-- [ ] Audit log
+- [x] Audit log
 - [ ] Kubernetes operator
 - [ ] Terraform provider
 - [x] Patchable secrets (update value without changing key)
