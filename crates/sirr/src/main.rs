@@ -80,10 +80,34 @@ enum Commands {
     },
     /// Delete all expired secrets immediately
     Prune,
+    /// Manage webhooks
+    #[command(subcommand)]
+    Webhooks(WebhookCommand),
     /// Rotate the encryption key (offline). Re-encrypts all records with a new
     /// master key. Requires SIRR_MASTER_KEY (or _FILE) for the current key and
     /// SIRR_NEW_MASTER_KEY (or _FILE) for the replacement.
     Rotate,
+}
+
+#[derive(Subcommand)]
+enum WebhookCommand {
+    /// List registered webhooks
+    List,
+    /// Register a webhook URL
+    Add {
+        /// Webhook endpoint URL
+        #[arg(name = "URL")]
+        url: String,
+        /// Comma-separated event types (default: all)
+        #[arg(long, value_delimiter = ',')]
+        events: Option<Vec<String>>,
+    },
+    /// Remove a webhook by ID
+    Remove {
+        /// Webhook ID
+        #[arg(name = "ID")]
+        id: String,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -134,6 +158,16 @@ async fn main() -> Result<()> {
         Commands::Delete { key } => cmd_delete(&cli.server, &cli.api_key, &key).await,
 
         Commands::Prune => cmd_prune(&cli.server, &cli.api_key).await,
+
+        Commands::Webhooks(sub) => match sub {
+            WebhookCommand::List => cmd_webhook_list(&cli.server, &cli.api_key).await,
+            WebhookCommand::Add { url, events } => {
+                cmd_webhook_add(&cli.server, &cli.api_key, &url, events).await
+            }
+            WebhookCommand::Remove { id } => {
+                cmd_webhook_remove(&cli.server, &cli.api_key, &id).await
+            }
+        },
 
         Commands::Rotate => cmd_rotate().await,
     }
@@ -395,6 +429,103 @@ async fn cmd_prune(server: &str, api_key: &Option<String>) -> Result<()> {
     } else {
         let status = resp.status();
         anyhow::bail!("server returned {status}");
+    }
+    Ok(())
+}
+
+// ── Webhooks ─────────────────────────────────────────────────────────────
+
+async fn cmd_webhook_list(server: &str, api_key: &Option<String>) -> Result<()> {
+    let client = Client::new();
+    let req = client.get(format!("{}/webhooks", server.trim_end_matches('/')));
+    let resp = with_auth(req, api_key)
+        .send()
+        .await
+        .context("HTTP request failed")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("server returned {status}: {text}");
+    }
+
+    let json: Value = resp.json().await?;
+    let webhooks = json["webhooks"].as_array();
+    match webhooks {
+        Some(arr) if arr.is_empty() => println!("(no webhooks registered)"),
+        Some(arr) => {
+            for w in arr {
+                let id = w["id"].as_str().unwrap_or("?");
+                let url = w["url"].as_str().unwrap_or("?");
+                let events = w["events"]
+                    .as_array()
+                    .map(|e| {
+                        e.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_else(|| "*".into());
+                println!("  {id}  {url}  [{events}]");
+            }
+        }
+        None => println!("(no webhooks registered)"),
+    }
+    Ok(())
+}
+
+async fn cmd_webhook_add(
+    server: &str,
+    api_key: &Option<String>,
+    url: &str,
+    events: Option<Vec<String>>,
+) -> Result<()> {
+    let client = Client::new();
+    let mut body = serde_json::json!({"url": url});
+    if let Some(evts) = events {
+        body["events"] = serde_json::json!(evts);
+    }
+
+    let req = client.post(format!("{}/webhooks", server.trim_end_matches('/')));
+    let resp = with_auth(req, api_key)
+        .json(&body)
+        .send()
+        .await
+        .context("HTTP request failed")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("server returned {status}: {text}");
+    }
+
+    let json: Value = resp.json().await?;
+    let id = json["id"].as_str().unwrap_or("?");
+    let secret = json["secret"].as_str().unwrap_or("?");
+    println!("webhook registered");
+    println!("  id:     {id}");
+    println!("  secret: {secret}");
+    println!("  (save the secret — it won't be shown again)");
+    Ok(())
+}
+
+async fn cmd_webhook_remove(server: &str, api_key: &Option<String>, id: &str) -> Result<()> {
+    let client = Client::new();
+    let req = client.delete(format!("{}/webhooks/{}", server.trim_end_matches('/'), id));
+    let resp = with_auth(req, api_key)
+        .send()
+        .await
+        .context("HTTP request failed")?;
+
+    if resp.status().is_success() {
+        println!("webhook {id} removed");
+    } else {
+        let status = resp.status();
+        let json: Value = resp.json().await.unwrap_or_default();
+        anyhow::bail!(
+            "server returned {status}: {}",
+            json["error"].as_str().unwrap_or("")
+        );
     }
     Ok(())
 }

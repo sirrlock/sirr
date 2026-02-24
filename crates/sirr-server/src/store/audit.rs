@@ -12,6 +12,8 @@ pub const ACTION_SECRET_PATCH: &str = "secret.patch";
 pub const ACTION_SECRET_LIST: &str = "secret.list";
 pub const ACTION_SECRET_PRUNE: &str = "secret.prune";
 pub const ACTION_SECRET_EXPIRED: &str = "secret.expired";
+pub const ACTION_WEBHOOK_CREATE: &str = "webhook.create";
+pub const ACTION_WEBHOOK_DELETE: &str = "webhook.delete";
 
 // ── AuditEvent ───────────────────────────────────────────────────────────────
 

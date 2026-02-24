@@ -16,9 +16,11 @@ use crate::{
         audit::{
             AuditEvent, ACTION_SECRET_BURNED, ACTION_SECRET_CREATE, ACTION_SECRET_DELETE,
             ACTION_SECRET_LIST, ACTION_SECRET_PATCH, ACTION_SECRET_PRUNE, ACTION_SECRET_READ,
+            ACTION_WEBHOOK_CREATE, ACTION_WEBHOOK_DELETE,
         },
         AuditQuery, GetResult,
     },
+    webhooks::{self, MAX_WEBHOOKS},
     AppState,
 };
 
@@ -108,6 +110,7 @@ pub struct CreateRequest {
     pub ttl_seconds: Option<u64>,
     pub max_reads: Option<u32>,
     pub delete: Option<bool>,
+    pub webhook_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -188,10 +191,14 @@ pub async fn create_secret(
         _ => {}
     }
 
-    match state
-        .store
-        .put(&body.key, &body.value, body.ttl_seconds, body.max_reads, body.delete.unwrap_or(true))
-    {
+    match state.store.put(
+        &body.key,
+        &body.value,
+        body.ttl_seconds,
+        body.max_reads,
+        body.delete.unwrap_or(true),
+        body.webhook_url.clone(),
+    ) {
         Ok(()) => {
             info!(
                 key = %body.key,
@@ -206,6 +213,9 @@ pub async fn create_secret(
                 true,
                 None,
             ));
+            if let Some(ref sender) = state.webhook_sender {
+                sender.fire("secret.created", &body.key, json!({}));
+            }
             (StatusCode::CREATED, Json(CreateResponse { key: body.key })).into_response()
         }
         Err(e) => internal_error(e),
@@ -222,7 +232,7 @@ pub async fn get_secret(
 ) -> Response {
     let ip = extract_ip(&headers, &addr);
     match state.store.get(&key) {
-        Ok(GetResult::Value(value)) => {
+        Ok(GetResult::Value(value, webhook_url)) => {
             let _ = state.store.record_audit(AuditEvent::new(
                 ACTION_SECRET_READ,
                 Some(key.clone()),
@@ -230,9 +240,15 @@ pub async fn get_secret(
                 true,
                 None,
             ));
+            if let Some(ref sender) = state.webhook_sender {
+                sender.fire("secret.read", &key, json!({}));
+                if let Some(ref url) = webhook_url {
+                    sender.fire_for_url(url, "secret.read", &key, json!({}));
+                }
+            }
             Json(json!({ "key": key, "value": value })).into_response()
         }
-        Ok(GetResult::Burned(value)) => {
+        Ok(GetResult::Burned(value, webhook_url)) => {
             let _ = state.store.record_audit(AuditEvent::new(
                 ACTION_SECRET_BURNED,
                 Some(key.clone()),
@@ -240,6 +256,12 @@ pub async fn get_secret(
                 true,
                 None,
             ));
+            if let Some(ref sender) = state.webhook_sender {
+                sender.fire("secret.burned", &key, json!({}));
+                if let Some(ref url) = webhook_url {
+                    sender.fire_for_url(url, "secret.burned", &key, json!({}));
+                }
+            }
             Json(json!({ "key": key, "value": value })).into_response()
         }
         Ok(GetResult::Sealed) => {
@@ -441,6 +463,9 @@ pub async fn delete_secret(
                 true,
                 None,
             ));
+            if let Some(ref sender) = state.webhook_sender {
+                sender.fire("secret.deleted", &key, json!({}));
+            }
             Json(json!({"deleted": true})).into_response()
         }
         Ok(false) => {
@@ -467,7 +492,8 @@ pub async fn prune_secrets(
 ) -> Response {
     let ip = extract_ip(&headers, &addr);
     match state.store.prune() {
-        Ok(n) => {
+        Ok(pruned_keys) => {
+            let n = pruned_keys.len();
             info!(pruned = n, "audit: secret.prune");
             let _ = state.store.record_audit(AuditEvent::new(
                 ACTION_SECRET_PRUNE,
@@ -476,8 +502,142 @@ pub async fn prune_secrets(
                 true,
                 Some(format!("pruned={n}")),
             ));
+            if let Some(ref sender) = state.webhook_sender {
+                for key in &pruned_keys {
+                    sender.fire("secret.expired", key, json!({"reason": "manual_prune"}));
+                }
+            }
             Json(json!({"pruned": n})).into_response()
         }
+        Err(e) => internal_error(e),
+    }
+}
+
+// ── Webhooks ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CreateWebhookRequest {
+    pub url: String,
+    pub events: Option<Vec<String>>,
+}
+
+pub async fn create_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(body): Json<CreateWebhookRequest>,
+) -> Response {
+    let ip = extract_ip(&headers, &addr);
+
+    // License gate: free tier gets 0 webhooks.
+    if state.license == LicenseStatus::Free {
+        return (
+            StatusCode::PAYMENT_REQUIRED,
+            Json(json!({"error": "webhooks require a SIRR_LICENSE_KEY"})),
+        )
+            .into_response();
+    }
+
+    // Validate URL.
+    if !body.url.starts_with("http://") && !body.url.starts_with("https://") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "webhook URL must start with http:// or https://"})),
+        )
+            .into_response();
+    }
+
+    // Check count limit.
+    match state.store.count_webhooks() {
+        Ok(count) if count >= MAX_WEBHOOKS => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": format!("maximum of {MAX_WEBHOOKS} webhooks reached")})),
+            )
+                .into_response();
+        }
+        Err(e) => return internal_error(e),
+        _ => {}
+    }
+
+    let events = body.events.unwrap_or_else(|| vec!["*".to_string()]);
+    let id = webhooks::generate_webhook_id();
+    let secret = webhooks::generate_signing_secret();
+
+    let reg = webhooks::WebhookRegistration {
+        id: id.clone(),
+        url: body.url.clone(),
+        secret: secret.clone(),
+        events,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+    };
+
+    match state.store.put_webhook(&reg) {
+        Ok(()) => {
+            let _ = state.store.record_audit(AuditEvent::new(
+                ACTION_WEBHOOK_CREATE,
+                None,
+                ip,
+                true,
+                Some(format!("id={id}")),
+            ));
+            (
+                StatusCode::CREATED,
+                Json(json!({"id": id, "secret": secret})),
+            )
+                .into_response()
+        }
+        Err(e) => internal_error(e),
+    }
+}
+
+pub async fn list_webhooks(State(state): State<AppState>) -> Response {
+    match state.store.list_webhooks() {
+        Ok(regs) => {
+            // Redact signing secrets in the response.
+            let redacted: Vec<_> = regs
+                .iter()
+                .map(|r| {
+                    json!({
+                        "id": r.id,
+                        "url": r.url,
+                        "events": r.events,
+                        "created_at": r.created_at,
+                    })
+                })
+                .collect();
+            Json(json!({"webhooks": redacted})).into_response()
+        }
+        Err(e) => internal_error(e),
+    }
+}
+
+pub async fn delete_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(id): Path<String>,
+) -> Response {
+    let ip = extract_ip(&headers, &addr);
+    match state.store.delete_webhook(&id) {
+        Ok(true) => {
+            let _ = state.store.record_audit(AuditEvent::new(
+                ACTION_WEBHOOK_DELETE,
+                None,
+                ip,
+                true,
+                Some(format!("id={id}")),
+            ));
+            Json(json!({"deleted": true})).into_response()
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "webhook not found"})),
+        )
+            .into_response(),
         Err(e) => internal_error(e),
     }
 }

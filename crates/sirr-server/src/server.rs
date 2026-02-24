@@ -15,8 +15,8 @@ use tracing::{info, warn};
 use crate::{
     auth::require_api_key,
     handlers::{
-        audit_events, create_secret, delete_secret, get_secret, head_secret, health,
-        list_secrets, patch_secret, prune_secrets,
+        audit_events, create_secret, create_webhook, delete_secret, delete_webhook, get_secret,
+        head_secret, health, list_secrets, list_webhooks, patch_secret, prune_secrets,
     },
     license, AppState,
 };
@@ -32,6 +32,12 @@ pub struct ServerConfig {
     pub audit_retention_days: u64,
     pub validation_url: String,
     pub validation_cache_secs: u64,
+    /// Set `SIRR_HEARTBEAT=false` to disable instance heartbeat reporting.
+    pub heartbeat: bool,
+    /// Signing key for per-secret webhook URLs ($SIRR_WEBHOOK_SECRET).
+    pub webhook_secret: Option<String>,
+    /// Instance identifier for webhook event payloads ($SIRR_INSTANCE_ID).
+    pub instance_id: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -57,6 +63,11 @@ impl Default for ServerConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3600),
+            heartbeat: std::env::var("SIRR_HEARTBEAT")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true),
+            webhook_secret: std::env::var("SIRR_WEBHOOK_SECRET").ok(),
+            instance_id: std::env::var("SIRR_INSTANCE_ID").ok(),
         }
     }
 }
@@ -118,14 +129,32 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     info!(data_dir = %data_dir.display(), "using data directory");
 
     // Load or generate the encryption key.
+    // Read raw key bytes for instance ID generation (before they're wrapped).
+    let key_path = data_dir.join("sirr.key");
     let enc_key = load_or_create_key(&data_dir)?;
+    let key_bytes_for_id = std::fs::read(&key_path).ok();
 
     // Open redb store.
     let db_path = data_dir.join("sirr.db");
     let store = crate::store::Store::open(&db_path, enc_key).context("open store")?;
 
-    // Spawn background sweeps.
-    store.clone().spawn_sweep(cfg.sweep_interval);
+    // Resolve instance ID for webhook payloads.
+    let webhook_instance_id = cfg
+        .instance_id
+        .clone()
+        .unwrap_or_else(|| gethostname().unwrap_or_else(|| "unknown".into()));
+
+    // Initialize webhook sender.
+    let webhook_sender = crate::webhooks::WebhookSender::new(
+        store.clone(),
+        webhook_instance_id,
+        cfg.webhook_secret.clone(),
+    );
+
+    // Spawn background sweeps (with webhook sender for expired events).
+    store
+        .clone()
+        .spawn_sweep(cfg.sweep_interval, Some(webhook_sender.clone()));
     let retention_secs = (cfg.audit_retention_days * 86400) as i64;
     store
         .clone()
@@ -148,6 +177,11 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         }
     }
 
+    // Derive the heartbeat endpoint from the validation URL base.
+    let heartbeat_url = cfg
+        .validation_url
+        .replace("/api/validate", "/api/instances/heartbeat");
+
     // Set up online license validation if a license key is configured and format is valid.
     let validator = if lic_status == license::LicenseStatus::Licensed {
         if let Some(ref key) = cfg.license_key {
@@ -169,11 +203,28 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         None
     };
 
+    // Spawn instance heartbeat if enabled and a license key is present.
+    if cfg.heartbeat {
+        if let (Some(ref license_key), Some(ref raw_bytes)) =
+            (&cfg.license_key, &key_bytes_for_id)
+        {
+            let instance_id = crate::heartbeat::instance_id_from_key(raw_bytes);
+            info!(instance_id = %instance_id, "starting instance heartbeat");
+            crate::heartbeat::spawn_heartbeat(crate::heartbeat::HeartbeatConfig {
+                endpoint: heartbeat_url,
+                license_key: license_key.clone(),
+                instance_id,
+                store: store.clone(),
+            });
+        }
+    }
+
     let state = AppState {
         store,
         api_key: cfg.api_key,
         license: lic_status,
         validator,
+        webhook_sender: Some(webhook_sender),
     };
 
     let cors = build_cors(cfg.cors_origins.as_deref());
@@ -192,6 +243,9 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         .route("/secrets/{key}", delete(delete_secret))
         .route("/prune", post(prune_secrets))
         .route("/audit", get(audit_events))
+        .route("/webhooks", post(create_webhook))
+        .route("/webhooks", get(list_webhooks))
+        .route("/webhooks/{id}", delete(delete_webhook))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
@@ -239,6 +293,15 @@ fn load_or_create_key(
         info!("generated new encryption key");
         Ok(key)
     }
+}
+
+fn gethostname() -> Option<String> {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
 }
 
 fn build_cors(origins: Option<&str>) -> CorsLayer {

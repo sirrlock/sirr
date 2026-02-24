@@ -11,6 +11,9 @@ pub struct SecretRecord {
     pub read_count: u32,
     #[serde(default = "default_delete")]
     pub delete: bool,
+    /// Optional per-secret webhook URL for event notifications.
+    #[serde(default)]
+    pub webhook_url: Option<String>,
 }
 
 fn default_delete() -> bool {
@@ -58,6 +61,7 @@ mod tests {
             max_reads,
             read_count,
             delete,
+            webhook_url: None,
         }
     }
 

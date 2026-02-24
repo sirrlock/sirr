@@ -25,9 +25,11 @@ const RECORD_V2_MARKER: u8 = 0x01;
 #[derive(Debug, PartialEq)]
 pub enum GetResult {
     /// Secret found and decrypted. Read counter was incremented.
-    Value(String),
+    /// Contains (value, webhook_url).
+    Value(String, Option<String>),
     /// Secret found, decrypted, and burned (final read with delete=true).
-    Burned(String),
+    /// Contains (value, webhook_url).
+    Burned(String, Option<String>),
     /// Secret exists but is sealed (delete=false, reads exhausted).
     Sealed,
     /// Secret not found or TTL-expired.
@@ -37,7 +39,7 @@ pub enum GetResult {
 /// Thread-safe handle to the redb store.
 #[derive(Clone)]
 pub struct Store {
-    db: Arc<Database>,
+    pub(crate) db: Arc<Database>,
     key: Arc<EncryptionKey>,
     key_version: u8,
 }
@@ -58,6 +60,7 @@ impl Store {
         write_txn.open_table(SECRETS)?;
         write_txn.open_table(AUDIT_LOG)?;
         write_txn.open_table(COUNTERS)?;
+        write_txn.open_table(super::webhooks::WEBHOOKS)?;
         write_txn.commit()?;
 
         Ok(Self {
@@ -82,6 +85,7 @@ impl Store {
         ttl_seconds: Option<u64>,
         max_reads: Option<u32>,
         delete: bool,
+        webhook_url: Option<String>,
     ) -> Result<()> {
         let now = Self::now();
         let expires_at = ttl_seconds.map(|ttl| now + ttl as i64);
@@ -97,6 +101,7 @@ impl Store {
             max_reads,
             read_count: 0,
             delete,
+            webhook_url,
         };
 
         let bytes = encode(&record, self.key_version)?;
@@ -152,14 +157,15 @@ impl Store {
                         let value = String::from_utf8(plaintext)
                             .context("secret value is not valid UTF-8")?;
 
+                        let webhook_url = record.webhook_url.clone();
                         if record.is_burned() {
                             table.remove(secret_key)?;
                             debug!(key = %secret_key, "burned after final read");
-                            GetResult::Burned(value)
+                            GetResult::Burned(value, webhook_url)
                         } else {
                             let updated = encode(&record, record_key_version)?;
                             table.insert(secret_key, updated.as_slice())?;
-                            GetResult::Value(value)
+                            GetResult::Value(value, webhook_url)
                         }
                     }
                 }
@@ -206,8 +212,8 @@ impl Store {
         Ok(metas)
     }
 
-    /// Remove all expired secrets. Returns count of removed entries.
-    pub fn prune(&self) -> Result<usize> {
+    /// Remove all expired secrets. Returns the names of removed keys.
+    pub fn prune(&self) -> Result<Vec<String>> {
         let now = Self::now();
 
         // Collect expired keys in a read pass first.
@@ -226,7 +232,7 @@ impl Store {
         };
 
         if expired_keys.is_empty() {
-            return Ok(0);
+            return Ok(vec![]);
         }
 
         let write_txn = self.db.begin_write()?;
@@ -242,7 +248,7 @@ impl Store {
         if removed > 0 {
             info!(removed, "pruned expired secrets");
         }
-        Ok(removed)
+        Ok(expired_keys)
     }
 
     /// Retrieve metadata for a secret without incrementing read_count.
@@ -465,14 +471,32 @@ impl Store {
     }
 
     /// Spawn a background Tokio task that calls `prune()` every `interval`.
-    pub fn spawn_sweep(self, interval: Duration) {
+    /// If a `WebhookSender` is provided, fires `secret.expired` for each pruned key.
+    pub fn spawn_sweep(
+        self,
+        interval: Duration,
+        webhook_sender: Option<crate::webhooks::WebhookSender>,
+    ) {
         tokio::spawn(async move {
             let mut ticker = time::interval(interval);
             ticker.tick().await; // skip first immediate tick
             loop {
                 ticker.tick().await;
-                if let Err(e) = self.prune() {
-                    warn!(error = %e, "background sweep error");
+                match self.prune() {
+                    Ok(pruned_keys) => {
+                        if let Some(ref sender) = webhook_sender {
+                            for key in &pruned_keys {
+                                sender.fire(
+                                    "secret.expired",
+                                    key,
+                                    serde_json::json!({"reason": "ttl_or_burned"}),
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "background sweep error");
+                    }
                 }
             }
         });
@@ -547,6 +571,7 @@ impl Store {
                     max_reads: record.max_reads,
                     read_count: record.read_count,
                     delete: record.delete,
+                    webhook_url: record.webhook_url.clone(),
                 };
 
                 let new_bytes = encode(&new_record, new_key_version)?;
@@ -613,8 +638,8 @@ mod tests {
     #[test]
     fn put_get_delete() {
         let (s, _dir) = make_store();
-        s.put("MY_KEY", "my-value", None, None, true).unwrap();
-        assert_eq!(s.get("MY_KEY").unwrap(), GetResult::Value("my-value".into()));
+        s.put("MY_KEY", "my-value", None, None, true, None).unwrap();
+        assert_eq!(s.get("MY_KEY").unwrap(), GetResult::Value("my-value".into(), None));
         assert!(s.delete("MY_KEY").unwrap());
         assert_eq!(s.get("MY_KEY").unwrap(), GetResult::NotFound);
     }
@@ -622,8 +647,8 @@ mod tests {
     #[test]
     fn read_limit_burn() {
         let (s, _dir) = make_store();
-        s.put("BURN", "secret", None, Some(1), true).unwrap();
-        assert_eq!(s.get("BURN").unwrap(), GetResult::Burned("secret".into()));
+        s.put("BURN", "secret", None, Some(1), true, None).unwrap();
+        assert_eq!(s.get("BURN").unwrap(), GetResult::Burned("secret".into(), None));
         // Second read should return NotFound — record was burned.
         assert_eq!(s.get("BURN").unwrap(), GetResult::NotFound);
     }
@@ -632,15 +657,15 @@ mod tests {
     fn ttl_expiry() {
         let (s, _dir) = make_store();
         // TTL = 0 means already expired.
-        s.put("EXPIRED", "value", Some(0), None, true).unwrap();
+        s.put("EXPIRED", "value", Some(0), None, true, None).unwrap();
         assert_eq!(s.get("EXPIRED").unwrap(), GetResult::NotFound);
     }
 
     #[test]
     fn list_excludes_expired() {
         let (s, _dir) = make_store();
-        s.put("LIVE", "v", Some(3600), None, true).unwrap();
-        s.put("DEAD", "v", Some(0), None, true).unwrap();
+        s.put("LIVE", "v", Some(3600), None, true, None).unwrap();
+        s.put("DEAD", "v", Some(0), None, true, None).unwrap();
         let metas = s.list().unwrap();
         assert!(metas.iter().any(|m| m.key == "LIVE"));
         assert!(!metas.iter().any(|m| m.key == "DEAD"));
@@ -649,7 +674,7 @@ mod tests {
     #[test]
     fn head_returns_meta_without_incrementing() {
         let (s, _dir) = make_store();
-        s.put("H", "val", None, Some(5), true).unwrap();
+        s.put("H", "val", None, Some(5), true, None).unwrap();
         let (meta, sealed) = s.head("H").unwrap().unwrap();
         assert_eq!(meta.read_count, 0);
         assert_eq!(meta.max_reads, Some(5));
@@ -661,14 +686,14 @@ mod tests {
     #[test]
     fn head_returns_none_for_expired() {
         let (s, _dir) = make_store();
-        s.put("HE", "val", Some(0), None, true).unwrap();
+        s.put("HE", "val", Some(0), None, true, None).unwrap();
         assert!(s.head("HE").unwrap().is_none());
     }
 
     #[test]
     fn head_returns_sealed_status() {
         let (s, _dir) = make_store();
-        s.put("HS", "val", None, Some(1), false).unwrap();
+        s.put("HS", "val", None, Some(1), false, None).unwrap();
         s.get("HS").unwrap(); // read once, hits limit
         let (meta, sealed) = s.head("HS").unwrap().unwrap();
         assert!(sealed);
@@ -678,17 +703,17 @@ mod tests {
     #[test]
     fn patch_updates_value_and_resets_count() {
         let (s, _dir) = make_store();
-        s.put("P", "old", None, Some(5), false).unwrap();
+        s.put("P", "old", None, Some(5), false, None).unwrap();
         s.get("P").unwrap(); // read_count = 1
         let meta = s.patch("P", Some("new"), None, None).unwrap().unwrap();
         assert_eq!(meta.read_count, 0); // reset
-        assert_eq!(s.get("P").unwrap(), GetResult::Value("new".into()));
+        assert_eq!(s.get("P").unwrap(), GetResult::Value("new".into(), None));
     }
 
     #[test]
     fn patch_rejects_delete_true_secret() {
         let (s, _dir) = make_store();
-        s.put("PD", "val", None, None, true).unwrap();
+        s.put("PD", "val", None, None, true, None).unwrap();
         let err = s.patch("PD", Some("new"), None, None);
         assert!(err.is_err()); // should error for delete=true
     }
@@ -696,11 +721,11 @@ mod tests {
     #[test]
     fn patch_unseals_secret() {
         let (s, _dir) = make_store();
-        s.put("PS", "val", None, Some(1), false).unwrap();
+        s.put("PS", "val", None, Some(1), false, None).unwrap();
         s.get("PS").unwrap(); // now sealed
         assert_eq!(s.get("PS").unwrap(), GetResult::Sealed); // sealed, can't read
         s.patch("PS", None, Some(5), None).unwrap(); // unseal with new max_reads
-        assert_eq!(s.get("PS").unwrap(), GetResult::Value("val".into())); // readable again
+        assert_eq!(s.get("PS").unwrap(), GetResult::Value("val".into(), None)); // readable again
     }
 
     #[test]
@@ -713,8 +738,8 @@ mod tests {
     #[test]
     fn get_sealed_returns_sealed_variant() {
         let (s, _dir) = make_store();
-        s.put("GS", "val", None, Some(1), false).unwrap();
-        assert!(matches!(s.get("GS").unwrap(), GetResult::Value(_)));
+        s.put("GS", "val", None, Some(1), false, None).unwrap();
+        assert!(matches!(s.get("GS").unwrap(), GetResult::Value(..)));
         assert!(matches!(s.get("GS").unwrap(), GetResult::Sealed));
     }
 
