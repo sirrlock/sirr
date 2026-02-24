@@ -12,6 +12,11 @@ use super::model::{SecretMeta, SecretRecord};
 
 const SECRETS: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");
 
+/// Marker byte for v2 record format (with key version tracking).
+/// Legacy records (v1) start with a bincode varint for Vec length (always >= 16
+/// for ChaCha20Poly1305 ciphertext), so 0x01 is unambiguous.
+const RECORD_V2_MARKER: u8 = 0x01;
+
 /// Result of a secret retrieval.
 #[derive(Debug, PartialEq)]
 pub enum GetResult {
@@ -143,7 +148,7 @@ impl Store {
                             table.remove(secret_key)?;
                             debug!(key = %secret_key, "burned after final read");
                         } else {
-                            let updated = encode(&record)?;
+                            let updated = encode(&record, record_key_version)?;
                             table.insert(secret_key, updated.as_slice())?;
                         }
 
@@ -204,7 +209,7 @@ impl Store {
             let mut keys = Vec::new();
             for item in table.iter()? {
                 let (k, v) = item?;
-                let record: SecretRecord = decode(v.value())?;
+                let (record, _kv) = decode(v.value())?;
                 if record.is_expired(now) || record.is_burned() {
                     keys.push(k.value().to_owned());
                 }
@@ -245,7 +250,7 @@ impl Store {
         match raw_bytes {
             None => Ok(None),
             Some(bytes) => {
-                let record: SecretRecord = decode(&bytes)?;
+                let (record, _kv) = decode(&bytes)?;
                 if record.is_expired(now) {
                     return Ok(None);
                 }
@@ -288,7 +293,7 @@ impl Store {
             match raw_bytes {
                 None => Ok(None),
                 Some(bytes) => {
-                    let mut record: SecretRecord = decode(&bytes)?;
+                    let (mut record, record_key_version) = decode(&bytes)?;
 
                     if record.is_expired(now) {
                         table.remove(secret_key)?;
@@ -317,7 +322,7 @@ impl Store {
 
                     record.read_count = 0;
 
-                    let updated = encode(&record)?;
+                    let updated = encode(&record, record_key_version)?;
                     table.insert(secret_key, updated.as_slice())?;
 
                     Ok(Some(SecretMeta {
@@ -417,6 +422,7 @@ impl Store {
                     expires_at: record.expires_at,
                     max_reads: record.max_reads,
                     read_count: record.read_count,
+                    delete: record.delete,
                 };
 
                 let new_bytes = encode(&new_record, new_key_version)?;
