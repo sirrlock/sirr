@@ -63,6 +63,23 @@ This isn't paranoia. This is correct threat modeling for an age where your codin
 
 ### Run the server
 
+**With a key file (recommended for production):**
+
+```bash
+# Generate the master key file once.
+openssl rand -hex 32 > master.key
+chmod 400 master.key
+
+docker run -d \
+  -p 8080:8080 \
+  -v ./sirr-data:/data \
+  -v ./master.key:/run/secrets/master.key:ro \
+  -e SIRR_MASTER_KEY_FILE=/run/secrets/master.key \
+  ghcr.io/sirrvault/sirr
+```
+
+Or with an environment variable (development only — visible via `docker inspect`):
+
 ```bash
 docker run -d \
   -p 8080:8080 \
@@ -175,6 +192,9 @@ sirr list                                  # metadata only, no values shown
 sirr delete KEY
 sirr prune                                 # delete all expired secrets now
 sirr share KEY                             # print reference URL
+
+# Key rotation (offline — stop the server first)
+sirr rotate                                # re-encrypts all records with new key
 ```
 
 TTL format: `30s`, `5m`, `2h`, `7d`, `30d`
@@ -219,12 +239,15 @@ Returns metadata only — values are never included in list responses.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SIRR_MASTER_KEY` | **required** | Bearer token + encryption key seed |
+| `SIRR_MASTER_KEY_FILE` | — | Path to a file containing the master key (recommended) |
+| `SIRR_MASTER_KEY` | — | Bearer token + encryption key seed (use `_FILE` in production) |
 | `SIRR_LICENSE_KEY` | — | Required for >100 active secrets |
 | `SIRR_PORT` | `8080` | HTTP listen port |
 | `SIRR_HOST` | `0.0.0.0` | Bind address |
 | `SIRR_DATA_DIR` | platform default¹ | Storage directory |
 | `SIRR_LOG_LEVEL` | `info` | `trace` / `debug` / `info` / `warn` / `error` |
+
+One of `SIRR_MASTER_KEY_FILE` or `SIRR_MASTER_KEY` is required. If both are set, the file takes precedence. File-based key delivery is recommended for production because environment variables are visible via `docker inspect` and `/proc`.
 
 **CLI / client variables:**
 
@@ -232,6 +255,13 @@ Returns metadata only — values are never included in list responses.
 |---|---|---|
 | `SIRR_SERVER` | `http://localhost:8080` | Server base URL |
 | `SIRR_TOKEN` | — | Same value as `SIRR_MASTER_KEY` on the server |
+
+**Key rotation variables** (used by `sirr rotate`):
+
+| Variable | Description |
+|---|---|
+| `SIRR_NEW_MASTER_KEY_FILE` | Path to file containing the new master key |
+| `SIRR_NEW_MASTER_KEY` | New master key value (prefer `_FILE`) |
 
 ¹ `~/.local/share/sirr/` (Linux), `~/Library/Application Support/sirr/` (macOS), `%APPDATA%\sirr\` (Windows). Docker: mount `/data` and set `SIRR_DATA_DIR=/data`.
 
@@ -254,6 +284,28 @@ CLI / Node SDK / Python SDK / .NET SDK / MCP Server
 - Per-record random 12-byte nonce; value field is encrypted, metadata is not
 - `SIRR_MASTER_KEY` doubles as the bearer token (constant-time comparison)
 - `sirr.salt` — 32 random bytes, generated on first run, stored beside `sirr.db`
+- Each encrypted record carries a key version tag to support graceful key rotation
+- All secret CRUD operations are audit-logged via structured tracing
+
+### Key Rotation
+
+To rotate the encryption key, stop the server and run:
+
+```bash
+# Set the current and new master keys.
+export SIRR_MASTER_KEY=current-key
+export SIRR_NEW_MASTER_KEY=new-key
+# Or use file-based delivery:
+# export SIRR_MASTER_KEY_FILE=/path/to/current.key
+# export SIRR_NEW_MASTER_KEY_FILE=/path/to/new.key
+
+sirr rotate
+# → rotated 42 secret(s) to key version 2
+
+# Update the key file / env var to the new key, then restart.
+```
+
+All records are re-encrypted atomically in a single database transaction. The old key is no longer needed after rotation completes. **If the master key is lost and no backup exists, all data is irrecoverable by design.**
 
 ---
 
@@ -282,10 +334,10 @@ SIRR_LICENSE_KEY=sirr_lic_... SIRR_MASTER_KEY=... ./sirr serve
 - [ ] Web UI
 - [ ] Webhooks on expiry / burn
 - [ ] Team namespaces
-- [ ] Audit log
+- [x] Audit log
 - [ ] Kubernetes operator
 - [ ] Terraform provider
-- [ ] Secret versioning
+- [x] Secret versioning (key version tracking for rotation)
 
 ---
 

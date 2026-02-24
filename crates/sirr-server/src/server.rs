@@ -42,15 +42,59 @@ impl Default for ServerConfig {
     }
 }
 
+/// Read a master key from a file, trimming surrounding whitespace.
+/// Fails if the file cannot be read or is empty after trimming.
+pub fn read_key_file(path: &std::path::Path) -> Result<String> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("read key file: {}", path.display()))?;
+    let key = content.trim().to_string();
+    if key.is_empty() {
+        anyhow::bail!("key file is empty: {}", path.display());
+    }
+    Ok(key)
+}
+
+/// Resolve the master key from `SIRR_MASTER_KEY_FILE` (preferred) or `SIRR_MASTER_KEY`.
+/// File-based delivery is recommended for production — env vars are visible via
+/// `docker inspect` and `/proc`.
+pub fn resolve_master_key() -> Result<String> {
+    if let Ok(path) = std::env::var("SIRR_MASTER_KEY_FILE") {
+        let key = read_key_file(std::path::Path::new(&path))?;
+        if std::env::var("SIRR_MASTER_KEY").is_ok() {
+            tracing::warn!(
+                "both SIRR_MASTER_KEY and SIRR_MASTER_KEY_FILE are set; using file"
+            );
+        }
+        return Ok(key);
+    }
+    std::env::var("SIRR_MASTER_KEY")
+        .context("SIRR_MASTER_KEY or SIRR_MASTER_KEY_FILE environment variable is required")
+}
+
+/// Resolve the data directory and load the persisted salt.
+/// Public so the CLI rotate command can reuse this logic.
+pub fn resolve_data_dir(data_dir: Option<&PathBuf>) -> Result<PathBuf> {
+    match data_dir {
+        Some(d) => {
+            std::fs::create_dir_all(d).context("create data dir")?;
+            Ok(d.clone())
+        }
+        None => {
+            let d = std::env::var("SIRR_DATA_DIR").ok().map(PathBuf::from);
+            match d {
+                Some(d) => {
+                    std::fs::create_dir_all(&d).context("create data dir")?;
+                    Ok(d)
+                }
+                None => crate::dirs::data_dir(),
+            }
+        }
+    }
+}
+
 pub async fn run(cfg: ServerConfig) -> Result<()> {
     // Resolve data directory.
-    let data_dir = match cfg.data_dir {
-        Some(d) => {
-            std::fs::create_dir_all(&d).context("create data dir")?;
-            d
-        }
-        None => crate::dirs::data_dir()?,
-    };
+    let data_dir = resolve_data_dir(cfg.data_dir.as_ref())?;
 
     info!(data_dir = %data_dir.display(), "using data directory");
 
@@ -118,7 +162,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     axum::serve(listener, app).await.context("server error")
 }
 
-fn load_or_create_salt(data_dir: &std::path::Path) -> Result<[u8; 32]> {
+pub fn load_or_create_salt(data_dir: &std::path::Path) -> Result<[u8; 32]> {
     let salt_path = data_dir.join("sirr.salt");
     if salt_path.exists() {
         let bytes = std::fs::read(&salt_path).context("read sirr.salt")?;

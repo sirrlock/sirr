@@ -23,7 +23,10 @@ pub async fn health() -> impl IntoResponse {
 
 pub async fn list_secrets(State(state): State<AppState>) -> Response {
     match state.store.list() {
-        Ok(metas) => Json(json!({ "secrets": metas })).into_response(),
+        Ok(metas) => {
+            info!(count = metas.len(), "audit: secret.list");
+            Json(json!({ "secrets": metas })).into_response()
+        }
         Err(e) => internal_error(e),
     }
 }
@@ -88,7 +91,12 @@ pub async fn create_secret(
         .put(&body.key, &body.value, body.ttl_seconds, body.max_reads)
     {
         Ok(()) => {
-            info!(key = %body.key, "created secret");
+            info!(
+                key = %body.key,
+                ttl_seconds = ?body.ttl_seconds,
+                max_reads = ?body.max_reads,
+                "audit: secret.create"
+            );
             (StatusCode::CREATED, Json(CreateResponse { key: body.key })).into_response()
         }
         Err(e) => internal_error(e),
@@ -99,12 +107,18 @@ pub async fn create_secret(
 
 pub async fn get_secret(State(state): State<AppState>, Path(key): Path<String>) -> Response {
     match state.store.get(&key) {
-        Ok(Some(value)) => Json(json!({ "key": key, "value": value })).into_response(),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "not found or expired"})),
-        )
-            .into_response(),
+        Ok(Some(value)) => {
+            info!(key = %key, "audit: secret.read");
+            Json(json!({ "key": key, "value": value })).into_response()
+        }
+        Ok(None) => {
+            info!(key = %key, "audit: secret.read.not_found");
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "not found or expired"})),
+            )
+                .into_response()
+        }
         Err(e) => internal_error(e),
     }
 }
@@ -113,8 +127,14 @@ pub async fn get_secret(State(state): State<AppState>, Path(key): Path<String>) 
 
 pub async fn delete_secret(State(state): State<AppState>, Path(key): Path<String>) -> Response {
     match state.store.delete(&key) {
-        Ok(true) => Json(json!({"deleted": true})).into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
+        Ok(true) => {
+            info!(key = %key, "audit: secret.delete");
+            Json(json!({"deleted": true})).into_response()
+        }
+        Ok(false) => {
+            info!(key = %key, "audit: secret.delete.not_found");
+            (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+        }
         Err(e) => internal_error(e),
     }
 }
@@ -123,7 +143,10 @@ pub async fn delete_secret(State(state): State<AppState>, Path(key): Path<String
 
 pub async fn prune_secrets(State(state): State<AppState>) -> Response {
     match state.store.prune() {
-        Ok(n) => Json(json!({"pruned": n})).into_response(),
+        Ok(n) => {
+            info!(pruned = n, "audit: secret.prune");
+            Json(json!({"pruned": n})).into_response()
+        }
         Err(e) => internal_error(e),
     }
 }
