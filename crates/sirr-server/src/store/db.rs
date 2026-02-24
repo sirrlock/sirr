@@ -7,10 +7,14 @@ use redb::{Database, ReadableTable, TableDefinition};
 use tokio::time;
 use tracing::{debug, info, warn};
 
+use super::audit::{AuditEvent, AuditQuery};
 use super::crypto::EncryptionKey;
 use super::model::{SecretMeta, SecretRecord};
 
 const SECRETS: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");
+const AUDIT_LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("audit_log");
+const COUNTERS: TableDefinition<&str, u64> = TableDefinition::new("counters");
+const AUDIT_SEQ_KEY: &str = "audit_seq";
 
 /// Marker byte for v2 record format (with key version tracking).
 /// Legacy records (v1) start with a bincode varint for Vec length (always >= 16
@@ -22,6 +26,8 @@ const RECORD_V2_MARKER: u8 = 0x01;
 pub enum GetResult {
     /// Secret found and decrypted. Read counter was incremented.
     Value(String),
+    /// Secret found, decrypted, and burned (final read with delete=true).
+    Burned(String),
     /// Secret exists but is sealed (delete=false, reads exhausted).
     Sealed,
     /// Secret not found or TTL-expired.
@@ -47,9 +53,11 @@ impl Store {
     pub fn open_versioned(path: &Path, key: EncryptionKey, key_version: u8) -> Result<Self> {
         let db = Database::create(path).context("open redb database")?;
 
-        // Ensure the table exists.
+        // Ensure all tables exist.
         let write_txn = db.begin_write()?;
         write_txn.open_table(SECRETS)?;
+        write_txn.open_table(AUDIT_LOG)?;
+        write_txn.open_table(COUNTERS)?;
         write_txn.commit()?;
 
         Ok(Self {
@@ -147,12 +155,12 @@ impl Store {
                         if record.is_burned() {
                             table.remove(secret_key)?;
                             debug!(key = %secret_key, "burned after final read");
+                            GetResult::Burned(value)
                         } else {
                             let updated = encode(&record, record_key_version)?;
                             table.insert(secret_key, updated.as_slice())?;
+                            GetResult::Value(value)
                         }
-
-                        GetResult::Value(value)
                     }
                 }
             }
@@ -340,6 +348,122 @@ impl Store {
         result
     }
 
+    // ── Audit log ─────────────────────────────────────────────────────────
+
+    /// Record an audit event. Allocates a monotonic ID via the counters table.
+    pub fn record_audit(&self, mut event: AuditEvent) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut counters = write_txn.open_table(COUNTERS)?;
+            let seq = counters
+                .get(AUDIT_SEQ_KEY)?
+                .map(|g| g.value())
+                .unwrap_or(0)
+                + 1;
+            counters.insert(AUDIT_SEQ_KEY, seq)?;
+            event.id = seq;
+
+            let bytes = bincode::serde::encode_to_vec(&event, bincode::config::standard())
+                .context("bincode encode audit event")?;
+            let mut audit = write_txn.open_table(AUDIT_LOG)?;
+            audit.insert(event.id, bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// List audit events matching the query, most recent first.
+    pub fn list_audit(&self, query: &AuditQuery) -> Result<Vec<AuditEvent>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(AUDIT_LOG)?;
+
+        let mut events = Vec::new();
+        for item in table.iter()?.rev() {
+            let (_k, v) = item?;
+            let (event, _): (AuditEvent, _) =
+                bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
+                    .context("bincode decode audit event")?;
+
+            if let Some(since) = query.since {
+                if event.timestamp < since {
+                    break; // IDs are monotonic, older events follow — stop early.
+                }
+            }
+            if let Some(until) = query.until {
+                if event.timestamp > until {
+                    continue;
+                }
+            }
+            if let Some(ref action) = query.action {
+                if event.action != *action {
+                    continue;
+                }
+            }
+            events.push(event);
+            if events.len() >= query.limit {
+                break;
+            }
+        }
+        Ok(events)
+    }
+
+    /// Remove audit events older than `retention_seconds`. Returns count removed.
+    pub fn prune_audit(&self, retention_seconds: i64) -> Result<usize> {
+        let cutoff = Self::now() - retention_seconds;
+
+        // Read pass: collect IDs to remove.
+        let ids_to_remove: Vec<u64> = {
+            let read_txn = self.db.begin_read()?;
+            let table = read_txn.open_table(AUDIT_LOG)?;
+            let mut ids = Vec::new();
+            for item in table.iter()? {
+                let (k, v) = item?;
+                let (event, _): (AuditEvent, _) =
+                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
+                        .context("bincode decode audit for prune")?;
+                if event.timestamp < cutoff {
+                    ids.push(k.value());
+                } else {
+                    break; // IDs are monotonic — remaining are newer.
+                }
+            }
+            ids
+        };
+
+        if ids_to_remove.is_empty() {
+            return Ok(0);
+        }
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(AUDIT_LOG)?;
+            for id in &ids_to_remove {
+                table.remove(*id)?;
+            }
+        }
+        write_txn.commit()?;
+
+        let removed = ids_to_remove.len();
+        if removed > 0 {
+            info!(removed, "pruned old audit events");
+        }
+        Ok(removed)
+    }
+
+    /// Spawn a background task that prunes old audit events periodically.
+    pub fn spawn_audit_sweep(self, interval: Duration, retention_seconds: i64) {
+        tokio::spawn(async move {
+            let mut ticker = time::interval(interval);
+            ticker.tick().await; // skip first immediate tick
+            loop {
+                ticker.tick().await;
+                if let Err(e) = self.prune_audit(retention_seconds) {
+                    warn!(error = %e, "audit sweep error");
+                }
+            }
+        });
+    }
+
     /// Spawn a background Tokio task that calls `prune()` every `interval`.
     pub fn spawn_sweep(self, interval: Duration) {
         tokio::spawn(async move {
@@ -499,7 +623,7 @@ mod tests {
     fn read_limit_burn() {
         let (s, _dir) = make_store();
         s.put("BURN", "secret", None, Some(1), true).unwrap();
-        assert_eq!(s.get("BURN").unwrap(), GetResult::Value("secret".into()));
+        assert_eq!(s.get("BURN").unwrap(), GetResult::Burned("secret".into()));
         // Second read should return NotFound — record was burned.
         assert_eq!(s.get("BURN").unwrap(), GetResult::NotFound);
     }
@@ -592,5 +716,127 @@ mod tests {
         s.put("GS", "val", None, Some(1), false).unwrap();
         assert!(matches!(s.get("GS").unwrap(), GetResult::Value(_)));
         assert!(matches!(s.get("GS").unwrap(), GetResult::Sealed));
+    }
+
+    // ── Audit tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn record_and_list_audit() {
+        let (s, _dir) = make_store();
+
+        s.record_audit(AuditEvent::new(
+            "secret.create",
+            Some("KEY1".into()),
+            "127.0.0.1".into(),
+            true,
+            None,
+        ))
+        .unwrap();
+        s.record_audit(AuditEvent::new(
+            "secret.read",
+            Some("KEY1".into()),
+            "10.0.0.1".into(),
+            true,
+            None,
+        ))
+        .unwrap();
+
+        let query = AuditQuery {
+            since: None,
+            until: None,
+            action: None,
+            limit: 100,
+        };
+        let events = s.list_audit(&query).unwrap();
+        assert_eq!(events.len(), 2);
+        // Most recent first.
+        assert_eq!(events[0].action, "secret.read");
+        assert_eq!(events[0].id, 2);
+        assert_eq!(events[1].action, "secret.create");
+        assert_eq!(events[1].id, 1);
+    }
+
+    #[test]
+    fn audit_query_filters() {
+        let (s, _dir) = make_store();
+
+        // Insert 5 events.
+        for i in 0..5 {
+            let action = if i % 2 == 0 {
+                "secret.create"
+            } else {
+                "secret.read"
+            };
+            s.record_audit(AuditEvent::new(
+                action,
+                Some(format!("K{i}")),
+                "127.0.0.1".into(),
+                true,
+                None,
+            ))
+            .unwrap();
+        }
+
+        // Filter by action.
+        let events = s
+            .list_audit(&AuditQuery {
+                since: None,
+                until: None,
+                action: Some("secret.create".into()),
+                limit: 100,
+            })
+            .unwrap();
+        assert_eq!(events.len(), 3); // indices 0, 2, 4
+
+        // Limit.
+        let events = s
+            .list_audit(&AuditQuery {
+                since: None,
+                until: None,
+                action: None,
+                limit: 2,
+            })
+            .unwrap();
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn audit_prune_removes_old_entries() {
+        let (s, _dir) = make_store();
+
+        // Insert an event with a manually backdated timestamp.
+        let mut old_event = AuditEvent::new(
+            "secret.create",
+            Some("OLD".into()),
+            "127.0.0.1".into(),
+            true,
+            None,
+        );
+        old_event.timestamp = 1000; // far in the past
+
+        s.record_audit(old_event).unwrap();
+        s.record_audit(AuditEvent::new(
+            "secret.read",
+            Some("NEW".into()),
+            "127.0.0.1".into(),
+            true,
+            None,
+        ))
+        .unwrap();
+
+        // Prune with a short retention (anything older than 1 day from now).
+        let removed = s.prune_audit(86400).unwrap();
+        assert_eq!(removed, 1);
+
+        let events = s
+            .list_audit(&AuditQuery {
+                since: None,
+                until: None,
+                action: None,
+                limit: 100,
+            })
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, "secret.read");
     }
 }

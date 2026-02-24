@@ -10,13 +10,13 @@ use axum::{
 };
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     auth::require_api_key,
     handlers::{
-        create_secret, delete_secret, get_secret, head_secret, health, list_secrets,
-        patch_secret, prune_secrets,
+        audit_events, create_secret, delete_secret, get_secret, head_secret, health,
+        list_secrets, patch_secret, prune_secrets,
     },
     license, AppState,
 };
@@ -29,6 +29,9 @@ pub struct ServerConfig {
     pub data_dir: Option<PathBuf>,
     pub sweep_interval: Duration,
     pub cors_origins: Option<String>,
+    pub audit_retention_days: u64,
+    pub validation_url: String,
+    pub validation_cache_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -44,6 +47,16 @@ impl Default for ServerConfig {
             data_dir: std::env::var("SIRR_DATA_DIR").ok().map(PathBuf::from),
             sweep_interval: Duration::from_secs(300),
             cors_origins: std::env::var("SIRR_CORS_ORIGINS").ok(),
+            audit_retention_days: std::env::var("SIRR_AUDIT_RETENTION_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
+            validation_url: std::env::var("SIRR_VALIDATION_URL")
+                .unwrap_or_else(|_| "https://secretdrop.app/api/validate".into()),
+            validation_cache_secs: std::env::var("SIRR_VALIDATION_CACHE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3600),
         }
     }
 }
@@ -111,8 +124,12 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     let db_path = data_dir.join("sirr.db");
     let store = crate::store::Store::open(&db_path, enc_key).context("open store")?;
 
-    // Spawn background sweep.
+    // Spawn background sweeps.
     store.clone().spawn_sweep(cfg.sweep_interval);
+    let retention_secs = (cfg.audit_retention_days * 86400) as i64;
+    store
+        .clone()
+        .spawn_audit_sweep(cfg.sweep_interval, retention_secs);
 
     // Validate license key.
     let lic_status = license::effective_status(cfg.license_key.as_deref());
@@ -131,10 +148,32 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         }
     }
 
+    // Set up online license validation if a license key is configured and format is valid.
+    let validator = if lic_status == license::LicenseStatus::Licensed {
+        if let Some(ref key) = cfg.license_key {
+            let v = crate::validator::OnlineValidator::new(
+                key.clone(),
+                cfg.validation_url,
+                cfg.validation_cache_secs,
+                259200, // 72-hour grace period
+            );
+            let valid = v.validate_startup(&store).await;
+            if !valid {
+                warn!("license rejected online — server will enforce free-tier limits above 100 secrets");
+            }
+            Some(v)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let state = AppState {
         store,
         api_key: cfg.api_key,
         license: lic_status,
+        validator,
     };
 
     let cors = build_cors(cfg.cors_origins.as_deref());
@@ -152,6 +191,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         .route("/secrets/{key}", patch(patch_secret))
         .route("/secrets/{key}", delete(delete_secret))
         .route("/prune", post(prune_secrets))
+        .route("/audit", get(audit_events))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
@@ -173,7 +213,12 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         .await
         .context("bind listener")?;
 
-    axum::serve(listener, app).await.context("server error")
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("server error")
 }
 
 fn load_or_create_key(
