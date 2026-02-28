@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/sirr",
+    "crates/sirrd",
     "crates/sirr-server",
 ]
 resolver = "2"

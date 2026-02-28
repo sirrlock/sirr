@@ -1,28 +1,24 @@
 [package]
-name = "sirr"
+name = "sirrd"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license = "MIT"
+license.workspace = true
 repository.workspace = true
-description = "CLI client for Sirr — push, get, and manage ephemeral secrets"
+description = "Sirrd — ephemeral secret vault server daemon"
 homepage.workspace = true
 documentation.workspace = true
-keywords = ["secrets", "vault", "ephemeral", "ttl", "self-hosted"]
+keywords = ["secrets", "vault", "ephemeral", "server", "self-hosted"]
 categories = ["command-line-utilities", "cryptography"]
 
 [[bin]]
-name = "sirr"
+name = "sirrd"
 path = "src/main.rs"
 
 [dependencies]
+sirr-server.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-dotenvy = "0.15"
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-humantime = "2"

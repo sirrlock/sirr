@@ -1715,6 +1715,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sirr"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dotenvy",
+ "humantime",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sirr-server"
 version = "0.1.0"
 dependencies = [
@@ -1750,11 +1766,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "dotenvy",
- "humantime",
- "reqwest",
- "serde",
- "serde_json",
  "sirr-server",
  "tokio",
  "tracing",

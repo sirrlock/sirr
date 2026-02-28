@@ -2,10 +2,11 @@
 
 ## Project Overview
 
-Sirr is a self-hosted ephemeral secret vault. Single Rust binary, zero runtime deps.
+Sirr is a self-hosted ephemeral secret vault. Two binaries: `sirrd` (server) and `sirr` (CLI client).
 Stack: Rust (axum + redb + ChaCha20Poly1305).
 
-BSL 1.1 license — free ≤100 secrets/instance, license required above that.
+BSL 1.1 license on `sirrd` — free ≤100 secrets/instance, license required above that.
+MIT license on `sirr` CLI client.
 
 ## Monorepo Layout
 
@@ -13,7 +14,8 @@ BSL 1.1 license — free ≤100 secrets/instance, license required above that.
 sirr/                           # github.com/SirrVault/sirr
 ├── Cargo.toml                  # Rust workspace
 ├── crates/
-│   ├── sirrd/                  # sirrd daemon binary (axum server, redb store, crypto)
+│   ├── sirr/                   # sirr CLI client binary (MIT, reqwest-based, no server deps)
+│   ├── sirrd/                  # sirrd daemon binary (BSL-1.1, axum server, redb store, crypto)
 │   └── sirr-server/            # Library: axum server, redb store, crypto
 ├── Dockerfile                  # FROM scratch + musl binary
 ├── Dockerfile.release          # Used by CI release workflow
@@ -27,14 +29,20 @@ sirr/                           # github.com/SirrVault/sirr
 
 ```bash
 # Rust
-cargo build --release --bin sirrd   # Production server binary
-cargo test --all                    # All unit tests
-cargo clippy --all-targets          # Linter
-cargo fmt --all                     # Formatter
+cargo build --release --bin sirrd --bin sirr   # Both binaries
+cargo build --release --bin sirrd              # Server only
+cargo build --release --bin sirr               # CLI client only
+cargo test --all                               # All unit tests
+cargo clippy --all-targets                     # Linter
+cargo fmt --all                                # Formatter
 
 # Run server locally
 ./target/release/sirrd serve
 # Optionally protect writes: SIRR_API_KEY=my-key ./target/release/sirrd serve
+
+# Use CLI client
+./target/release/sirr push FOO=bar
+./target/release/sirr get FOO
 ```
 
 ## Architecture
@@ -49,7 +57,8 @@ key + per-record nonce --ChaCha20Poly1305--> encrypted value stored in redb
 - `crates/sirr-server/src/store/model.rs` — SecretRecord with `delete` flag, is_expired/is_burned/is_sealed checks
 - `crates/sirr-server/src/server.rs` — axum router, CORS, key management (sirr.key)
 - `crates/sirr-server/src/auth.rs` — optional API key middleware (SIRR_API_KEY)
-- `crates/sirrd/src/main.rs` — clap CLI dispatch for server daemon
+- `crates/sirrd/src/main.rs` — clap CLI: `serve` + `rotate` subcommands (server-side ops only)
+- `crates/sirr/src/main.rs` — clap CLI: `push`, `get`, `pull`, `run`, `share`, `list`, `delete`, `prune`, `webhooks`, `audit`, `keys`
 
 ## Key Constraints
 
