@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Sirrd — ephemeral secret vault server daemon"
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["secrets", "vault", "ephemeral", "ttl", "self-hosted"]
+categories = ["command-line-utilities", "cryptography"]
 default-run = "sirrd"
 
 [[bin]]
@@ -13,7 +17,7 @@ name = "sirrd"
 path = "src/main.rs"
 
 [dependencies]
-sirr-server = { path = "../sirr-server" }
+sirr-server.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { workspace = true }
 serde = { workspace = true }

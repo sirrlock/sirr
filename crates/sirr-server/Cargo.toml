@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Sirr server library — axum HTTP server with redb storage and ChaCha20Poly1305 encryption"
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["secrets", "vault", "ephemeral", "axum", "encryption"]
+categories = ["cryptography", "web-programming::http-server"]
 
 [dependencies]
 axum = "0.8"
