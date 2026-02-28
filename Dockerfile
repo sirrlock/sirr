@@ -1,23 +1,20 @@
 # ── Builder ────────────────────────────────────────────────────────────────────
 FROM rust:1.85-alpine AS builder
 
-RUN apk add --no-cache musl-dev && \
-    rustup target add x86_64-unknown-linux-musl
+RUN apk add --no-cache musl-dev
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
 COPY crates/ crates/
 
-# Build a static musl binary.
-# Alpine is already musl — point cargo at the native gcc instead of the
-# missing cross-linker x86_64-linux-musl-gcc.
-RUN CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=gcc \
-    cargo build --release --bin sirrd --target x86_64-unknown-linux-musl
+# Alpine is already musl-based, so the default target produces a static musl
+# binary without needing cross-compilation or --target flags.
+RUN cargo build --release --bin sirrd
 
 # ── Final image ────────────────────────────────────────────────────────────────
 FROM scratch
 
-COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/sirrd /sirrd
+COPY --from=builder /build/target/release/sirrd /sirrd
 
 # Data directory — mount a volume here for persistence.
 VOLUME ["/data"]
