@@ -1,15 +1,15 @@
 [package]
-name = "sirr"
+name = "sirrd"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Sirr — ephemeral secret vault CLI and server"
-default-run = "sirr"
+description = "Sirrd — ephemeral secret vault server daemon"
+default-run = "sirrd"
 
 [[bin]]
-name = "sirr"
+name = "sirrd"
 path = "src/main.rs"
 
 [dependencies]
