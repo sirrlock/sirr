@@ -215,20 +215,25 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Set workspace version
+        env:
+          VER: ${{ env.VERSION }}
+        run: sed -i "s/^version = \".*\"/version = \"${VER}\"/" Cargo.toml
+
       - name: Check if version already published
         id: check
+        env:
+          VER: ${{ env.VERSION }}
         run: |
-          VERSION=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "sirrd") | .version')
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            "https://crates.io/api/v1/crates/sirrd/${VERSION}")
+            -H "User-Agent: distros-check/1.0" \
+            "https://crates.io/api/v1/crates/sirrd/${VER}")
           if [ "$STATUS" = "200" ]; then
             echo "skip=true" >> $GITHUB_OUTPUT
-            echo "sirrd v${VERSION} already on crates.io — skipping"
+            echo "sirrd v${VER} already on crates.io — skipping"
           else
             echo "skip=false" >> $GITHUB_OUTPUT
-            echo "sirrd v${VERSION} not yet published — will publish"
+            echo "sirrd v${VER} not yet published — will publish"
           fi
 
       - name: Publish sirr-server
