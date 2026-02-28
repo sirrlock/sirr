@@ -1,4 +1,4 @@
-# Sirr (سر)
+# Sirr
 
 [![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-blue.svg)](LICENSE)
 [![CI](https://github.com/SirrVault/sirr/actions/workflows/ci.yml/badge.svg)](https://github.com/SirrVault/sirr/actions/workflows/ci.yml)
@@ -350,4 +350,4 @@ SIRR_LICENSE_KEY=sirr_lic_... ./sirr serve
 
 ---
 
-*Sirr (سر) means "secret" in Arabic. Secrets that whisper and disappear.*
+*Secrets that whisper and disappear.*

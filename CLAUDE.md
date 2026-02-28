@@ -2,48 +2,39 @@
 
 ## Project Overview
 
-Sirr (سر) is a self-hosted ephemeral secret vault. Single Rust binary, zero runtime deps.
-Stack: Rust (axum + redb + ChaCha20Poly1305) + Node.js SDK + MCP server.
+Sirr is a self-hosted ephemeral secret vault. Single Rust binary, zero runtime deps.
+Stack: Rust (axum + redb + ChaCha20Poly1305).
 
 BSL 1.1 license — free ≤100 secrets/instance, license required above that.
 
 ## Monorepo Layout
 
 ```
-sirr/
+sirr/                           # github.com/SirrVault/sirr
 ├── Cargo.toml                  # Rust workspace
 ├── crates/
-│   ├── sirr/                   # CLI binary (clap)
+│   ├── sirrd/                  # sirrd daemon binary (axum server, redb store, crypto)
 │   └── sirr-server/            # Library: axum server, redb store, crypto
-├── packages/
-│   ├── node/                   # @sirr/node — TypeScript fetch wrapper
-│   └── mcp/                    # @sirr/mcp — MCP server for Claude Code
-├── Formula/sirr.rb             # Homebrew formula
 ├── Dockerfile                  # FROM scratch + musl binary
+├── Dockerfile.release          # Used by CI release workflow
 ├── docker-compose.yml          # Production setup with key file mount
 └── .github/workflows/
-    ├── ci.yml                  # fmt + clippy + test (3 OS) + npm build/test
-    └── release.yml             # cross-platform binaries + Docker + npm publish
+    ├── ci.yml                  # fmt + clippy + test (3 OS)
+    └── release.yml             # cross-platform binaries + Docker + crates.io + package managers
 ```
 
 ## Commands
 
 ```bash
 # Rust
-cargo build --release --bin sirr   # Production binary
-cargo test --all                   # All unit tests
-cargo clippy --all-targets         # Linter
-cargo fmt --all                    # Formatter
-
-# Node SDK
-cd packages/node && npm install && npm run build && npm test
-
-# MCP server
-cd packages/mcp && npm install && npm run build
+cargo build --release --bin sirrd   # Production server binary
+cargo test --all                    # All unit tests
+cargo clippy --all-targets          # Linter
+cargo fmt --all                     # Formatter
 
 # Run server locally
-./target/release/sirr serve
-# Optionally protect writes: SIRR_API_KEY=my-key ./target/release/sirr serve
+./target/release/sirrd serve
+# Optionally protect writes: SIRR_API_KEY=my-key ./target/release/sirrd serve
 ```
 
 ## Architecture
@@ -58,7 +49,7 @@ key + per-record nonce --ChaCha20Poly1305--> encrypted value stored in redb
 - `crates/sirr-server/src/store/model.rs` — SecretRecord with `delete` flag, is_expired/is_burned/is_sealed checks
 - `crates/sirr-server/src/server.rs` — axum router, CORS, key management (sirr.key)
 - `crates/sirr-server/src/auth.rs` — optional API key middleware (SIRR_API_KEY)
-- `crates/sirr/src/main.rs` — clap CLI dispatch + reqwest HTTP client
+- `crates/sirrd/src/main.rs` — clap CLI dispatch for server daemon
 
 ## Key Constraints
 
@@ -72,25 +63,14 @@ key + per-record nonce --ChaCha20Poly1305--> encrypted value stored in redb
 ## Testing
 
 ```bash
-cargo test --all                   # 23 unit tests
+cargo test --all                   # unit tests
 
 # Manual smoke test
-./target/release/sirr serve &
+./target/release/sirrd serve &
 sleep 1
 
 # Store and retrieve (burn after 1 read)
-sirr push DB_URL="postgres://..." --reads 1
-sirr get DB_URL                    # Returns value
-sirr get DB_URL                    # 404 — burned
-
-# Patchable secret (no auto-delete)
-sirr push CF_TOKEN=abc123 --reads 5 --no-delete
-sirr get CF_TOKEN                  # Returns value, read_count = 1
-
-# TTL test
-sirr push TEMP=val --ttl 2s
-sleep 3
-sirr get TEMP                      # 404 — expired
+# (requires sirr CLI from separate client)
 ```
 
 ## Pre-Commit Checklist
@@ -100,8 +80,6 @@ sirr get TEMP                      # 404 — expired
 1. **README.md** — Does it reflect any new commands, env vars, or API changes?
 2. **CLAUDE.md** (this file) — Are there new architectural constraints or gotchas worth recording?
 3. **llms.txt** — Does it reflect the current feature set? (LLMs may use this to understand the project)
-
-This applies to all packages — Rust crates, Node SDK, and MCP server.
 
 ## License Key System
 
@@ -122,8 +100,8 @@ chacha20poly1305 = "0.10"
 
 ## Release Process
 
-1. Update versions: `Cargo.toml` workspace version + `packages/node/package.json`
-2. Review README.md, CLAUDE.md, llms.txt
-3. Tag: `git tag v0.x.0 && git push --tags`
-4. CI/release.yml builds all targets, publishes Docker + npm automatically
-5. Update SHA256 hashes in `Formula/sirr.rb` with values from the release artifacts
+CI releases on every push to main. Version: `1.0.<run_number>`.
+
+1. Push to main → CI builds all targets, publishes Docker + crates.io + updates Homebrew/Scoop
+2. To publish to crates.io: bump `version` in workspace `Cargo.toml` (CI skips if version already published)
+3. Secrets needed in repo settings: `CRATES_IO_TOKEN`, `SIRR_PACKAGE_MANAGERS_KEY`, `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`

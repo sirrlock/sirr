@@ -39,6 +39,10 @@ pub struct ServerConfig {
     pub webhook_secret: Option<String>,
     /// Instance identifier for webhook event payloads ($SIRR_INSTANCE_ID).
     pub instance_id: Option<String>,
+    /// Effective log level string shown in the startup banner.
+    pub log_level: String,
+    /// Set `NO_BANNER=1` to suppress the startup banner.
+    pub no_banner: bool,
 }
 
 impl Default for ServerConfig {
@@ -69,6 +73,10 @@ impl Default for ServerConfig {
                 .unwrap_or(true),
             webhook_secret: std::env::var("SIRR_WEBHOOK_SECRET").ok(),
             instance_id: std::env::var("SIRR_INSTANCE_ID").ok(),
+            log_level: std::env::var("SIRR_LOG_LEVEL").unwrap_or_else(|_| "warn".into()),
+            no_banner: std::env::var("NO_BANNER")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
     }
 }
@@ -175,6 +183,9 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
             anyhow::bail!("invalid SIRR_LICENSE_KEY: {reason}");
         }
     }
+
+    // Print startup banner (before any values are moved into AppState).
+    print_banner(&cfg, &data_dir, &lic_status);
 
     // Derive the heartbeat endpoint from the validation URL base.
     let heartbeat_url = cfg
@@ -301,6 +312,49 @@ fn gethostname() -> Option<String> {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
+}
+
+fn print_banner(
+    cfg: &ServerConfig,
+    data_dir: &std::path::Path,
+    lic_status: &license::LicenseStatus,
+) {
+    if cfg.no_banner {
+        return;
+    }
+
+    let version = env!("CARGO_PKG_VERSION");
+    let addr = format!("http://{}:{}", cfg.host, cfg.port);
+
+    let token_source = if std::env::var("SIRR_MASTER_KEY_FILE").is_ok() {
+        "SIRR_MASTER_KEY_FILE"
+    } else {
+        "SIRR_MASTER_KEY"
+    };
+
+    let tier = match lic_status {
+        license::LicenseStatus::Free => {
+            format!("free  (≤{} active secrets)", license::FREE_TIER_LIMIT)
+        }
+        license::LicenseStatus::Licensed => "licensed  (unlimited secrets)".to_string(),
+        license::LicenseStatus::Invalid(_) => return,
+    };
+
+    // compact ASCII art: s i r r
+    eprintln!();
+    eprintln!("  ___ _          ");
+    eprintln!(" / __(_)_ _ _ _  ");
+    eprintln!(" \\__ \\ | '_| '_| ");
+    eprintln!(" |___/_|_| |_|   ");
+    eprintln!();
+    eprintln!("  sirr v{version}  ·  ephemeral secret vault");
+    eprintln!();
+    eprintln!("  address   {addr}");
+    eprintln!("  data      {}", data_dir.display());
+    eprintln!("  log       {}", cfg.log_level);
+    eprintln!("  token     {token_source}");
+    eprintln!("  tier      {tier}");
+    eprintln!();
 }
 
 fn build_cors(origins: Option<&str>) -> CorsLayer {

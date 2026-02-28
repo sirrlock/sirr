@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 // ── CLI definition ─────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "sirr", about = "Sirr (سر) — ephemeral secret vault", version)]
+#[command(name = "sirr", about = "Sirr — ephemeral secret vault", version)]
 struct Cli {
     /// Sirr server URL (default: http://localhost:39999 or $SIRR_SERVER)
     #[arg(long, env = "SIRR_SERVER", default_value = "http://localhost:39999")]
@@ -33,6 +33,9 @@ enum Commands {
         /// Host to bind (default: $SIRR_HOST or 0.0.0.0)
         #[arg(long, env = "SIRR_HOST", default_value = "0.0.0.0")]
         host: String,
+        /// Log level: error, warn, info, debug, verbose (default: $SIRR_LOG_LEVEL or warn)
+        #[arg(long, env = "SIRR_LOG_LEVEL")]
+        log_level: Option<String>,
     },
     /// Push a secret: `KEY=value` or a `.env` file path
     Push {
@@ -153,16 +156,34 @@ enum KeyCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_env("SIRR_LOG_LEVEL").unwrap_or_else(|_| EnvFilter::new("warn")),
-        )
-        .init();
-
     let cli = Cli::parse();
 
+    // Resolve the effective log level early so tracing is initialized with the right filter.
+    // --log-level (or $SIRR_LOG_LEVEL) takes effect; "verbose" normalizes to "debug".
+    let effective_log_level = if let Commands::Serve { ref log_level, .. } = cli.command {
+        let raw = log_level
+            .clone()
+            .or_else(|| std::env::var("SIRR_LOG_LEVEL").ok())
+            .unwrap_or_else(|| "warn".into());
+        if raw.eq_ignore_ascii_case("verbose") {
+            "debug".to_owned()
+        } else {
+            raw
+        }
+    } else {
+        std::env::var("SIRR_LOG_LEVEL").unwrap_or_else(|_| "warn".into())
+    };
+
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new(&effective_log_level))
+        .init();
+
     match cli.command {
-        Commands::Serve { port, host } => cmd_serve(host, port).await,
+        Commands::Serve {
+            port,
+            host,
+            log_level: _,
+        } => cmd_serve(host, port, effective_log_level).await,
 
         Commands::Push {
             target,
@@ -230,13 +251,19 @@ async fn main() -> Result<()> {
 
 // ── Command implementations ───────────────────────────────────────────────────
 
-async fn cmd_serve(host: String, port: u16) -> Result<()> {
+async fn cmd_serve(host: String, port: u16, log_level: String) -> Result<()> {
+    let no_banner = std::env::var("NO_BANNER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     let cfg = sirr_server::ServerConfig {
         host,
         port,
         api_key: std::env::var("SIRR_API_KEY").ok(),
         license_key: std::env::var("SIRR_LICENSE_KEY").ok(),
         data_dir: std::env::var("SIRR_DATA_DIR").ok().map(Into::into),
+        log_level,
+        no_banner,
         ..Default::default()
     };
 
