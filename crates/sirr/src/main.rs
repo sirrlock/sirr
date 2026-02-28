@@ -83,6 +83,21 @@ enum Commands {
     /// Manage webhooks
     #[command(subcommand)]
     Webhooks(WebhookCommand),
+    /// Query the audit log
+    Audit {
+        /// Filter by timestamp (Unix epoch seconds)
+        #[arg(long)]
+        since: Option<i64>,
+        /// Filter by action type (e.g. secret.create)
+        #[arg(long)]
+        action: Option<String>,
+        /// Maximum events to return
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    /// Manage scoped API keys
+    #[command(subcommand)]
+    Keys(KeyCommand),
     /// Rotate the encryption key (offline). Re-encrypts all records with a new
     /// master key. Requires SIRR_MASTER_KEY (or _FILE) for the current key and
     /// SIRR_NEW_MASTER_KEY (or _FILE) for the replacement.
@@ -105,6 +120,30 @@ enum WebhookCommand {
     /// Remove a webhook by ID
     Remove {
         /// Webhook ID
+        #[arg(name = "ID")]
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyCommand {
+    /// List all scoped API keys
+    List,
+    /// Create a new scoped API key
+    Create {
+        /// Human-readable label
+        #[arg(name = "LABEL")]
+        label: String,
+        /// Comma-separated permissions: read,write,delete,admin
+        #[arg(long, value_delimiter = ',', default_value = "read,write")]
+        permissions: Vec<String>,
+        /// Optional prefix scope (e.g. PROD_)
+        #[arg(long)]
+        prefix: Option<String>,
+    },
+    /// Remove an API key by ID
+    Remove {
+        /// API key ID
         #[arg(name = "ID")]
         id: String,
     },
@@ -169,6 +208,22 @@ async fn main() -> Result<()> {
             }
         },
 
+        Commands::Audit {
+            since,
+            action,
+            limit,
+        } => cmd_audit(&cli.server, &cli.api_key, since, action.as_deref(), limit).await,
+
+        Commands::Keys(sub) => match sub {
+            KeyCommand::List => cmd_key_list(&cli.server, &cli.api_key).await,
+            KeyCommand::Create {
+                label,
+                permissions,
+                prefix,
+            } => cmd_key_create(&cli.server, &cli.api_key, &label, permissions, prefix).await,
+            KeyCommand::Remove { id } => cmd_key_remove(&cli.server, &cli.api_key, &id).await,
+        },
+
         Commands::Rotate => cmd_rotate().await,
     }
 }
@@ -195,7 +250,8 @@ async fn cmd_rotate() -> Result<()> {
 
     // Load the current encryption key from sirr.key.
     let key_path = data_dir.join("sirr.key");
-    let old_bytes = std::fs::read(&key_path).context("read sirr.key — is the server initialized?")?;
+    let old_bytes =
+        std::fs::read(&key_path).context("read sirr.key — is the server initialized?")?;
     let old_key = sirr_server::store::crypto::load_key(&old_bytes)
         .ok_or_else(|| anyhow::anyhow!("sirr.key is corrupt (expected 32 bytes)"))?;
 
@@ -519,6 +575,161 @@ async fn cmd_webhook_remove(server: &str, api_key: &Option<String>, id: &str) ->
 
     if resp.status().is_success() {
         println!("webhook {id} removed");
+    } else {
+        let status = resp.status();
+        let json: Value = resp.json().await.unwrap_or_default();
+        anyhow::bail!(
+            "server returned {status}: {}",
+            json["error"].as_str().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+// ── Audit ─────────────────────────────────────────────────────────────────
+
+async fn cmd_audit(
+    server: &str,
+    api_key: &Option<String>,
+    since: Option<i64>,
+    action: Option<&str>,
+    limit: usize,
+) -> Result<()> {
+    let client = Client::new();
+    let mut url = format!("{}/audit?limit={}", server.trim_end_matches('/'), limit);
+    if let Some(s) = since {
+        url.push_str(&format!("&since={s}"));
+    }
+    if let Some(a) = action {
+        url.push_str(&format!("&action={a}"));
+    }
+
+    let req = client.get(&url);
+    let resp = with_auth(req, api_key)
+        .send()
+        .await
+        .context("HTTP request failed")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("server returned {status}: {text}");
+    }
+
+    let json: Value = resp.json().await?;
+    let events = json["events"].as_array();
+    match events {
+        Some(arr) if arr.is_empty() => println!("(no audit events)"),
+        Some(arr) => {
+            for e in arr {
+                let ts = e["timestamp"].as_i64().unwrap_or(0);
+                let action = e["action"].as_str().unwrap_or("?");
+                let key = e["key"].as_str().unwrap_or("-");
+                let ip = e["source_ip"].as_str().unwrap_or("?");
+                let ok = if e["success"].as_bool().unwrap_or(false) {
+                    "ok"
+                } else {
+                    "FAIL"
+                };
+                println!("  [{ts}] {action} key={key} ip={ip} {ok}");
+            }
+        }
+        None => println!("(no audit events)"),
+    }
+    Ok(())
+}
+
+// ── API Keys ──────────────────────────────────────────────────────────────
+
+async fn cmd_key_list(server: &str, api_key: &Option<String>) -> Result<()> {
+    let client = Client::new();
+    let req = client.get(format!("{}/keys", server.trim_end_matches('/')));
+    let resp = with_auth(req, api_key)
+        .send()
+        .await
+        .context("HTTP request failed")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("server returned {status}: {text}");
+    }
+
+    let json: Value = resp.json().await?;
+    let keys = json["keys"].as_array();
+    match keys {
+        Some(arr) if arr.is_empty() => println!("(no API keys)"),
+        Some(arr) => {
+            for k in arr {
+                let id = k["id"].as_str().unwrap_or("?");
+                let label = k["label"].as_str().unwrap_or("?");
+                let perms = k["permissions"]
+                    .as_array()
+                    .map(|p| {
+                        p.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_default();
+                let prefix = k["prefix"].as_str().unwrap_or("*");
+                println!("  {id}  {label}  [{perms}]  prefix={prefix}");
+            }
+        }
+        None => println!("(no API keys)"),
+    }
+    Ok(())
+}
+
+async fn cmd_key_create(
+    server: &str,
+    api_key: &Option<String>,
+    label: &str,
+    permissions: Vec<String>,
+    prefix: Option<String>,
+) -> Result<()> {
+    let client = Client::new();
+    let mut body = serde_json::json!({
+        "label": label,
+        "permissions": permissions,
+    });
+    if let Some(ref p) = prefix {
+        body["prefix"] = serde_json::json!(p);
+    }
+
+    let req = client.post(format!("{}/keys", server.trim_end_matches('/')));
+    let resp = with_auth(req, api_key)
+        .json(&body)
+        .send()
+        .await
+        .context("HTTP request failed")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("server returned {status}: {text}");
+    }
+
+    let json: Value = resp.json().await?;
+    let id = json["id"].as_str().unwrap_or("?");
+    let key = json["key"].as_str().unwrap_or("?");
+    println!("API key created");
+    println!("  id:    {id}");
+    println!("  key:   {key}");
+    println!("  (save the key — it won't be shown again)");
+    Ok(())
+}
+
+async fn cmd_key_remove(server: &str, api_key: &Option<String>, id: &str) -> Result<()> {
+    let client = Client::new();
+    let req = client.delete(format!("{}/keys/{}", server.trim_end_matches('/'), id));
+    let resp = with_auth(req, api_key)
+        .send()
+        .await
+        .context("HTTP request failed")?;
+
+    if resp.status().is_success() {
+        println!("API key {id} removed");
     } else {
         let status = resp.status();
         let json: Value = resp.json().await.unwrap_or_default();

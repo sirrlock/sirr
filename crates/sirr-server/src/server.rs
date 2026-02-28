@@ -15,8 +15,9 @@ use tracing::{info, warn};
 use crate::{
     auth::require_api_key,
     handlers::{
-        audit_events, create_secret, create_webhook, delete_secret, delete_webhook, get_secret,
-        head_secret, health, list_secrets, list_webhooks, patch_secret, prune_secrets,
+        audit_events, create_api_key, create_secret, create_webhook, delete_api_key, delete_secret,
+        delete_webhook, get_secret, head_secret, health, list_api_keys, list_secrets,
+        list_webhooks, patch_secret, prune_secrets,
     },
     license, AppState,
 };
@@ -91,9 +92,7 @@ pub fn resolve_master_key() -> Result<String> {
     if let Ok(path) = std::env::var("SIRR_MASTER_KEY_FILE") {
         let key = read_key_file(std::path::Path::new(&path))?;
         if std::env::var("SIRR_MASTER_KEY").is_ok() {
-            tracing::warn!(
-                "both SIRR_MASTER_KEY and SIRR_MASTER_KEY_FILE are set; using file"
-            );
+            tracing::warn!("both SIRR_MASTER_KEY and SIRR_MASTER_KEY_FILE are set; using file");
         }
         return Ok(key);
     }
@@ -205,8 +204,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
 
     // Spawn instance heartbeat if enabled and a license key is present.
     if cfg.heartbeat {
-        if let (Some(ref license_key), Some(ref raw_bytes)) =
-            (&cfg.license_key, &key_bytes_for_id)
+        if let (Some(ref license_key), Some(ref raw_bytes)) = (&cfg.license_key, &key_bytes_for_id)
         {
             let instance_id = crate::heartbeat::instance_id_from_key(raw_bytes);
             info!(instance_id = %instance_id, "starting instance heartbeat");
@@ -246,6 +244,9 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         .route("/webhooks", post(create_webhook))
         .route("/webhooks", get(list_webhooks))
         .route("/webhooks/{id}", delete(delete_webhook))
+        .route("/keys", post(create_api_key))
+        .route("/keys", get(list_api_keys))
+        .route("/keys/{id}", delete(delete_api_key))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
@@ -275,9 +276,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     .context("server error")
 }
 
-fn load_or_create_key(
-    data_dir: &std::path::Path,
-) -> Result<crate::store::crypto::EncryptionKey> {
+fn load_or_create_key(data_dir: &std::path::Path) -> Result<crate::store::crypto::EncryptionKey> {
     let key_path = data_dir.join("sirr.key");
     if key_path.exists() {
         let bytes = std::fs::read(&key_path).context("read sirr.key")?;
@@ -318,10 +317,7 @@ fn build_cors(origins: Option<&str>) -> CorsLayer {
 
     match origins {
         Some(o) => {
-            let origins: Vec<_> = o
-                .split(',')
-                .filter_map(|s| s.trim().parse().ok())
-                .collect();
+            let origins: Vec<_> = o.split(',').filter_map(|s| s.trim().parse().ok()).collect();
             cors.allow_origin(origins)
         }
         None => cors.allow_origin(Any),

@@ -168,6 +168,120 @@ const TOOLS: Tool[] = [
       properties: {},
     },
   },
+  {
+    name: "sirr_audit",
+    description:
+      "Query the Sirr audit log. Returns recent events like secret creates, reads, deletes. " +
+      "Useful for security monitoring and debugging access patterns.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        since: {
+          type: "number",
+          description: "Only return events after this Unix timestamp.",
+        },
+        action: {
+          type: "string",
+          description: "Filter by action type (e.g. secret.create, secret.read, key.create).",
+        },
+        limit: {
+          type: "number",
+          description: "Maximum events to return (default: 50).",
+        },
+      },
+    },
+  },
+  {
+    name: "sirr_webhook_create",
+    description:
+      "Register a webhook URL to receive Sirr event notifications. " +
+      "Returns the webhook ID and signing secret (shown once — save it).",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        url: {
+          type: "string",
+          description: "Webhook endpoint URL (must start with http:// or https://).",
+        },
+        events: {
+          type: "array",
+          items: { type: "string" },
+          description: "Event types to subscribe to (default: all). Examples: secret.created, secret.burned.",
+        },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    name: "sirr_webhook_list",
+    description: "List all registered webhooks on the Sirr server. Signing secrets are redacted.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+  {
+    name: "sirr_webhook_delete",
+    description: "Remove a webhook registration by its ID.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        id: {
+          type: "string",
+          description: "Webhook ID to delete.",
+        },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "sirr_key_create",
+    description:
+      "Create a scoped API key with specific permissions. " +
+      "The raw key is returned once — save it immediately. " +
+      "Permissions: read, write, delete, admin. Optional prefix scoping limits access to secrets matching the prefix.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        label: {
+          type: "string",
+          description: "Human-readable label for the key.",
+        },
+        permissions: {
+          type: "array",
+          items: { type: "string" },
+          description: "Permissions to grant: read, write, delete, admin.",
+        },
+        prefix: {
+          type: "string",
+          description: "Optional prefix scope — key can only access secrets starting with this prefix.",
+        },
+      },
+      required: ["label", "permissions"],
+    },
+  },
+  {
+    name: "sirr_key_list",
+    description: "List all scoped API keys. Key hashes are never returned.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+  {
+    name: "sirr_key_delete",
+    description: "Delete a scoped API key by its ID.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        id: {
+          type: "string",
+          description: "API key ID to delete.",
+        },
+      },
+      required: ["id"],
+    },
+  },
 ];
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
@@ -322,6 +436,166 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               type: "text" as const,
               text: `Sirr server status: ${data.status} (${SIRR_SERVER})`,
             },
+          ],
+        };
+      }
+
+      case "sirr_audit": {
+        const { since, action, limit } = args as {
+          since?: number;
+          action?: string;
+          limit?: number;
+        };
+        const params = new URLSearchParams();
+        if (since != null) params.set("since", String(since));
+        if (action != null) params.set("action", action);
+        if (limit != null) params.set("limit", String(limit));
+        const qs = params.toString();
+        const data = await sirrRequest<{ events: Array<{ id: number; timestamp: number; action: string; key: string | null; source_ip: string; success: boolean }> }>(
+          "GET",
+          `/audit${qs ? `?${qs}` : ""}`,
+        );
+
+        if (data.events.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: "No audit events found." }],
+          };
+        }
+
+        const lines = data.events.map(
+          (e) =>
+            `[${e.timestamp}] ${e.action} key=${e.key ?? "-"} ip=${e.source_ip} ${e.success ? "ok" : "FAIL"}`,
+        );
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `${data.events.length} audit event(s):\n${lines.join("\n")}`,
+            },
+          ],
+        };
+      }
+
+      case "sirr_webhook_create": {
+        const { url, events } = args as { url: string; events?: string[] };
+        const body: Record<string, unknown> = { url };
+        if (events) body.events = events;
+        const data = await sirrRequest<{ id: string; secret: string }>(
+          "POST",
+          "/webhooks",
+          body,
+        );
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Webhook registered.\n  ID: ${data.id}\n  Secret: ${data.secret}\n  (Save the secret — it won't be shown again)`,
+            },
+          ],
+        };
+      }
+
+      case "sirr_webhook_list": {
+        const data = await sirrRequest<{
+          webhooks: Array<{ id: string; url: string; events: string[]; created_at: number }>;
+        }>("GET", "/webhooks");
+
+        if (data.webhooks.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: "No webhooks registered." }],
+          };
+        }
+
+        const lines = data.webhooks.map(
+          (w) => `• ${w.id} — ${w.url} [${w.events.join(",")}]`,
+        );
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `${data.webhooks.length} webhook(s):\n${lines.join("\n")}`,
+            },
+          ],
+        };
+      }
+
+      case "sirr_webhook_delete": {
+        const { id } = args as { id: string };
+        await sirrRequest("DELETE", `/webhooks/${encodeURIComponent(id)}`);
+        return {
+          content: [
+            { type: "text" as const, text: `Webhook '${id}' deleted.` },
+          ],
+        };
+      }
+
+      case "sirr_key_create": {
+        const { label, permissions, prefix } = args as {
+          label: string;
+          permissions: string[];
+          prefix?: string;
+        };
+        const body: Record<string, unknown> = { label, permissions };
+        if (prefix) body.prefix = prefix;
+        const data = await sirrRequest<{
+          id: string;
+          key: string;
+          label: string;
+          permissions: string[];
+          prefix: string | null;
+        }>("POST", "/keys", body);
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `API key created.\n  ID: ${data.id}\n  Key: ${data.key}\n  Permissions: ${data.permissions.join(", ")}\n  Prefix: ${data.prefix ?? "(none)"}\n  (Save the key — it won't be shown again)`,
+            },
+          ],
+        };
+      }
+
+      case "sirr_key_list": {
+        const data = await sirrRequest<{
+          keys: Array<{
+            id: string;
+            label: string;
+            permissions: string[];
+            prefix: string | null;
+            created_at: number;
+          }>;
+        }>("GET", "/keys");
+
+        if (data.keys.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: "No API keys." }],
+          };
+        }
+
+        const lines = data.keys.map(
+          (k) =>
+            `• ${k.id} — ${k.label} [${k.permissions.join(",")}] prefix=${k.prefix ?? "*"}`,
+        );
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `${data.keys.length} API key(s):\n${lines.join("\n")}`,
+            },
+          ],
+        };
+      }
+
+      case "sirr_key_delete": {
+        const { id } = args as { id: string };
+        await sirrRequest("DELETE", `/keys/${encodeURIComponent(id)}`);
+        return {
+          content: [
+            { type: "text" as const, text: `API key '${id}' deleted.` },
           ],
         };
       }

@@ -4,25 +4,37 @@ use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::info;
 
 use crate::{
+    auth::ResolvedPermissions,
     license::{LicenseStatus, FREE_TIER_LIMIT},
     store::{
+        api_keys::{self, Permission},
         audit::{
-            AuditEvent, ACTION_SECRET_BURNED, ACTION_SECRET_CREATE, ACTION_SECRET_DELETE,
-            ACTION_SECRET_LIST, ACTION_SECRET_PATCH, ACTION_SECRET_PRUNE, ACTION_SECRET_READ,
-            ACTION_WEBHOOK_CREATE, ACTION_WEBHOOK_DELETE,
+            AuditEvent, ACTION_KEY_CREATE, ACTION_KEY_DELETE, ACTION_SECRET_BURNED,
+            ACTION_SECRET_CREATE, ACTION_SECRET_DELETE, ACTION_SECRET_LIST, ACTION_SECRET_PATCH,
+            ACTION_SECRET_PRUNE, ACTION_SECRET_READ, ACTION_WEBHOOK_CREATE, ACTION_WEBHOOK_DELETE,
         },
         AuditQuery, GetResult,
     },
     webhooks::{self, MAX_WEBHOOKS},
     AppState,
 };
+
+// ── Permission helpers ───────────────────────────────────────────────────────
+
+fn forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"error": "insufficient permissions"})),
+    )
+        .into_response()
+}
 
 // ── IP extraction ────────────────────────────────────────────────────────────
 
@@ -62,8 +74,12 @@ pub struct AuditQueryParams {
 
 pub async fn audit_events(
     State(state): State<AppState>,
+    Extension(perms): Extension<ResolvedPermissions>,
     Query(params): Query<AuditQueryParams>,
 ) -> Response {
+    if !perms.can_admin() {
+        return forbidden();
+    }
     let limit = params.limit.unwrap_or(100).min(1000);
     let query = AuditQuery {
         since: params.since,
@@ -81,9 +97,13 @@ pub async fn audit_events(
 
 pub async fn list_secrets(
     State(state): State<AppState>,
+    Extension(perms): Extension<ResolvedPermissions>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
+    if !perms.can_read() {
+        return forbidden();
+    }
     let ip = extract_ip(&headers, &addr);
     match state.store.list() {
         Ok(metas) => {
@@ -120,10 +140,14 @@ pub struct CreateResponse {
 
 pub async fn create_secret(
     State(state): State<AppState>,
+    Extension(perms): Extension<ResolvedPermissions>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<CreateRequest>,
 ) -> Response {
+    if !perms.can_write() || !perms.matches_prefix(&body.key) {
+        return forbidden();
+    }
     let ip = extract_ip(&headers, &addr);
 
     if body.key.is_empty() || body.key.len() > 256 {
@@ -375,11 +399,15 @@ pub struct PatchRequest {
 
 pub async fn patch_secret(
     State(state): State<AppState>,
+    Extension(perms): Extension<ResolvedPermissions>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(key): Path<String>,
     Json(body): Json<PatchRequest>,
 ) -> Response {
+    if !perms.can_write() || !perms.matches_prefix(&key) {
+        return forbidden();
+    }
     let ip = extract_ip(&headers, &addr);
 
     if let Some(ref v) = body.value {
@@ -432,11 +460,7 @@ pub async fn patch_secret(
                     false,
                     Some("conflict: delete=true".into()),
                 ));
-                (
-                    StatusCode::CONFLICT,
-                    Json(json!({"error": msg})),
-                )
-                    .into_response()
+                (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response()
             } else {
                 internal_error(e)
             }
@@ -448,10 +472,14 @@ pub async fn patch_secret(
 
 pub async fn delete_secret(
     State(state): State<AppState>,
+    Extension(perms): Extension<ResolvedPermissions>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(key): Path<String>,
 ) -> Response {
+    if !perms.can_delete() || !perms.matches_prefix(&key) {
+        return forbidden();
+    }
     let ip = extract_ip(&headers, &addr);
     match state.store.delete(&key) {
         Ok(true) => {
@@ -487,9 +515,13 @@ pub async fn delete_secret(
 
 pub async fn prune_secrets(
     State(state): State<AppState>,
+    Extension(perms): Extension<ResolvedPermissions>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
+    if !perms.can_admin() {
+        return forbidden();
+    }
     let ip = extract_ip(&headers, &addr);
     match state.store.prune() {
         Ok(pruned_keys) => {
@@ -523,10 +555,14 @@ pub struct CreateWebhookRequest {
 
 pub async fn create_webhook(
     State(state): State<AppState>,
+    Extension(perms): Extension<ResolvedPermissions>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<CreateWebhookRequest>,
 ) -> Response {
+    if !perms.can_admin() {
+        return forbidden();
+    }
     let ip = extract_ip(&headers, &addr);
 
     // License gate: free tier gets 0 webhooks.
@@ -594,7 +630,13 @@ pub async fn create_webhook(
     }
 }
 
-pub async fn list_webhooks(State(state): State<AppState>) -> Response {
+pub async fn list_webhooks(
+    State(state): State<AppState>,
+    Extension(perms): Extension<ResolvedPermissions>,
+) -> Response {
+    if !perms.can_admin() {
+        return forbidden();
+    }
     match state.store.list_webhooks() {
         Ok(regs) => {
             // Redact signing secrets in the response.
@@ -617,10 +659,14 @@ pub async fn list_webhooks(State(state): State<AppState>) -> Response {
 
 pub async fn delete_webhook(
     State(state): State<AppState>,
+    Extension(perms): Extension<ResolvedPermissions>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(id): Path<String>,
 ) -> Response {
+    if !perms.can_admin() {
+        return forbidden();
+    }
     let ip = extract_ip(&headers, &addr);
     match state.store.delete_webhook(&id) {
         Ok(true) => {
@@ -636,6 +682,145 @@ pub async fn delete_webhook(
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "webhook not found"})),
+        )
+            .into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+// ── API Keys ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CreateApiKeyRequest {
+    pub label: String,
+    pub permissions: Vec<String>,
+    pub prefix: Option<String>,
+}
+
+pub async fn create_api_key(
+    State(state): State<AppState>,
+    Extension(perms): Extension<ResolvedPermissions>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(body): Json<CreateApiKeyRequest>,
+) -> Response {
+    if !perms.can_admin() {
+        return forbidden();
+    }
+    let ip = extract_ip(&headers, &addr);
+
+    // Parse permissions.
+    let parsed_perms: Vec<Permission> = body
+        .permissions
+        .iter()
+        .filter_map(|s| Permission::from_str(s))
+        .collect();
+
+    if parsed_perms.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "at least one valid permission required (read, write, delete, admin)"})),
+        )
+            .into_response();
+    }
+
+    let raw_key = api_keys::generate_api_key();
+    let key_hash = api_keys::hash_key(&raw_key);
+    let id = api_keys::generate_key_id();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let record = crate::store::ApiKeyRecord {
+        id: id.clone(),
+        key_hash,
+        label: body.label.clone(),
+        permissions: parsed_perms,
+        prefix: body.prefix.clone(),
+        created_at: now,
+    };
+
+    match state.store.put_api_key(&record) {
+        Ok(()) => {
+            let _ = state.store.record_audit(AuditEvent::new(
+                ACTION_KEY_CREATE,
+                None,
+                ip,
+                true,
+                Some(format!("id={id}")),
+            ));
+            let perm_strs: Vec<&str> = record.permissions.iter().map(|p| p.as_str()).collect();
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "id": id,
+                    "key": raw_key,
+                    "label": record.label,
+                    "permissions": perm_strs,
+                    "prefix": record.prefix,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => internal_error(e),
+    }
+}
+
+pub async fn list_api_keys(
+    State(state): State<AppState>,
+    Extension(perms): Extension<ResolvedPermissions>,
+) -> Response {
+    if !perms.can_admin() {
+        return forbidden();
+    }
+    match state.store.list_api_keys() {
+        Ok(records) => {
+            let keys: Vec<_> = records
+                .iter()
+                .map(|r| {
+                    let perm_strs: Vec<&str> = r.permissions.iter().map(|p| p.as_str()).collect();
+                    json!({
+                        "id": r.id,
+                        "label": r.label,
+                        "permissions": perm_strs,
+                        "prefix": r.prefix,
+                        "created_at": r.created_at,
+                    })
+                })
+                .collect();
+            Json(json!({"keys": keys})).into_response()
+        }
+        Err(e) => internal_error(e),
+    }
+}
+
+pub async fn delete_api_key(
+    State(state): State<AppState>,
+    Extension(perms): Extension<ResolvedPermissions>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(id): Path<String>,
+) -> Response {
+    if !perms.can_admin() {
+        return forbidden();
+    }
+    let ip = extract_ip(&headers, &addr);
+    match state.store.delete_api_key(&id) {
+        Ok(true) => {
+            let _ = state.store.record_audit(AuditEvent::new(
+                ACTION_KEY_DELETE,
+                None,
+                ip,
+                true,
+                Some(format!("id={id}")),
+            ));
+            Json(json!({"deleted": true})).into_response()
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "api key not found"})),
         )
             .into_response(),
         Err(e) => internal_error(e),

@@ -61,6 +61,7 @@ impl Store {
         write_txn.open_table(AUDIT_LOG)?;
         write_txn.open_table(COUNTERS)?;
         write_txn.open_table(super::webhooks::WEBHOOKS)?;
+        write_txn.open_table(super::api_keys::API_KEYS)?;
         write_txn.commit()?;
 
         Ok(Self {
@@ -258,8 +259,7 @@ impl Store {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(SECRETS)?;
 
-        let raw_bytes: Option<Vec<u8>> =
-            table.get(secret_key)?.map(|guard| guard.value().to_vec());
+        let raw_bytes: Option<Vec<u8>> = table.get(secret_key)?.map(|guard| guard.value().to_vec());
 
         match raw_bytes {
             None => Ok(None),
@@ -319,9 +319,8 @@ impl Store {
                     }
 
                     if let Some(val) = new_value {
-                        let (encrypted, nonce) =
-                            super::crypto::encrypt(&self.key, val.as_bytes())
-                                .context("encrypt patched value")?;
+                        let (encrypted, nonce) = super::crypto::encrypt(&self.key, val.as_bytes())
+                            .context("encrypt patched value")?;
                         record.value_encrypted = encrypted;
                         record.nonce = nonce;
                     }
@@ -361,11 +360,7 @@ impl Store {
         let write_txn = self.db.begin_write()?;
         {
             let mut counters = write_txn.open_table(COUNTERS)?;
-            let seq = counters
-                .get(AUDIT_SEQ_KEY)?
-                .map(|g| g.value())
-                .unwrap_or(0)
-                + 1;
+            let seq = counters.get(AUDIT_SEQ_KEY)?.map(|g| g.value()).unwrap_or(0) + 1;
             counters.insert(AUDIT_SEQ_KEY, seq)?;
             event.id = seq;
 
@@ -552,12 +547,9 @@ impl Store {
                 }
 
                 // Decrypt with old key.
-                let plaintext = super::crypto::decrypt(
-                    &self.key,
-                    &record.value_encrypted,
-                    &record.nonce,
-                )
-                .context("decrypt for rotation")?;
+                let plaintext =
+                    super::crypto::decrypt(&self.key, &record.value_encrypted, &record.nonce)
+                        .context("decrypt for rotation")?;
 
                 // Re-encrypt with new key.
                 let (new_encrypted, new_nonce) =
@@ -588,8 +580,8 @@ impl Store {
 
 /// Encode a SecretRecord in v2 format: `[RECORD_V2_MARKER, key_version] + bincode(record)`.
 fn encode(record: &SecretRecord, key_version: u8) -> Result<Vec<u8>> {
-    let payload =
-        bincode::serde::encode_to_vec(record, bincode::config::standard()).context("bincode encode")?;
+    let payload = bincode::serde::encode_to_vec(record, bincode::config::standard())
+        .context("bincode encode")?;
     let mut out = Vec::with_capacity(2 + payload.len());
     out.push(RECORD_V2_MARKER);
     out.push(key_version);
@@ -615,9 +607,8 @@ fn decode(bytes: &[u8]) -> Result<(SecretRecord, u8)> {
         Ok((record, key_version))
     } else {
         // Legacy v1: raw bincode, no version prefix. Assume key_version = 1.
-        let (record, _) =
-            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-                .context("bincode decode")?;
+        let (record, _) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+            .context("bincode decode")?;
         Ok((record, 1))
     }
 }
@@ -639,7 +630,10 @@ mod tests {
     fn put_get_delete() {
         let (s, _dir) = make_store();
         s.put("MY_KEY", "my-value", None, None, true, None).unwrap();
-        assert_eq!(s.get("MY_KEY").unwrap(), GetResult::Value("my-value".into(), None));
+        assert_eq!(
+            s.get("MY_KEY").unwrap(),
+            GetResult::Value("my-value".into(), None)
+        );
         assert!(s.delete("MY_KEY").unwrap());
         assert_eq!(s.get("MY_KEY").unwrap(), GetResult::NotFound);
     }
@@ -648,7 +642,10 @@ mod tests {
     fn read_limit_burn() {
         let (s, _dir) = make_store();
         s.put("BURN", "secret", None, Some(1), true, None).unwrap();
-        assert_eq!(s.get("BURN").unwrap(), GetResult::Burned("secret".into(), None));
+        assert_eq!(
+            s.get("BURN").unwrap(),
+            GetResult::Burned("secret".into(), None)
+        );
         // Second read should return NotFound — record was burned.
         assert_eq!(s.get("BURN").unwrap(), GetResult::NotFound);
     }
@@ -657,7 +654,8 @@ mod tests {
     fn ttl_expiry() {
         let (s, _dir) = make_store();
         // TTL = 0 means already expired.
-        s.put("EXPIRED", "value", Some(0), None, true, None).unwrap();
+        s.put("EXPIRED", "value", Some(0), None, true, None)
+            .unwrap();
         assert_eq!(s.get("EXPIRED").unwrap(), GetResult::NotFound);
     }
 

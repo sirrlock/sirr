@@ -199,11 +199,7 @@ impl OnlineValidator {
                         plan: resp.plan.clone(),
                         limit: resp.limit,
                         checked_at: now,
-                        last_success_at: if valid {
-                            Some(now)
-                        } else {
-                            prev_success
-                        },
+                        last_success_at: if valid { Some(now) } else { prev_success },
                     });
 
                     let detail = if valid {
@@ -248,7 +244,11 @@ impl OnlineValidator {
 
     /// Return the cached plan name, if available.
     pub async fn cached_plan(&self) -> Option<String> {
-        self.cache.read().await.as_ref().and_then(|c| c.plan.clone())
+        self.cache
+            .read()
+            .await
+            .as_ref()
+            .and_then(|c| c.plan.clone())
     }
 
     /// Return the cached secret limit, if available.

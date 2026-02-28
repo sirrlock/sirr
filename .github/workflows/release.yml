@@ -2,11 +2,11 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
+  VERSION: 1.0.${{ github.run_number }}
 
 jobs:
   build-rust:
@@ -83,7 +83,6 @@ jobs:
             sirr-*.zip
             sirr-*.sha256
 
-  # Create universal macOS binary via lipo
   macos-universal:
     name: macOS universal binary
     runs-on: macos-latest
@@ -127,10 +126,9 @@ jobs:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Set version from tag
-        run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          cd packages/mcp && npm version $VERSION --no-git-tag-version
+      - name: Set version
+        run: npm version ${{ env.VERSION }} --no-git-tag-version
+        working-directory: packages/mcp
 
       - run: npm ci
         working-directory: packages/mcp
@@ -162,6 +160,8 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ env.VERSION }}
+          name: v${{ env.VERSION }}
           files: artifacts/**
           generate_release_notes: true
 
@@ -219,9 +219,9 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:v${{ env.VERSION }}
             ghcr.io/${{ github.repository }}:latest
-            sirrvault/sirr:${{ github.ref_name }}
+            sirrvault/sirr:v${{ env.VERSION }}
             sirrvault/sirr:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max

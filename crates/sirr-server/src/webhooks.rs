@@ -44,11 +44,7 @@ pub struct WebhookSender {
 }
 
 impl WebhookSender {
-    pub fn new(
-        store: Store,
-        instance_id: String,
-        per_secret_signing_key: Option<String>,
-    ) -> Self {
+    pub fn new(store: Store, instance_id: String, per_secret_signing_key: Option<String>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
@@ -98,7 +94,9 @@ impl WebhookSender {
         let signing_key = match &self.per_secret_signing_key {
             Some(k) => k.clone(),
             None => {
-                debug!("per-secret webhook URL set but no SIRR_WEBHOOK_SECRET configured; skipping");
+                debug!(
+                    "per-secret webhook URL set but no SIRR_WEBHOOK_SECRET configured; skipping"
+                );
                 return;
             }
         };
@@ -158,8 +156,8 @@ fn matches_event(subscribed: &[String], event_type: &str) -> bool {
 
 /// Compute HMAC-SHA256 hex digest.
 pub fn compute_signature(secret: &str, body: &str) -> String {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC accepts any key length");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(body.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }
