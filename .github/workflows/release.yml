@@ -465,7 +465,7 @@ jobs:
 
           manifest['version'] = ver
           manifest['architecture']['64bit']['url'] = (
-              f'https://github.com/SirrVault/sirrd/releases/download/v{ver}/sirrd-windows-x64.zip'
+              f'https://github.com/SirrVault/sirr/releases/download/v{ver}/sirrd-windows-x64.zip'
           )
           manifest['architecture']['64bit']['hash'] = win_x64
 
