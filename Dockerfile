@@ -9,7 +9,10 @@ COPY Cargo.toml Cargo.lock* ./
 COPY crates/ crates/
 
 # Build a static musl binary.
-RUN cargo build --release --bin sirrd --target x86_64-unknown-linux-musl
+# Alpine is already musl — point cargo at the native gcc instead of the
+# missing cross-linker x86_64-linux-musl-gcc.
+RUN CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=gcc \
+    cargo build --release --bin sirrd --target x86_64-unknown-linux-musl
 
 # ── Final image ────────────────────────────────────────────────────────────────
 FROM scratch
