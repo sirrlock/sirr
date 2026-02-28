@@ -48,7 +48,7 @@ impl Default for ServerConfig {
             port: std::env::var("SIRR_PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
-                .unwrap_or(8080),
+                .unwrap_or(39999),
             api_key: std::env::var("SIRR_API_KEY").ok(),
             license_key: std::env::var("SIRR_LICENSE_KEY").ok(),
             data_dir: std::env::var("SIRR_DATA_DIR").ok().map(PathBuf::from),

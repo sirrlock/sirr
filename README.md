@@ -71,7 +71,7 @@ openssl rand -hex 32 > master.key
 chmod 400 master.key
 
 docker run -d \
-  -p 8080:8080 \
+  -p 39999:39999 \
   -v ./sirr-data:/data \
   -v ./master.key:/run/secrets/master.key:ro \
   -e SIRR_MASTER_KEY_FILE=/run/secrets/master.key \
@@ -82,7 +82,7 @@ Or with an environment variable (development only — visible via `docker inspec
 
 ```bash
 docker run -d \
-  -p 8080:8080 \
+  -p 39999:39999 \
   -v ./sirr-data:/data \
   ghcr.io/sirrvault/sirr
 ```
@@ -134,7 +134,7 @@ npm install -g @sirr/mcp
     "sirr": {
       "command": "sirr-mcp",
       "env": {
-        "SIRR_SERVER": "http://localhost:8080",
+        "SIRR_SERVER": "http://localhost:39999",
         "SIRR_API_KEY": "your-api-key"
       }
     }
@@ -157,7 +157,7 @@ Claude: [calls push_secret("STRIPE_KEY", "sk_test_...", reads=1, ttl=1800)]
 ```python
 from sirr import SirrClient
 
-sirr = SirrClient(server="http://localhost:8080", api_key=os.environ.get("SIRR_API_KEY"))
+sirr = SirrClient(server="http://localhost:39999", api_key=os.environ.get("SIRR_API_KEY"))
 
 # Give an agent a one-use credential
 sirr.push("DB_URL", connection_string, reads=1, ttl=3600)
@@ -272,7 +272,7 @@ Returns metadata only — values are never included in list responses.
 |---|---|---|
 | `SIRR_API_KEY` | — | Optional. Protects write endpoints (POST/PATCH/DELETE/list) |
 | `SIRR_LICENSE_KEY` | — | Required for >100 active secrets |
-| `SIRR_PORT` | `8080` | HTTP listen port |
+| `SIRR_PORT` | `39999` | HTTP listen port |
 | `SIRR_HOST` | `0.0.0.0` | Bind address |
 | `SIRR_DATA_DIR` | platform default¹ | Storage directory |
 | `SIRR_CORS_ORIGINS` | `*` (all) | Comma-separated allowed origins |
@@ -284,7 +284,7 @@ One of `SIRR_MASTER_KEY_FILE` or `SIRR_MASTER_KEY` is required. If both are set,
 
 | Variable | Default | Description |
 |---|---|---|
-| `SIRR_SERVER` | `http://localhost:8080` | Server base URL |
+| `SIRR_SERVER` | `http://localhost:39999` | Server base URL |
 | `SIRR_API_KEY` | — | Same value as server's `SIRR_API_KEY` (for write ops) |
 
 **Key rotation variables** (used by `sirr rotate`):

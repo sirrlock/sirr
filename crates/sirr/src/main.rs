@@ -11,8 +11,8 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "sirr", about = "Sirr (سر) — ephemeral secret vault", version)]
 struct Cli {
-    /// Sirr server URL (default: http://localhost:8080 or $SIRR_SERVER)
-    #[arg(long, env = "SIRR_SERVER", default_value = "http://localhost:8080")]
+    /// Sirr server URL (default: http://localhost:39999 or $SIRR_SERVER)
+    #[arg(long, env = "SIRR_SERVER", default_value = "http://localhost:39999")]
     server: String,
 
     /// API key for write operations ($SIRR_API_KEY)
@@ -27,8 +27,8 @@ struct Cli {
 enum Commands {
     /// Start the Sirr HTTP server
     Serve {
-        /// Port to listen on (default: $SIRR_PORT or 8080)
-        #[arg(long, env = "SIRR_PORT", default_value = "8080")]
+        /// Port to listen on (default: $SIRR_PORT or 39999)
+        #[arg(long, env = "SIRR_PORT", default_value = "39999")]
         port: u16,
         /// Host to bind (default: $SIRR_HOST or 0.0.0.0)
         #[arg(long, env = "SIRR_HOST", default_value = "0.0.0.0")]

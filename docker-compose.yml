@@ -2,7 +2,7 @@ services:
   sirr:
     build: .
     ports:
-      - "8080:8080"
+      - "39999:39999"
     volumes:
       # Persistent data (database + salt).
       - sirr-data:/data
@@ -13,7 +13,7 @@ services:
       SIRR_MASTER_KEY_FILE: /run/secrets/master.key
       SIRR_DATA_DIR: /data
       SIRR_HOST: "0.0.0.0"
-      SIRR_PORT: "8080"
+      SIRR_PORT: "39999"
       # Uncomment for >100 secrets:
       # SIRR_LICENSE_KEY: "sirr_lic_..."
     restart: unless-stopped

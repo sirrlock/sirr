@@ -26,9 +26,9 @@ VOLUME ["/run/secrets"]
 
 ENV SIRR_DATA_DIR=/data \
     SIRR_HOST=0.0.0.0 \
-    SIRR_PORT=8080
+    SIRR_PORT=39999
 
-EXPOSE 8080
+EXPOSE 39999
 
 ENTRYPOINT ["/sirrd"]
 CMD ["serve"]
