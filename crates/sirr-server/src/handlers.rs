@@ -713,7 +713,7 @@ pub async fn create_api_key(
     let parsed_perms: Vec<Permission> = body
         .permissions
         .iter()
-        .filter_map(|s| Permission::from_str(s))
+        .filter_map(|s| Permission::parse(s))
         .collect();
 
     if parsed_perms.is_empty() {
