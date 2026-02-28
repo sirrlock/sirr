@@ -1,19 +1,20 @@
 # ── Builder ────────────────────────────────────────────────────────────────────
-FROM rust:1.78-alpine AS builder
+FROM rust:1.85-alpine AS builder
 
-RUN apk add --no-cache musl-dev
+RUN apk add --no-cache musl-dev && \
+    rustup target add x86_64-unknown-linux-musl
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
 COPY crates/ crates/
 
 # Build a static musl binary.
-RUN cargo build --release --bin sirr --target x86_64-unknown-linux-musl
+RUN cargo build --release --bin sirrd --target x86_64-unknown-linux-musl
 
 # ── Final image ────────────────────────────────────────────────────────────────
 FROM scratch
 
-COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/sirr /sirr
+COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/sirrd /sirrd
 
 # Data directory — mount a volume here for persistence.
 VOLUME ["/data"]
@@ -29,5 +30,5 @@ ENV SIRR_DATA_DIR=/data \
 
 EXPOSE 8080
 
-ENTRYPOINT ["/sirr"]
+ENTRYPOINT ["/sirrd"]
 CMD ["serve"]
