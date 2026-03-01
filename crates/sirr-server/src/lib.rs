@@ -26,6 +26,9 @@ pub struct AppState {
     /// When true, key names in /audit responses are replaced with
     /// `sha256:<first 8 hex chars>` instead of the raw name.
     pub redact_audit_keys: bool,
+    /// Allowlist of URL prefixes for per-secret webhook URLs.
+    /// Empty = per-secret webhooks disabled (secure default).
+    pub webhook_allowed_origins: std::sync::Arc<Vec<String>>,
 }
 
 pub use server::{read_key_file, resolve_data_dir, run, ServerConfig};

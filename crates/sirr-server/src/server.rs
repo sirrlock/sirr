@@ -50,6 +50,10 @@ pub struct ServerConfig {
     /// When true, key names in /audit responses are hashed instead of returned verbatim.
     /// Set `SIRR_AUDIT_REDACT_KEYS=1` to enable.
     pub redact_audit_keys: bool,
+    /// Comma-separated URL prefixes allowed as per-secret webhook targets.
+    /// Empty (default) disables per-secret webhook_url entirely.
+    /// Example: `SIRR_WEBHOOK_ALLOWED_ORIGINS=https://hooks.example.com`
+    pub webhook_allowed_origins: String,
     /// Comma-separated CIDR list of trusted reverse-proxy IPs ($SIRR_TRUSTED_PROXIES).
     /// X-Forwarded-For / X-Real-IP are only trusted when the socket peer is in this list.
     /// Empty string (default) means proxy headers are never trusted.
@@ -99,6 +103,8 @@ impl Default for ServerConfig {
             no_banner: std::env::var("NO_BANNER")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            webhook_allowed_origins: std::env::var("SIRR_WEBHOOK_ALLOWED_ORIGINS")
+                .unwrap_or_default(),
             redact_audit_keys: std::env::var("SIRR_AUDIT_REDACT_KEYS")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
@@ -189,11 +195,22 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         .clone()
         .unwrap_or_else(|| gethostname().unwrap_or_else(|| "unknown".into()));
 
+    // Parse per-secret webhook URL allowlist.
+    let webhook_allowed_origins: Vec<String> = cfg
+        .webhook_allowed_origins
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let webhook_allowed_origins = std::sync::Arc::new(webhook_allowed_origins);
+
     // Initialize webhook sender.
     let webhook_sender = crate::webhooks::WebhookSender::new(
         store.clone(),
         webhook_instance_id,
         cfg.webhook_secret.clone(),
+        webhook_allowed_origins.clone(),
     );
 
     // Spawn background sweeps (with webhook sender for expired events).
@@ -295,6 +312,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         webhook_sender: Some(webhook_sender),
         trusted_proxies: std::sync::Arc::new(trusted_proxies),
         redact_audit_keys: cfg.redact_audit_keys,
+        webhook_allowed_origins,
     };
 
     // Per-IP rate limiting: configurable via SIRR_RATE_LIMIT_PER_SECOND / SIRR_RATE_LIMIT_BURST.

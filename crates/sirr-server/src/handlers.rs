@@ -216,6 +216,15 @@ pub async fn create_secret(
         )
             .into_response();
     }
+    if let Some(ref wurl) = body.webhook_url {
+        if let Err(reason) = webhooks::validate_webhook_url(wurl, &state.webhook_allowed_origins) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("webhook_url: {reason}")})),
+            )
+                .into_response();
+        }
+    }
 
     // License check: free tier capped at FREE_TIER_LIMIT active secrets.
     // Licensed users are validated online when exceeding the free tier threshold.
