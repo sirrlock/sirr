@@ -89,7 +89,11 @@ impl Store {
         webhook_url: Option<String>,
     ) -> Result<()> {
         let now = Self::now();
-        let expires_at = ttl_seconds.map(|ttl| now + ttl as i64);
+        // Cap ttl before casting to avoid u64→i64 wrapping (u64::MAX as i64 == -1).
+        // i64::MAX seconds is ~292 years — well beyond any practical TTL.
+        let expires_at = ttl_seconds
+            .map(|ttl| ttl.min((i64::MAX - now) as u64) as i64)
+            .map(|ttl| now + ttl);
 
         let (value_encrypted, nonce) =
             super::crypto::encrypt(&self.key, value.as_bytes()).context("encrypt value")?;
