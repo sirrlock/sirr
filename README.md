@@ -290,7 +290,7 @@ One of `SIRR_MASTER_KEY_FILE` or `SIRR_MASTER_KEY` is required. If both are set,
 
 | Variable | Default | Description |
 |---|---|---|
-| `SIRR_SERVER` | `http://localhost:39999` | Server base URL |
+| `SIRR_SERVER` | `sirr://localhost:39999` | Server base URL (`sirr://` → http, `sirrs://` → https) |
 | `SIRR_API_KEY` | — | Same value as server's `SIRR_API_KEY` (for write ops) |
 
 **Key rotation variables** (used by `sirr rotate`):

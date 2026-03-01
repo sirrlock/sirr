@@ -11,8 +11,8 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "sirr", about = "Sirr — ephemeral secret vault", version)]
 struct Cli {
-    /// Sirr server URL (default: http://localhost:39999 or $SIRR_SERVER)
-    #[arg(long, env = "SIRR_SERVER", default_value = "http://localhost:39999")]
+    /// Sirr server URL (default: sirr://localhost:39999 or $SIRR_SERVER)
+    #[arg(long, env = "SIRR_SERVER", default_value = "sirr://localhost:39999")]
     server: String,
 
     /// API key for write operations ($SIRR_API_KEY)
@@ -148,9 +148,13 @@ struct Ctx {
 
 impl Ctx {
     fn new(server: String, api_key: Option<String>) -> Self {
+        let server = server
+            .trim_end_matches('/')
+            .replace("sirr://", "http://")
+            .replace("sirrs://", "https://");
         Self {
             client: Client::new(),
-            server: server.trim_end_matches('/').to_owned(),
+            server,
             api_key,
         }
     }
