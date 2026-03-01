@@ -9,6 +9,7 @@ use axum::{
     routing::{delete, get, head, patch, post},
     Router,
 };
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
@@ -44,6 +45,10 @@ pub struct ServerConfig {
     pub log_level: String,
     /// Set `NO_BANNER=1` to suppress the startup banner.
     pub no_banner: bool,
+    /// Per-IP steady-state request rate (requests/second). $SIRR_RATE_LIMIT_PER_SECOND.
+    pub rate_limit_per_second: u64,
+    /// Per-IP burst allowance (tokens). $SIRR_RATE_LIMIT_BURST.
+    pub rate_limit_burst: u32,
     /// Set when `SIRR_API_KEY` was absent and a key was auto-generated.
     /// The value is the raw generated key, printed in the security notice.
     pub auto_generated_key: Option<String>,
@@ -85,6 +90,14 @@ impl Default for ServerConfig {
             no_banner: std::env::var("NO_BANNER")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            rate_limit_per_second: std::env::var("SIRR_RATE_LIMIT_PER_SECOND")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10),
+            rate_limit_burst: std::env::var("SIRR_RATE_LIMIT_BURST")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
             auto_generated_key: None,
             no_security_banner: std::env::var("NO_SECURITY_BANNER")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -250,6 +263,23 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         webhook_sender: Some(webhook_sender),
     };
 
+    // Per-IP rate limiting: configurable via SIRR_RATE_LIMIT_PER_SECOND / SIRR_RATE_LIMIT_BURST.
+    // Protects public endpoints from enumeration and write-amplification abuse.
+    let governor_conf = GovernorConfigBuilder::default()
+        .per_second(cfg.rate_limit_per_second)
+        .burst_size(cfg.rate_limit_burst)
+        .finish()
+        .expect("invalid rate-limit configuration");
+    // Periodically evict stale IP entries to bound memory usage.
+    let governor_limiter = governor_conf.limiter().clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            governor_limiter.retain_recent();
+        }
+    });
+
     let cors = build_cors(cfg.cors_origins.as_deref());
 
     // Secret-read routes carry NO CORS layer intentionally.
@@ -293,6 +323,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         .merge(public)
         .merge(protected)
         .with_state(state)
+        .layer(GovernorLayer::new(governor_conf))
         .layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
