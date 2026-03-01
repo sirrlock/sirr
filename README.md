@@ -75,7 +75,7 @@ docker run -d \
   -v ./sirr-data:/data \
   -v ./master.key:/run/secrets/master.key:ro \
   -e SIRR_MASTER_KEY_FILE=/run/secrets/master.key \
-  ghcr.io/sirrvault/sirr
+  ghcr.io/sirrlock/sirr
 ```
 
 Or with an environment variable (development only — visible via `docker inspect`):
@@ -84,7 +84,7 @@ Or with an environment variable (development only — visible via `docker inspec
 docker run -d \
   -p 39999:39999 \
   -v ./sirr-data:/data \
-  ghcr.io/sirrvault/sirr
+  ghcr.io/sirrlock/sirr
 ```
 
 Or as a binary:
