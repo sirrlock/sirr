@@ -4,8 +4,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::{
+    extract::Request,
     middleware,
-    response::IntoResponse,
+    middleware::Next,
+    response::{IntoResponse, Response},
     routing::{delete, get, head, patch, post},
     Router,
 };
@@ -349,6 +351,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         .merge(protected)
         .with_state(state)
         .layer(GovernorLayer::new(governor_conf))
+        .layer(middleware::from_fn(add_security_headers))
         .layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
@@ -436,6 +439,27 @@ fn print_banner(
     eprintln!("  token     {token_source}");
     eprintln!("  tier      {tier}");
     eprintln!();
+}
+
+/// Adds defensive security headers to every response and removes the `Server`
+/// header that would otherwise reveal the axum/hyper/tower stack.
+async fn add_security_headers(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    let h = response.headers_mut();
+    h.insert(
+        axum::http::header::HeaderName::from_static("x-content-type-options"),
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        axum::http::header::HeaderName::from_static("x-frame-options"),
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    h.insert(
+        axum::http::header::HeaderName::from_static("content-security-policy"),
+        axum::http::HeaderValue::from_static("default-src 'none'"),
+    );
+    h.remove(axum::http::header::SERVER);
+    response
 }
 
 /// Prints the mandatory security notice when a key was auto-generated.
