@@ -470,6 +470,19 @@ pub async fn patch_secret(
                     Some("conflict: delete=true".into()),
                 ));
                 (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response()
+            } else if msg.starts_with("sealed:") {
+                let _ = state.store.record_audit(AuditEvent::new(
+                    ACTION_SECRET_PATCH,
+                    Some(key.clone()),
+                    ip,
+                    false,
+                    Some("gone: secret read limit exhausted".into()),
+                ));
+                (
+                    StatusCode::GONE,
+                    Json(json!({"error": "secret read limit exhausted"})),
+                )
+                    .into_response()
             } else {
                 internal_error(e)
             }

@@ -322,6 +322,13 @@ impl Store {
                         anyhow::bail!("cannot patch a secret with delete=true");
                     }
 
+                    // Sealed secrets have exhausted their read limit and are immutable.
+                    // Allowing a patch would let a writer reset the counter and re-read
+                    // a secret that was supposed to have been consumed.
+                    if record.is_sealed() {
+                        anyhow::bail!("sealed: secret read limit exhausted");
+                    }
+
                     if let Some(val) = new_value {
                         let (encrypted, nonce) = super::crypto::encrypt(&self.key, val.as_bytes())
                             .context("encrypt patched value")?;
@@ -334,7 +341,7 @@ impl Store {
                     }
 
                     if let Some(ttl) = new_ttl_seconds {
-                        record.expires_at = Some(now + ttl as i64);
+                        record.expires_at = Some(now + ttl.min((i64::MAX - now) as u64) as i64);
                     }
 
                     record.read_count = 0;
@@ -721,13 +728,24 @@ mod tests {
     }
 
     #[test]
-    fn patch_unseals_secret() {
+    fn patch_rejects_sealed_secret() {
         let (s, _dir) = make_store();
         s.put("PS", "val", None, Some(1), false, None).unwrap();
-        s.get("PS").unwrap(); // now sealed
-        assert_eq!(s.get("PS").unwrap(), GetResult::Sealed); // sealed, can't read
-        s.patch("PS", None, Some(5), None).unwrap(); // unseal with new max_reads
-        assert_eq!(s.get("PS").unwrap(), GetResult::Value("val".into(), None)); // readable again
+        s.get("PS").unwrap(); // exhaust the one allowed read — now sealed
+        assert_eq!(s.get("PS").unwrap(), GetResult::Sealed);
+        // Patching a sealed secret must fail — read limit is a security boundary.
+        let err = s.patch("PS", None, Some(5), None);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("sealed"));
+    }
+
+    #[test]
+    fn patch_works_on_unexhausted_secret() {
+        let (s, _dir) = make_store();
+        s.put("PU", "val", None, Some(3), false, None).unwrap();
+        s.get("PU").unwrap(); // one of three reads used — not sealed
+        s.patch("PU", Some("new"), None, None).unwrap();
+        assert_eq!(s.get("PU").unwrap(), GetResult::Value("new".into(), None));
     }
 
     #[test]
