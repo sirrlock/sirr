@@ -26,6 +26,29 @@ use crate::{
     AppState,
 };
 
+// ── Input validation ─────────────────────────────────────────────────────────
+
+/// Validates a secret key name.
+///
+/// Allowed: ASCII alphanumerics, `-`, `_`, `.`, 1–256 characters.
+/// Rejects slashes, control characters, and other special characters to keep
+/// audit logs clean and prevent confusion in URL routing or future tooling.
+fn validate_key_name(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 256
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+fn bad_key_name() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": "key must be 1–256 characters: alphanumeric, -, _, . only"})),
+    )
+        .into_response()
+}
+
 // ── Permission helpers ───────────────────────────────────────────────────────
 
 fn forbidden() -> Response {
@@ -159,10 +182,13 @@ pub async fn create_secret(
     }
     let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
 
-    if body.key.is_empty() || body.key.len() > 256 {
+    if !validate_key_name(&body.key) {
+        return bad_key_name();
+    }
+    if body.max_reads == Some(0) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "key must be 1–256 characters"})),
+            Json(json!({"error": "max_reads must be ≥ 1; omit to allow unlimited reads"})),
         )
             .into_response();
     }
@@ -263,6 +289,9 @@ pub async fn get_secret(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(key): Path<String>,
 ) -> Response {
+    if !validate_key_name(&key) {
+        return bad_key_name();
+    }
     let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
     match state.store.get(&key) {
         Ok(GetResult::Value(value, webhook_url)) => {
@@ -337,6 +366,9 @@ pub async fn head_secret(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(key): Path<String>,
 ) -> Response {
+    if !validate_key_name(&key) {
+        return bad_key_name();
+    }
     let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
     match state.store.head(&key) {
         Ok(Some((meta, sealed))) => {
@@ -414,8 +446,18 @@ pub async fn patch_secret(
     Path(key): Path<String>,
     Json(body): Json<PatchRequest>,
 ) -> Response {
+    if !validate_key_name(&key) {
+        return bad_key_name();
+    }
     if !perms.can_write() || !perms.matches_prefix(&key) {
         return forbidden();
+    }
+    if body.max_reads == Some(0) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "max_reads must be ≥ 1; omit to allow unlimited reads"})),
+        )
+            .into_response();
     }
     let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
 
@@ -499,6 +541,9 @@ pub async fn delete_secret(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(key): Path<String>,
 ) -> Response {
+    if !validate_key_name(&key) {
+        return bad_key_name();
+    }
     if !perms.can_delete() || !perms.matches_prefix(&key) {
         return forbidden();
     }
