@@ -45,6 +45,10 @@ pub struct ServerConfig {
     pub log_level: String,
     /// Set `NO_BANNER=1` to suppress the startup banner.
     pub no_banner: bool,
+    /// Comma-separated CIDR list of trusted reverse-proxy IPs ($SIRR_TRUSTED_PROXIES).
+    /// X-Forwarded-For / X-Real-IP are only trusted when the socket peer is in this list.
+    /// Empty string (default) means proxy headers are never trusted.
+    pub trusted_proxies: String,
     /// Per-IP steady-state request rate (requests/second). $SIRR_RATE_LIMIT_PER_SECOND.
     pub rate_limit_per_second: u64,
     /// Per-IP burst allowance (tokens). $SIRR_RATE_LIMIT_BURST.
@@ -90,6 +94,7 @@ impl Default for ServerConfig {
             no_banner: std::env::var("NO_BANNER")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            trusted_proxies: std::env::var("SIRR_TRUSTED_PROXIES").unwrap_or_default(),
             rate_limit_per_second: std::env::var("SIRR_RATE_LIMIT_PER_SECOND")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -255,12 +260,32 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         }
     }
 
+    let trusted_proxies: Vec<ipnet::IpNet> = cfg
+        .trusted_proxies
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            s.parse().ok().or_else(|| {
+                // Plain IP address — treat as /32 or /128.
+                s.parse::<std::net::IpAddr>().ok().map(ipnet::IpNet::from)
+            })
+        })
+        .collect();
+    if !trusted_proxies.is_empty() {
+        info!(
+            proxies = ?trusted_proxies,
+            "X-Forwarded-For trusted for listed proxy CIDRs"
+        );
+    }
+
     let state = AppState {
         store,
         api_key: cfg.api_key,
         license: lic_status,
         validator,
         webhook_sender: Some(webhook_sender),
+        trusted_proxies: std::sync::Arc::new(trusted_proxies),
     };
 
     // Per-IP rate limiting: configurable via SIRR_RATE_LIMIT_PER_SECOND / SIRR_RATE_LIMIT_BURST.

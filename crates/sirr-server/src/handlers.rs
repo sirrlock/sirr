@@ -38,22 +38,31 @@ fn forbidden() -> Response {
 
 // ── IP extraction ────────────────────────────────────────────────────────────
 
-fn extract_ip(headers: &HeaderMap, addr: &SocketAddr) -> String {
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(first) = xff.split(',').next() {
-            let trimmed = first.trim();
+/// Returns the best-effort client IP for audit logging.
+///
+/// Proxy headers (`X-Forwarded-For`, `X-Real-IP`) are only trusted when the
+/// socket peer matches one of the configured trusted-proxy CIDRs.  An empty
+/// `trusted_proxies` slice means proxy headers are never trusted, so any
+/// client-supplied value is ignored and the real socket IP is used instead.
+fn extract_ip(headers: &HeaderMap, addr: &SocketAddr, trusted_proxies: &[ipnet::IpNet]) -> String {
+    let peer = addr.ip();
+    if !trusted_proxies.is_empty() && trusted_proxies.iter().any(|net| net.contains(&peer)) {
+        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            if let Some(first) = xff.split(',').next() {
+                let trimmed = first.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_owned();
+                }
+            }
+        }
+        if let Some(real_ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+            let trimmed = real_ip.trim();
             if !trimmed.is_empty() {
                 return trimmed.to_owned();
             }
         }
     }
-    if let Some(real_ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        let trimmed = real_ip.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_owned();
-        }
-    }
-    addr.ip().to_string()
+    peer.to_string()
 }
 
 // ── Health ────────────────────────────────────────────────────────────────────
@@ -104,7 +113,7 @@ pub async fn list_secrets(
     if !perms.can_read() {
         return forbidden();
     }
-    let ip = extract_ip(&headers, &addr);
+    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
     match state.store.list() {
         Ok(metas) => {
             info!(count = metas.len(), "audit: secret.list");
@@ -148,7 +157,7 @@ pub async fn create_secret(
     if !perms.can_write() || !perms.matches_prefix(&body.key) {
         return forbidden();
     }
-    let ip = extract_ip(&headers, &addr);
+    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
 
     if body.key.is_empty() || body.key.len() > 256 {
         return (
@@ -254,7 +263,7 @@ pub async fn get_secret(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(key): Path<String>,
 ) -> Response {
-    let ip = extract_ip(&headers, &addr);
+    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
     match state.store.get(&key) {
         Ok(GetResult::Value(value, webhook_url)) => {
             let _ = state.store.record_audit(AuditEvent::new(
@@ -328,7 +337,7 @@ pub async fn head_secret(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(key): Path<String>,
 ) -> Response {
-    let ip = extract_ip(&headers, &addr);
+    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
     match state.store.head(&key) {
         Ok(Some((meta, sealed))) => {
             let detail = if sealed { "head;sealed" } else { "head" };
@@ -408,7 +417,7 @@ pub async fn patch_secret(
     if !perms.can_write() || !perms.matches_prefix(&key) {
         return forbidden();
     }
-    let ip = extract_ip(&headers, &addr);
+    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
 
     if let Some(ref v) = body.value {
         if v.len() > 1_048_576 {
@@ -480,7 +489,7 @@ pub async fn delete_secret(
     if !perms.can_delete() || !perms.matches_prefix(&key) {
         return forbidden();
     }
-    let ip = extract_ip(&headers, &addr);
+    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
     match state.store.delete(&key) {
         Ok(true) => {
             info!(key = %key, "audit: secret.delete");
@@ -522,7 +531,7 @@ pub async fn prune_secrets(
     if !perms.can_admin() {
         return forbidden();
     }
-    let ip = extract_ip(&headers, &addr);
+    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
     match state.store.prune() {
         Ok(pruned_keys) => {
             let n = pruned_keys.len();
@@ -563,7 +572,7 @@ pub async fn create_webhook(
     if !perms.can_admin() {
         return forbidden();
     }
-    let ip = extract_ip(&headers, &addr);
+    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
 
     // License gate: free tier gets 0 webhooks.
     if state.license == LicenseStatus::Free {
@@ -667,7 +676,7 @@ pub async fn delete_webhook(
     if !perms.can_admin() {
         return forbidden();
     }
-    let ip = extract_ip(&headers, &addr);
+    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
     match state.store.delete_webhook(&id) {
         Ok(true) => {
             let _ = state.store.record_audit(AuditEvent::new(
@@ -707,7 +716,7 @@ pub async fn create_api_key(
     if !perms.can_admin() {
         return forbidden();
     }
-    let ip = extract_ip(&headers, &addr);
+    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
 
     // Parse permissions.
     let parsed_perms: Vec<Permission> = body
@@ -806,7 +815,7 @@ pub async fn delete_api_key(
     if !perms.can_admin() {
         return forbidden();
     }
-    let ip = extract_ip(&headers, &addr);
+    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
     match state.store.delete_api_key(&id) {
         Ok(true) => {
             let _ = state.store.record_audit(AuditEvent::new(

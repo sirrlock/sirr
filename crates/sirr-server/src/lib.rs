@@ -20,6 +20,9 @@ pub struct AppState {
     pub validator: Option<validator::OnlineValidator>,
     /// Webhook sender for dispatching event notifications.
     pub webhook_sender: Option<webhooks::WebhookSender>,
+    /// Peer IPs (CIDRs) whose X-Forwarded-For / X-Real-IP headers are trusted
+    /// for audit-log IP attribution. Empty = never trust proxy headers.
+    pub trusted_proxies: std::sync::Arc<Vec<ipnet::IpNet>>,
 }
 
 pub use server::{read_key_file, resolve_data_dir, run, ServerConfig};
