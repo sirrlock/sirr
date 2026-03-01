@@ -23,6 +23,9 @@ pub struct AppState {
     /// Peer IPs (CIDRs) whose X-Forwarded-For / X-Real-IP headers are trusted
     /// for audit-log IP attribution. Empty = never trust proxy headers.
     pub trusted_proxies: std::sync::Arc<Vec<ipnet::IpNet>>,
+    /// When true, key names in /audit responses are replaced with
+    /// `sha256:<first 8 hex chars>` instead of the raw name.
+    pub redact_audit_keys: bool,
 }
 
 pub use server::{read_key_file, resolve_data_dir, run, ServerConfig};

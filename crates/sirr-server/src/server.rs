@@ -47,6 +47,9 @@ pub struct ServerConfig {
     pub log_level: String,
     /// Set `NO_BANNER=1` to suppress the startup banner.
     pub no_banner: bool,
+    /// When true, key names in /audit responses are hashed instead of returned verbatim.
+    /// Set `SIRR_AUDIT_REDACT_KEYS=1` to enable.
+    pub redact_audit_keys: bool,
     /// Comma-separated CIDR list of trusted reverse-proxy IPs ($SIRR_TRUSTED_PROXIES).
     /// X-Forwarded-For / X-Real-IP are only trusted when the socket peer is in this list.
     /// Empty string (default) means proxy headers are never trusted.
@@ -94,6 +97,9 @@ impl Default for ServerConfig {
             instance_id: std::env::var("SIRR_INSTANCE_ID").ok(),
             log_level: std::env::var("SIRR_LOG_LEVEL").unwrap_or_else(|_| "warn".into()),
             no_banner: std::env::var("NO_BANNER")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            redact_audit_keys: std::env::var("SIRR_AUDIT_REDACT_KEYS")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             trusted_proxies: std::env::var("SIRR_TRUSTED_PROXIES").unwrap_or_default(),
@@ -288,6 +294,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         validator,
         webhook_sender: Some(webhook_sender),
         trusted_proxies: std::sync::Arc::new(trusted_proxies),
+        redact_audit_keys: cfg.redact_audit_keys,
     };
 
     // Per-IP rate limiting: configurable via SIRR_RATE_LIMIT_PER_SECOND / SIRR_RATE_LIMIT_BURST.

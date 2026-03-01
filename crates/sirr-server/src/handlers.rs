@@ -120,7 +120,24 @@ pub async fn audit_events(
         limit,
     };
     match state.store.list_audit(&query) {
-        Ok(events) => Json(json!({ "events": events })).into_response(),
+        Ok(events) => {
+            if state.redact_audit_keys {
+                use sha2::{Digest, Sha256};
+                let redacted: Vec<_> = events
+                    .into_iter()
+                    .map(|mut e| {
+                        if let Some(ref k) = e.key {
+                            let hash = Sha256::digest(k.as_bytes());
+                            e.key = Some(format!("sha256:{}", &hex::encode(hash)[..8]));
+                        }
+                        e
+                    })
+                    .collect();
+                Json(json!({ "events": redacted })).into_response()
+            } else {
+                Json(json!({ "events": events })).into_response()
+            }
+        }
         Err(e) => internal_error(e),
     }
 }
