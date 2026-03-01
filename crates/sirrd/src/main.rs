@@ -76,14 +76,32 @@ async fn cmd_serve(host: String, port: u16, log_level: String) -> Result<()> {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
+    let no_security_banner = std::env::var("NO_SECURITY_BANNER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    // If SIRR_API_KEY is not set, generate a random key so the server is
+    // never left open.  The key is shown in the security notice and must be
+    // persisted by the operator if they want it to survive a restart.
+    let env_api_key = std::env::var("SIRR_API_KEY").ok();
+    let (api_key, auto_generated_key) = match env_api_key {
+        Some(k) => (Some(k), None),
+        None => {
+            let key = sirr_server::store::api_keys::generate_api_key();
+            (Some(key.clone()), Some(key))
+        }
+    };
+
     let cfg = sirr_server::ServerConfig {
         host,
         port,
-        api_key: std::env::var("SIRR_API_KEY").ok(),
+        api_key,
+        auto_generated_key,
         license_key: std::env::var("SIRR_LICENSE_KEY").ok(),
         data_dir: std::env::var("SIRR_DATA_DIR").ok().map(Into::into),
         log_level,
         no_banner,
+        no_security_banner,
         ..Default::default()
     };
 

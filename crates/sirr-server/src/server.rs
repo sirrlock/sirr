@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::{
     middleware,
+    response::IntoResponse,
     routing::{delete, get, head, patch, post},
     Router,
 };
@@ -43,6 +44,13 @@ pub struct ServerConfig {
     pub log_level: String,
     /// Set `NO_BANNER=1` to suppress the startup banner.
     pub no_banner: bool,
+    /// Set when `SIRR_API_KEY` was absent and a key was auto-generated.
+    /// The value is the raw generated key, printed in the security notice.
+    pub auto_generated_key: Option<String>,
+    /// Set `NO_SECURITY_BANNER=1` to suppress the mandatory security notice
+    /// shown when a key is auto-generated.  Has no effect when `api_key` was
+    /// explicitly configured via `SIRR_API_KEY`.
+    pub no_security_banner: bool,
 }
 
 impl Default for ServerConfig {
@@ -75,6 +83,10 @@ impl Default for ServerConfig {
             instance_id: std::env::var("SIRR_INSTANCE_ID").ok(),
             log_level: std::env::var("SIRR_LOG_LEVEL").unwrap_or_else(|_| "warn".into()),
             no_banner: std::env::var("NO_BANNER")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            auto_generated_key: None,
+            no_security_banner: std::env::var("NO_SECURITY_BANNER")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
         }
@@ -186,6 +198,8 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
 
     // Print startup banner (before any values are moved into AppState).
     print_banner(&cfg, &data_dir, &lic_status);
+    // Always printed when a key was auto-generated; bypasses NO_BANNER.
+    print_security_notice(&cfg);
 
     // Derive the heartbeat endpoint from the validation URL base.
     let heartbeat_url = cfg
@@ -238,13 +252,23 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
 
     let cors = build_cors(cfg.cors_origins.as_deref());
 
-    // Public routes (no auth required).
-    let public = Router::new()
-        .route("/health", get(health))
+    // Secret-read routes carry NO CORS layer intentionally.
+    // Without Access-Control-Allow-Origin, browsers block cross-origin reads,
+    // preventing a malicious webpage from silently exfiltrating secrets.
+    // Non-browser clients (sirr CLI, curl) are unaffected.
+    let secret_read = Router::new()
         .route("/secrets/{key}", get(get_secret))
         .route("/secrets/{key}", head(head_secret));
 
-    // Protected routes (API key required if configured).
+    // Public informational routes (no auth, CORS allowed).
+    let public = Router::new()
+        .route("/health", get(health))
+        .route("/robots.txt", get(robots_txt))
+        .route("/security.txt", get(security_txt))
+        .route("/.well-known/security.txt", get(security_txt))
+        .layer(cors.clone());
+
+    // Protected routes (API key required if configured, CORS allowed for the web UI).
     let protected = Router::new()
         .route("/secrets", get(list_secrets))
         .route("/secrets", post(create_secret))
@@ -261,13 +285,14 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
-        ));
+        ))
+        .layer(cors);
 
     let app = Router::new()
+        .merge(secret_read)
         .merge(public)
         .merge(protected)
         .with_state(state)
-        .layer(cors)
         .layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
@@ -355,6 +380,57 @@ fn print_banner(
     eprintln!("  token     {token_source}");
     eprintln!("  tier      {tier}");
     eprintln!();
+}
+
+/// Prints the mandatory security notice when a key was auto-generated.
+/// Bypasses `NO_BANNER`; only `NO_SECURITY_BANNER=1` can suppress it.
+fn print_security_notice(cfg: &ServerConfig) {
+    let Some(ref key) = cfg.auto_generated_key else {
+        return;
+    };
+    if cfg.no_security_banner {
+        return;
+    }
+    eprintln!();
+    eprintln!("  !! SECURITY NOTICE !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    eprintln!("  !!");
+    eprintln!("  !!  No SIRR_API_KEY was set.  A random key has been generated:");
+    eprintln!("  !!");
+    eprintln!("  !!    SIRR_API_KEY={key}");
+    eprintln!("  !!");
+    eprintln!("  !!  Copy this key and set it in your environment before exposing");
+    eprintln!("  !!  this server on any network.  It changes on every restart");
+    eprintln!("  !!  until you persist it as SIRR_API_KEY.");
+    eprintln!("  !!");
+    eprintln!("  !!  Suppress this notice: NO_SECURITY_BANNER=1");
+    eprintln!("  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    eprintln!();
+}
+
+async fn robots_txt() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        "User-agent: *\nDisallow: /\n",
+    )
+}
+
+async fn security_txt() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        concat!(
+            "Contact: mailto:security@sirr.dev\n",
+            "Expires: 2027-01-01T00:00:00.000Z\n",
+            "Preferred-Languages: en\n",
+            "Canonical: https://sirr.dev/.well-known/security.txt\n",
+            "Policy: https://sirr.dev/security\n",
+        ),
+    )
 }
 
 fn build_cors(origins: Option<&str>) -> CorsLayer {
