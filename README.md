@@ -335,7 +335,7 @@ CLI / Node SDK / Python SDK / .NET SDK / MCP Server
 | Converts to Apache 2.0 | **February 20, 2028** |
 | Commercial license | Required for >100 active secrets in production |
 
-License keys at [secretdrop.app/sirr](https://secretdrop.app/sirr).
+License keys at [sirrlock.com/pricing](https://sirrlock.com/pricing).
 
 ```bash
 SIRR_LICENSE_KEY=sirr_lic_... ./sirr serve
@@ -365,7 +365,7 @@ SIRR_LICENSE_KEY=sirr_lic_... ./sirr serve
 | [sirr (PyPI)](https://github.com/SirrVault/python) | Python SDK |
 | [Sirr.Client (NuGet)](https://github.com/SirrVault/dotnet) | .NET SDK |
 | [sirr.dev](https://sirr.dev) | Documentation |
-| [secretdrop.app](https://secretdrop.app) | Hosted service + license keys |
+| [sirrlock.com](https://sirrlock.com) | Hosted service + license keys |
 
 ---
 

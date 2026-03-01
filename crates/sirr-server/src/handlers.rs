@@ -244,7 +244,7 @@ pub async fn create_secret(
                         "error": format!(
                             "free tier limit of {FREE_TIER_LIMIT} secrets reached — \
                              add SIRR_LICENSE_KEY to continue. \
-                             Get a license at https://secretdrop.app/sirr"
+                             Get a license at https://sirrlock.com/pricing"
                         )
                     })),
                 )

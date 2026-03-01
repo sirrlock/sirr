@@ -1,8 +1,8 @@
-//! Online license validation against SecretDrop.
+//! Online license validation against SirrLock.
 //!
 //! Cached with background revalidation so `create_secret` is never blocked
 //! on HTTP after startup. A 72-hour grace period allows operation if
-//! SecretDrop is temporarily unreachable.
+//! SirrLock is temporarily unreachable.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -69,7 +69,7 @@ impl OnlineValidator {
         }
     }
 
-    /// Call the SecretDrop validation endpoint.
+    /// Call the SirrLock validation endpoint.
     async fn validate_remote(&self) -> Result<ValidationResponse, reqwest::Error> {
         let url = format!("{}?key={}", self.validation_url, self.license_key);
         self.client.get(&url).send().await?.json().await
@@ -117,13 +117,13 @@ impl OnlineValidator {
                 } else {
                     warn!(
                         reason = resp.reason.as_deref().unwrap_or("unknown"),
-                        "license rejected by SecretDrop"
+                        "license rejected by SirrLock"
                     );
                 }
                 valid
             }
             Err(e) => {
-                warn!(error = %e, "SecretDrop unreachable at startup — allowing degraded mode");
+                warn!(error = %e, "SirrLock unreachable at startup — allowing degraded mode");
                 let _ = store.record_audit(AuditEvent::new(
                     ACTION_LICENSE_VALIDATE,
                     None,

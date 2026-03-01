@@ -3,7 +3,7 @@
 /// Free tier: up to FREE_TIER_LIMIT active secrets per instance.
 /// Licensed tier: unlimited secrets, validated by key prefix + length.
 ///
-/// License keys are issued at https://secretdrop.app/sirr.
+/// License keys are issued at https://sirrlock.com/pricing.
 /// Format: `sirr_lic_` followed by 40 hex characters.
 ///
 /// Online validation is attempted if the key looks valid; offline fallback

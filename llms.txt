@@ -47,7 +47,7 @@ sirr rotate                             Re-encrypt all records with a new master
 
 SIRR_MASTER_KEY_FILE   Path to master key file (recommended for production)
 SIRR_MASTER_KEY        Bearer token + Argon2id seed (use _FILE in production)
-SIRR_LICENSE_KEY       License key for >100 secrets (get at secretdrop.app/sirr)
+SIRR_LICENSE_KEY       License key for >100 secrets (get at sirrlock.com/pricing)
 SIRR_PORT              HTTP port (default: 8080)
 SIRR_HOST              Bind address (default: 0.0.0.0)
 SIRR_DATA_DIR          Storage dir (default: ~/.local/share/sirr/)
@@ -92,7 +92,7 @@ Tools: get_secret, push_secret, list_secrets, delete_secret, prune_secrets
 
 BSL 1.1: free for ≤100 secrets/instance, commercial license required above that.
 Converts to Apache 2.0 on February 20, 2028.
-Get a license key at: https://secretdrop.app/sirr
+Get a license key at: https://sirrlock.com/pricing
 
 ## Repository Layout
 

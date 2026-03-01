@@ -1,4 +1,4 @@
-//! Instance heartbeat — periodic phone-home to SecretDrop so customers
+//! Instance heartbeat — periodic phone-home to SirrLock so customers
 //! can see which Sirr instances are running, their versions, and health.
 
 use std::time::{Duration, Instant};
@@ -10,7 +10,7 @@ use crate::store::Store;
 
 /// Configuration for the background heartbeat task.
 pub struct HeartbeatConfig {
-    /// Full URL, e.g. `https://secretdrop.app/api/instances/heartbeat`.
+    /// Full URL, e.g. `https://sirrlock.com/api/instances/heartbeat`.
     pub endpoint: String,
     /// The `SIRR_LICENSE_KEY` value (sent as Bearer token).
     pub license_key: String,

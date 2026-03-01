@@ -89,7 +89,7 @@ impl Default for ServerConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
             validation_url: std::env::var("SIRR_VALIDATION_URL")
-                .unwrap_or_else(|_| "https://secretdrop.app/api/validate".into()),
+                .unwrap_or_else(|_| "https://sirrlock.com/api/validate".into()),
             validation_cache_secs: std::env::var("SIRR_VALIDATION_CACHE_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())

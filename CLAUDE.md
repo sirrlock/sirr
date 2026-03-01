@@ -94,8 +94,8 @@ sleep 1
 
 - Free tier: ≤100 active secrets per instance (no license key required)
 - Licensed: unlimited secrets with valid `SIRR_LICENSE_KEY`
-- License keys are issued at [secretdrop.app/sirr](https://secretdrop.app/sirr)
-- Key format: `sirr_lic_<40-hex-chars>` (validated against secretdrop.app API or offline)
+- License keys are issued at [sirrlock.com/pricing](https://sirrlock.com/pricing)
+- Key format: `sirr_lic_<40-hex-chars>` (validated against sirrlock.com API or offline)
 - Server behavior: at >100 secrets without a valid license, POST /secrets returns 402 Payment Required
 
 ## Crate Versions (pinned)
