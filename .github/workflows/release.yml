@@ -241,7 +241,7 @@ jobs:
       - name: Publish sirr-server
         if: steps.check.outputs.skip == 'false'
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.SIRR_PACKAGE_MANAGERS_KEY }}
         run: cargo publish -p sirr-server --allow-dirty --token "$CARGO_REGISTRY_TOKEN"
 
       - name: Wait for crates.io to index sirr-server
@@ -251,7 +251,7 @@ jobs:
       - name: Publish sirrd
         if: steps.check.outputs.skip == 'false'
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.SIRR_PACKAGE_MANAGERS_KEY }}
         run: cargo publish -p sirrd --allow-dirty --token "$CARGO_REGISTRY_TOKEN"
 
       - name: Wait for crates.io to index sirrd
@@ -261,7 +261,7 @@ jobs:
       - name: Publish sirr
         if: steps.check.outputs.skip == 'false'
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.SIRR_PACKAGE_MANAGERS_KEY }}
         run: cargo publish -p sirr --allow-dirty --token "$CARGO_REGISTRY_TOKEN"
 
   update-homebrew:
