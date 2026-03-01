@@ -26,6 +26,12 @@ use crate::{
     AppState,
 };
 
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// Maximum allowed TTL: 10 years in seconds.
+/// Prevents u64 → i64 overflow in the expiry timestamp calculation.
+const MAX_TTL_SECS: u64 = 315_360_000;
+
 // ── Input validation ─────────────────────────────────────────────────────────
 
 /// Validates a secret key name.
@@ -215,6 +221,15 @@ pub async fn create_secret(
             Json(json!({"error": "value exceeds 1 MiB limit"})),
         )
             .into_response();
+    }
+    if let Some(ttl) = body.ttl_seconds {
+        if ttl > MAX_TTL_SECS {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("ttl_seconds exceeds maximum of {MAX_TTL_SECS} (10 years)")})),
+            )
+                .into_response();
+        }
     }
     if let Some(ref wurl) = body.webhook_url {
         if let Err(reason) = webhooks::validate_webhook_url(wurl, &state.webhook_allowed_origins) {
@@ -492,6 +507,15 @@ pub async fn patch_secret(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "value exceeds 1 MiB limit"})),
+            )
+                .into_response();
+        }
+    }
+    if let Some(ttl) = body.ttl_seconds {
+        if ttl > MAX_TTL_SECS {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("ttl_seconds exceeds maximum of {MAX_TTL_SECS} (10 years)")})),
             )
                 .into_response();
         }

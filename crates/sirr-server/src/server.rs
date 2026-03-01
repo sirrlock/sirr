@@ -34,6 +34,10 @@ pub struct ServerConfig {
     pub data_dir: Option<PathBuf>,
     pub sweep_interval: Duration,
     pub cors_origins: Option<String>,
+    /// Comma-separated HTTP methods allowed in CORS responses ($SIRR_CORS_METHODS).
+    /// Only meaningful when `SIRR_CORS_ORIGINS` is also set.
+    /// Defaults to all methods when unset. Example: `GET,HEAD`.
+    pub cors_methods: Option<String>,
     pub audit_retention_days: u64,
     pub validation_url: String,
     pub validation_cache_secs: u64,
@@ -84,6 +88,7 @@ impl Default for ServerConfig {
             data_dir: std::env::var("SIRR_DATA_DIR").ok().map(PathBuf::from),
             sweep_interval: Duration::from_secs(300),
             cors_origins: std::env::var("SIRR_CORS_ORIGINS").ok(),
+            cors_methods: std::env::var("SIRR_CORS_METHODS").ok(),
             audit_retention_days: std::env::var("SIRR_AUDIT_RETENTION_DAYS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -332,7 +337,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         }
     });
 
-    let cors = build_cors(cfg.cors_origins.as_deref());
+    let cors = build_cors(cfg.cors_origins.as_deref(), cfg.cors_methods.as_deref());
 
     // Secret-read routes carry NO CORS layer intentionally.
     // Without Access-Control-Allow-Origin, browsers block cross-origin reads,
@@ -538,23 +543,33 @@ async fn security_txt() -> impl IntoResponse {
     )
 }
 
-fn build_cors(origins: Option<&str>) -> CorsLayer {
-    let cors = CorsLayer::new()
-        .allow_methods([
-            http::Method::GET,
-            http::Method::HEAD,
-            http::Method::POST,
-            http::Method::PATCH,
-            http::Method::DELETE,
-            http::Method::OPTIONS,
-        ])
-        .allow_headers(Any);
+fn build_cors(origins: Option<&str>, methods: Option<&str>) -> CorsLayer {
+    // No origins configured → deny all cross-origin requests.
+    let Some(origins_str) = origins else {
+        return CorsLayer::new();
+    };
 
-    match origins {
-        Some(o) => {
-            let origins: Vec<_> = o.split(',').filter_map(|s| s.trim().parse().ok()).collect();
-            cors.allow_origin(origins)
-        }
-        None => cors.allow_origin(Any),
-    }
+    let allowed_origins: Vec<_> = origins_str
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+
+    // Parse SIRR_CORS_METHODS; fall back to all safe methods when unset.
+    let all_methods = [
+        http::Method::GET,
+        http::Method::HEAD,
+        http::Method::POST,
+        http::Method::PATCH,
+        http::Method::DELETE,
+        http::Method::OPTIONS,
+    ];
+    let allowed_methods: Vec<http::Method> = match methods {
+        None => all_methods.to_vec(),
+        Some(m) => m.split(',').filter_map(|s| s.trim().parse().ok()).collect(),
+    };
+
+    CorsLayer::new()
+        .allow_origin(allowed_origins)
+        .allow_methods(allowed_methods)
+        .allow_headers(Any)
 }
