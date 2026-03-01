@@ -90,8 +90,8 @@ docker run -d \
 Or as a binary:
 
 ```bash
-./sirr serve
-# Optionally protect writes: SIRR_API_KEY=my-key ./sirr serve
+./sirrd serve
+# Optionally protect writes: SIRR_API_KEY=my-key ./sirrd serve
 ```
 
 ### Push and retrieve
@@ -123,7 +123,7 @@ sirr run -- node app.js
 Install the MCP server so Claude can read and write secrets directly:
 
 ```bash
-npm install -g @sirr/mcp
+npm install -g @sirrvault/mcp
 ```
 
 **.mcp.json:**
@@ -270,13 +270,19 @@ Returns metadata only — values are never included in list responses.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SIRR_API_KEY` | — | Optional. Protects write endpoints (POST/PATCH/DELETE/list) |
+| `SIRR_API_KEY` | auto-generated | Protects all authenticated endpoints. Printed at startup if not set — copy and persist it. |
 | `SIRR_LICENSE_KEY` | — | Required for >100 active secrets |
 | `SIRR_PORT` | `39999` | HTTP listen port |
 | `SIRR_HOST` | `0.0.0.0` | Bind address |
 | `SIRR_DATA_DIR` | platform default¹ | Storage directory |
-| `SIRR_CORS_ORIGINS` | `*` (all) | Comma-separated allowed origins |
+| `SIRR_CORS_ORIGINS` | `*` (all) | Comma-separated allowed origins for management endpoints |
 | `SIRR_LOG_LEVEL` | `info` | `trace` / `debug` / `info` / `warn` / `error` |
+| `SIRR_RATE_LIMIT_PER_SECOND` | `10` | Per-IP request rate (steady-state, all routes) |
+| `SIRR_RATE_LIMIT_BURST` | `30` | Per-IP burst allowance |
+| `NO_BANNER` | `0` | Set to `1` to suppress the startup banner |
+| `NO_SECURITY_BANNER` | `0` | Set to `1` to suppress the auto-generated key notice |
+
+**CORS design note:** sirrd is a backend service, not a browser API. `GET /secrets/{key}` deliberately returns **no** `Access-Control-Allow-Origin` header — browsers block cross-origin reads of secret values by design, regardless of `SIRR_CORS_ORIGINS`. Management endpoints (create, list, delete, keys) do respect `SIRR_CORS_ORIGINS` so a trusted admin UI on a different origin can talk to them. If you need browser clients to read secrets, run them on the same origin as sirrd or proxy through your own backend.
 
 One of `SIRR_MASTER_KEY_FILE` or `SIRR_MASTER_KEY` is required. If both are set, the file takes precedence. File-based key delivery is recommended for production because environment variables are visible via `docker inspect` and `/proc`.
 
@@ -347,6 +353,19 @@ SIRR_LICENSE_KEY=sirr_lic_... ./sirr serve
 - [ ] Terraform provider
 - [x] Patchable secrets (update value without changing key)
 - [ ] Secret versioning
+
+---
+
+## Related
+
+| Package | Description |
+|---------|-------------|
+| [@sirrvault/mcp](https://github.com/SirrVault/mcp) | MCP server for AI assistants |
+| [@sirrvault/node](https://github.com/SirrVault/node) | Node.js / TypeScript SDK |
+| [sirr (PyPI)](https://github.com/SirrVault/python) | Python SDK |
+| [Sirr.Client (NuGet)](https://github.com/SirrVault/dotnet) | .NET SDK |
+| [sirr.dev](https://sirr.dev) | Documentation |
+| [secretdrop.app](https://secretdrop.app) | Hosted service + license keys |
 
 ---
 
