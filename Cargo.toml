@@ -11,7 +11,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Sirr Contributors"]
 license-file = "LICENSE"
-repository = "https://github.com/SirrVault/sirr"
+repository = "https://github.com/sirrlock/sirr"
 homepage = "https://sirr.dev"
 documentation = "https://sirr.dev/en/api-reference"
 

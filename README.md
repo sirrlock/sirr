@@ -1,7 +1,7 @@
 # Sirr
 
 [![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-blue.svg)](LICENSE)
-[![CI](https://github.com/SirrVault/sirr/actions/workflows/ci.yml/badge.svg)](https://github.com/SirrVault/sirr/actions/workflows/ci.yml)
+[![CI](https://github.com/sirrlock/sirr/actions/workflows/ci.yml/badge.svg)](https://github.com/sirrlock/sirr/actions/workflows/ci.yml)
 
 **The secret manager built for the AI era. Every secret expires. By design.**
 
@@ -360,10 +360,10 @@ SIRR_LICENSE_KEY=sirr_lic_... ./sirr serve
 
 | Package | Description |
 |---------|-------------|
-| [@sirrvault/mcp](https://github.com/SirrVault/mcp) | MCP server for AI assistants |
-| [@sirrvault/node](https://github.com/SirrVault/node) | Node.js / TypeScript SDK |
-| [sirr (PyPI)](https://github.com/SirrVault/python) | Python SDK |
-| [Sirr.Client (NuGet)](https://github.com/SirrVault/dotnet) | .NET SDK |
+| [@sirrvault/mcp](https://github.com/sirrlock/mcp) | MCP server for AI assistants |
+| [@sirrvault/node](https://github.com/sirrlock/node) | Node.js / TypeScript SDK |
+| [sirr (PyPI)](https://github.com/sirrlock/python) | Python SDK |
+| [Sirr.Client (NuGet)](https://github.com/sirrlock/dotnet) | .NET SDK |
 | [sirr.dev](https://sirr.dev) | Documentation |
 | [sirrlock.com](https://sirrlock.com) | Hosted service + license keys |
 

@@ -11,7 +11,7 @@ MIT license on `sirr` CLI client.
 ## Monorepo Layout
 
 ```
-sirr/                           # github.com/SirrVault/sirr
+sirr/                           # github.com/sirrlock/sirr
 ├── Cargo.toml                  # Rust workspace
 ├── crates/
 │   ├── sirr/                   # sirr CLI client binary (MIT, reqwest-based, no server deps)

@@ -195,10 +195,10 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            ghcr.io/sirrvault/sirrd:v${{ steps.version.outputs.version }}
-            ghcr.io/sirrvault/sirrd:latest
-            sirrvault/sirrd:v${{ steps.version.outputs.version }}
-            sirrvault/sirrd:latest
+            ghcr.io/sirrlock/sirrd:v${{ steps.version.outputs.version }}
+            ghcr.io/sirrlock/sirrd:latest
+            sirrlock/sirrd:v${{ steps.version.outputs.version }}
+            sirrlock/sirrd:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -296,7 +296,7 @@ jobs:
       - name: Checkout homebrew-tap
         uses: actions/checkout@v4
         with:
-          repository: SirrVault/homebrew-tap
+          repository: sirrlock/homebrew-tap
           token: ${{ secrets.SIRR_PACKAGE_MANAGERS_KEY }}
           path: homebrew-tap
 
@@ -384,7 +384,7 @@ jobs:
       - name: Checkout scoop-bucket
         uses: actions/checkout@v4
         with:
-          repository: SirrVault/scoop-bucket
+          repository: sirrlock/scoop-bucket
           token: ${{ secrets.SIRR_PACKAGE_MANAGERS_KEY }}
           path: scoop-bucket
 
@@ -409,16 +409,16 @@ jobs:
           with open('scoop-bucket/bucket/sirrd.json') as f:
               m = json.load(f)
           m['version'] = ver
-          m['architecture']['64bit']['url'] = f'https://github.com/SirrVault/sirr/releases/download/v{ver}/sirrd-windows-x64.zip'
+          m['architecture']['64bit']['url'] = f'https://github.com/sirrlock/sirr/releases/download/v{ver}/sirrd-windows-x64.zip'
           m['architecture']['64bit']['hash'] = os.environ['SIRRD_WIN_X64']
           write('scoop-bucket/bucket/sirrd.json', m)
 
           with open('scoop-bucket/bucket/sirr.json') as f:
               m = json.load(f)
           m['version'] = ver
-          m['architecture']['64bit']['url']  = f'https://github.com/SirrVault/sirr/releases/download/v{ver}/sirr-windows-x64.zip'
+          m['architecture']['64bit']['url']  = f'https://github.com/sirrlock/sirr/releases/download/v{ver}/sirr-windows-x64.zip'
           m['architecture']['64bit']['hash']  = os.environ['SIRR_WIN_X64']
-          m['architecture']['arm64']['url']  = f'https://github.com/SirrVault/sirr/releases/download/v{ver}/sirr-windows-arm64.zip'
+          m['architecture']['arm64']['url']  = f'https://github.com/sirrlock/sirr/releases/download/v{ver}/sirr-windows-arm64.zip'
           m['architecture']['arm64']['hash'] = os.environ['SIRR_WIN_ARM64']
           write('scoop-bucket/bucket/sirr.json', m)
           EOF
