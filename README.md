@@ -123,7 +123,7 @@ sirr run -- node app.js
 Install the MCP server so Claude can read and write secrets directly:
 
 ```bash
-npm install -g @sirrvault/mcp
+npm install -g @sirrlock/mcp
 ```
 
 **.mcp.json:**
@@ -360,8 +360,8 @@ SIRR_LICENSE_KEY=sirr_lic_... ./sirr serve
 
 | Package | Description |
 |---------|-------------|
-| [@sirrvault/mcp](https://github.com/sirrlock/mcp) | MCP server for AI assistants |
-| [@sirrvault/node](https://github.com/sirrlock/node) | Node.js / TypeScript SDK |
+| [@sirrlock/mcp](https://github.com/sirrlock/mcp) | MCP server for AI assistants |
+| [@sirrlock/node](https://github.com/sirrlock/node) | Node.js / TypeScript SDK |
 | [sirr (PyPI)](https://github.com/sirrlock/python) | Python SDK |
 | [Sirr.Client (NuGet)](https://github.com/sirrlock/dotnet) | .NET SDK |
 | [sirr.dev](https://sirr.dev) | Documentation |
