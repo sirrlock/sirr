@@ -62,7 +62,30 @@ impl Store {
         write_txn.open_table(COUNTERS)?;
         write_txn.open_table(super::webhooks::WEBHOOKS)?;
         write_txn.open_table(super::api_keys::API_KEYS)?;
+        write_txn.open_table(super::org::ORGS)?;
+        write_txn.open_table(super::org::PRINCIPALS)?;
+        write_txn.open_table(super::org::PRINCIPAL_KEYS)?;
+        write_txn.open_table(super::org::PRINCIPAL_KEY_IX)?;
+        write_txn.open_table(super::org::ROLES)?;
         write_txn.commit()?;
+
+        // Seed built-in roles (idempotent).
+        {
+            let write_txn = db.begin_write()?;
+            {
+                let mut table = write_txn.open_table(super::org::ROLES)?;
+                for role in super::org::builtin_roles() {
+                    let key = format!("builtin:{}", role.name);
+                    if table.get(key.as_str())?.is_none() {
+                        let bytes =
+                            bincode::serde::encode_to_vec(&role, bincode::config::standard())
+                                .context("encode builtin role")?;
+                        table.insert(key.as_str(), bytes.as_slice())?;
+                    }
+                }
+            }
+            write_txn.commit()?;
+        }
 
         Ok(Self {
             db: Arc::new(db),
@@ -895,5 +918,34 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action, "secret.read");
+    }
+
+    #[test]
+    fn new_tables_created_on_open() {
+        let (store, _dir) = make_store();
+        let read_txn = store.db.begin_read().unwrap();
+        read_txn.open_table(super::super::org::ORGS).unwrap();
+        read_txn.open_table(super::super::org::PRINCIPALS).unwrap();
+        read_txn
+            .open_table(super::super::org::PRINCIPAL_KEYS)
+            .unwrap();
+        read_txn
+            .open_table(super::super::org::PRINCIPAL_KEY_IX)
+            .unwrap();
+        read_txn.open_table(super::super::org::ROLES).unwrap();
+    }
+
+    #[test]
+    fn builtin_roles_seeded_on_open() {
+        let (store, _dir) = make_store();
+        let read_txn = store.db.begin_read().unwrap();
+        let table = read_txn.open_table(super::super::org::ROLES).unwrap();
+        for name in &["reader", "writer", "admin", "owner"] {
+            let key = format!("builtin:{name}");
+            assert!(
+                table.get(key.as_str()).unwrap().is_some(),
+                "builtin role {name} not found"
+            );
+        }
     }
 }
