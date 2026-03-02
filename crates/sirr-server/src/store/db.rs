@@ -61,7 +61,9 @@ impl Store {
         write_txn.open_table(AUDIT_LOG)?;
         write_txn.open_table(COUNTERS)?;
         write_txn.open_table(super::webhooks::WEBHOOKS)?;
-        write_txn.open_table(super::api_keys::API_KEYS)?;
+        // Legacy api_keys table: kept so existing databases don't lose the table on open.
+        const LEGACY_API_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("api_keys");
+        write_txn.open_table(LEGACY_API_KEYS)?;
         write_txn.open_table(super::org::ORGS)?;
         write_txn.open_table(super::org::PRINCIPALS)?;
         write_txn.open_table(super::org::PRINCIPAL_KEYS)?;

@@ -19,9 +19,8 @@ use tracing::{info, warn};
 use crate::{
     auth::{require_auth, require_master_key},
     handlers::{
-        audit_events, create_api_key, create_secret, create_webhook, delete_api_key, delete_secret,
-        delete_webhook, get_secret, head_secret, health, list_api_keys, list_secrets,
-        list_webhooks, patch_secret, prune_secrets,
+        audit_events, create_secret, create_webhook, delete_secret, delete_webhook, get_secret,
+        head_secret, health, list_secrets, list_webhooks, patch_secret, prune_secrets,
     },
     license,
     org_handlers::{
@@ -429,9 +428,6 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
             .route("/webhooks", post(create_webhook))
             .route("/webhooks", get(list_webhooks))
             .route("/webhooks/{id}", delete(delete_webhook))
-            .route("/keys", post(create_api_key))
-            .route("/keys", get(list_api_keys))
-            .route("/keys/{id}", delete(delete_api_key))
             .layer(middleware::from_fn_with_state(
                 state.clone(),
                 require_master_key,
@@ -474,10 +470,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
 /// Auto-initialize with a default org, admin principal, and temporary keys.
 /// Only runs if no orgs exist yet.
 fn auto_init_bootstrap(store: &crate::store::Store) -> Result<()> {
-    use crate::store::{
-        api_keys::{generate_api_key, hash_key},
-        org::{OrgRecord, PrincipalKeyRecord, PrincipalRecord},
-    };
+    use crate::store::org::{OrgRecord, PrincipalKeyRecord, PrincipalRecord};
 
     // Check if any orgs exist already.
     let orgs = store.list_orgs().context("list orgs for auto-init")?;
@@ -522,8 +515,16 @@ fn auto_init_bootstrap(store: &crate::store::Store) -> Result<()> {
     let mut keys_output = Vec::new();
 
     for i in 1..=2 {
-        let raw_key = generate_api_key();
-        let key_hash = hash_key(&raw_key);
+        // Generate a random API key and its SHA-256 hash.
+        let raw_key = {
+            let mut bytes = [0u8; 16];
+            rand::Rng::fill(&mut rand::thread_rng(), &mut bytes);
+            format!("sirr_key_{}", hex::encode(bytes))
+        };
+        let key_hash = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(raw_key.as_bytes()).to_vec()
+        };
         let key_id = format!("{:016x}", rand::random::<u64>());
 
         let key_record = PrincipalKeyRecord {

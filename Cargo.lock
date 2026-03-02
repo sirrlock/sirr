@@ -1860,7 +1860,7 @@ dependencies = [
 
 [[package]]
 name = "sirr"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1876,7 +1876,7 @@ dependencies = [
 
 [[package]]
 name = "sirr-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
@@ -1908,10 +1908,12 @@ dependencies = [
 
 [[package]]
 name = "sirrd"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
+ "hex",
+ "rand 0.8.5",
  "sirr-server",
  "tokio",
  "tracing",

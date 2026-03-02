@@ -91,7 +91,11 @@ async fn cmd_serve(host: String, port: u16, log_level: String, init: bool) -> Re
     let (api_key, auto_generated_key) = match env_api_key {
         Some(k) => (Some(k), None),
         None => {
-            let key = sirr_server::store::api_keys::generate_api_key();
+            let key = {
+                let mut bytes = [0u8; 16];
+                rand::Rng::fill(&mut rand::thread_rng(), &mut bytes);
+                format!("sirr_key_{}", hex::encode(bytes))
+            };
             (Some(key.clone()), Some(key))
         }
     };

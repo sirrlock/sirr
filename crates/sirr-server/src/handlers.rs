@@ -14,11 +14,10 @@ use crate::{
     auth::ResolvedAuth,
     license::LicenseStatus,
     store::{
-        api_keys::{self, Permission},
         audit::{
-            AuditEvent, ACTION_KEY_CREATE, ACTION_KEY_DELETE, ACTION_SECRET_BURNED,
-            ACTION_SECRET_CREATE, ACTION_SECRET_DELETE, ACTION_SECRET_LIST, ACTION_SECRET_PATCH,
-            ACTION_SECRET_PRUNE, ACTION_SECRET_READ, ACTION_WEBHOOK_CREATE, ACTION_WEBHOOK_DELETE,
+            AuditEvent, ACTION_SECRET_BURNED, ACTION_SECRET_CREATE, ACTION_SECRET_DELETE,
+            ACTION_SECRET_LIST, ACTION_SECRET_PATCH, ACTION_SECRET_PRUNE, ACTION_SECRET_READ,
+            ACTION_WEBHOOK_CREATE, ACTION_WEBHOOK_DELETE,
         },
         AuditQuery, GetResult,
     },
@@ -766,141 +765,6 @@ pub async fn delete_webhook(
 }
 
 // ── API Keys ──────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-pub struct CreateApiKeyRequest {
-    pub label: String,
-    pub permissions: Vec<String>,
-    pub prefix: Option<String>,
-}
-
-pub async fn create_api_key(
-    State(state): State<AppState>,
-    Extension(_auth): Extension<ResolvedAuth>,
-    headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Json(body): Json<CreateApiKeyRequest>,
-) -> Response {
-    // Auth is handled by require_master_key middleware.
-    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
-
-    // Parse permissions.
-    let parsed_perms: Vec<Permission> = body
-        .permissions
-        .iter()
-        .filter_map(|s| Permission::parse(s))
-        .collect();
-
-    if parsed_perms.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "at least one valid permission required (read, write, delete, admin)"})),
-        )
-            .into_response();
-    }
-
-    let raw_key = api_keys::generate_api_key();
-    let key_hash = api_keys::hash_key(&raw_key);
-    let id = api_keys::generate_key_id();
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    let record = crate::store::ApiKeyRecord {
-        id: id.clone(),
-        key_hash,
-        label: body.label.clone(),
-        permissions: parsed_perms,
-        prefix: body.prefix.clone(),
-        created_at: now,
-    };
-
-    match state.store.put_api_key(&record) {
-        Ok(()) => {
-            let _ = state.store.record_audit(AuditEvent::new(
-                ACTION_KEY_CREATE,
-                None,
-                ip,
-                true,
-                Some(format!("id={id}")),
-                None,
-                None,
-            ));
-            let perm_strs: Vec<&str> = record.permissions.iter().map(|p| p.as_str()).collect();
-            (
-                StatusCode::CREATED,
-                Json(json!({
-                    "id": id,
-                    "key": raw_key,
-                    "label": record.label,
-                    "permissions": perm_strs,
-                    "prefix": record.prefix,
-                })),
-            )
-                .into_response()
-        }
-        Err(e) => internal_error(e),
-    }
-}
-
-pub async fn list_api_keys(
-    State(state): State<AppState>,
-    Extension(_auth): Extension<ResolvedAuth>,
-) -> Response {
-    // Auth is handled by require_master_key middleware.
-    match state.store.list_api_keys() {
-        Ok(records) => {
-            let keys: Vec<_> = records
-                .iter()
-                .map(|r| {
-                    let perm_strs: Vec<&str> = r.permissions.iter().map(|p| p.as_str()).collect();
-                    json!({
-                        "id": r.id,
-                        "label": r.label,
-                        "permissions": perm_strs,
-                        "prefix": r.prefix,
-                        "created_at": r.created_at,
-                    })
-                })
-                .collect();
-            Json(json!({"keys": keys})).into_response()
-        }
-        Err(e) => internal_error(e),
-    }
-}
-
-pub async fn delete_api_key(
-    State(state): State<AppState>,
-    Extension(_auth): Extension<ResolvedAuth>,
-    headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Path(id): Path<String>,
-) -> Response {
-    // Auth is handled by require_master_key middleware.
-    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
-    match state.store.delete_api_key(&id) {
-        Ok(true) => {
-            let _ = state.store.record_audit(AuditEvent::new(
-                ACTION_KEY_DELETE,
-                None,
-                ip,
-                true,
-                Some(format!("id={id}")),
-                None,
-                None,
-            ));
-            Json(json!({"deleted": true})).into_response()
-        }
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "api key not found"})),
-        )
-            .into_response(),
-        Err(e) => internal_error(e),
-    }
-}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
