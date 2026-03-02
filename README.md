@@ -205,6 +205,59 @@ TTL format: `30s`, `5m`, `2h`, `7d`, `30d`
 
 ---
 
+## Multi-Tenant Mode
+
+Sirr supports org-scoped secrets with role-based access control. Each org has principals (identities) with named API keys and roles that control permissions.
+
+### Bootstrap
+
+```bash
+# Auto-create a default org + admin principal + temporary keys on first boot:
+sirrd serve --init
+# Or: SIRR_AUTOINIT=true sirrd serve
+```
+
+The bootstrap prints org ID, principal ID, and two temporary API keys (valid 30 minutes). Use those keys to create permanent ones.
+
+### Org management (requires master key)
+
+```bash
+export SIRR_API_KEY=<master-key>
+
+sirr orgs create "My Team"
+sirr orgs list
+sirr principals create <org_id> alice --role writer
+sirr me create-key --name deploy-key    # using a principal key
+```
+
+### Using org-scoped secrets
+
+```bash
+# With a principal API key:
+export SIRR_API_KEY=<principal-key>
+
+sirr push DB_URL=postgres://... --org <org_id>
+sirr get DB_URL --org <org_id>
+sirr list --org <org_id>
+```
+
+### Built-in roles
+
+| Role | Permissions | Description |
+|------|-------------|-------------|
+| reader | `rla` | Read own secrets, list own, read own account |
+| writer | `rlcpdam` | Read/list/create/patch/delete own secrets + manage account |
+| admin | `rRlLcCpPaAmMdD` | Full org access (all secrets, manage principals/roles) |
+| owner | `rRlLcCpPaAmMSdD` | Admin + SirrAdmin (can create/delete orgs) |
+
+Custom roles can be created per-org with any combination of the 15 permission bits.
+
+### Disabling the public bucket
+
+Set `ENABLE_PUBLIC_BUCKET=false` to serve only org-scoped routes.
+
+---
+
 ## HTTP API
 
 **Public routes** (no auth required):
@@ -281,6 +334,8 @@ Returns metadata only — values are never included in list responses.
 | `SIRR_RATE_LIMIT_BURST` | `30` | Per-IP burst allowance |
 | `NO_BANNER` | `0` | Set to `1` to suppress the startup banner |
 | `NO_SECURITY_BANNER` | `0` | Set to `1` to suppress the auto-generated key notice |
+| `ENABLE_PUBLIC_BUCKET` | `true` | Set to `false` to disable legacy `/secrets` routes |
+| `SIRR_AUTOINIT` | `false` | Set to `true` to auto-create default org on first boot |
 
 **CORS design note:** sirrd is a backend service, not a browser API. `GET /secrets/{key}` deliberately returns **no** `Access-Control-Allow-Origin` header — browsers block cross-origin reads of secret values by design, regardless of `SIRR_CORS_ORIGINS`. Management endpoints (create, list, delete, keys) do respect `SIRR_CORS_ORIGINS` so a trusted admin UI on a different origin can talk to them. If you need browser clients to read secrets, run them on the same origin as sirrd or proxy through your own backend.
 
@@ -329,11 +384,12 @@ CLI / Node SDK / Python SDK / .NET SDK / MCP Server
 
 | | |
 |---|---|
-| Free | Up to **100 active secrets** per instance |
+| Solo (free) | 1 org, 3 principals, unlimited secrets |
+| Team | 5 orgs, 25 principals |
+| Business | Unlimited orgs and principals |
 | Free | All non-production use (dev, staging, CI) |
 | Source available | Forks and modifications permitted |
 | Converts to Apache 2.0 | **February 20, 2028** |
-| Commercial license | Required for >100 active secrets in production |
 
 License keys at [sirrlock.com/pricing](https://sirrlock.com/pricing).
 
@@ -346,8 +402,8 @@ SIRR_LICENSE_KEY=sirr_lic_... ./sirr serve
 ## Roadmap
 
 - [ ] Web UI
-- [ ] Webhooks on expiry / burn
-- [ ] Team namespaces
+- [x] Webhooks on expiry / burn
+- [x] Team namespaces (multi-tenant orgs)
 - [x] Audit log
 - [ ] Kubernetes operator
 - [ ] Terraform provider

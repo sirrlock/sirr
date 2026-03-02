@@ -17,6 +17,17 @@ sirr/                           # github.com/sirrlock/sirr
 │   ├── sirr/                   # sirr CLI client binary (MIT, reqwest-based, no server deps)
 │   ├── sirrd/                  # sirrd daemon binary (BSL-1.1, axum server, redb store, crypto)
 │   └── sirr-server/            # Library: axum server, redb store, crypto
+│       └── src/
+│           ├── server.rs       # axum router, CORS, auto-init bootstrap
+│           ├── auth.rs         # ResolvedAuth middleware (master key + principal key)
+│           ├── handlers.rs     # public-bucket handlers
+│           ├── org_handlers.rs # org-scoped CRUD handlers (secrets, principals, roles, keys)
+│           └── store/
+│               ├── db.rs       # redb store (secrets + org tables)
+│               ├── org.rs      # OrgRecord, PrincipalRecord, PrincipalKeyRecord, RoleRecord
+│               ├── permissions.rs  # PermBit + Permissions 15-bit bitflag
+│               ├── model.rs    # SecretRecord, SecretMeta (owner_id, org_id, allowed_keys)
+│               └── crypto.rs   # ChaCha20Poly1305 encrypt/decrypt
 ├── Dockerfile                  # FROM scratch + musl binary
 ├── Dockerfile.release          # Used by CI release workflow
 ├── docker-compose.yml          # Production setup with key file mount
@@ -38,6 +49,9 @@ cargo fmt --all                                # Formatter
 
 # Run server locally
 ./target/release/sirrd serve
+# With auto-init (creates default org + admin principal + temp keys):
+./target/release/sirrd serve --init
+# Or via env: SIRR_AUTOINIT=true ./target/release/sirrd serve
 # Optionally protect writes: SIRR_API_KEY=my-key ./target/release/sirrd serve
 
 # Use CLI client
@@ -53,21 +67,34 @@ key + per-record nonce --ChaCha20Poly1305--> encrypted value stored in redb
 ```
 
 - `crates/sirr-server/src/store/crypto.rs` — ChaCha20Poly1305 encrypt/decrypt + key generation
-- `crates/sirr-server/src/store/db.rs` — redb open/read/write/patch/head/prune + GetResult enum (watch borrow lifetimes — AccessGuard must be dropped before mutating the table)
-- `crates/sirr-server/src/store/model.rs` — SecretRecord with `delete` flag, is_expired/is_burned/is_sealed checks
-- `crates/sirr-server/src/server.rs` — axum router, CORS, key management (sirr.key)
-- `crates/sirr-server/src/auth.rs` — optional API key middleware (SIRR_API_KEY)
-- `crates/sirrd/src/main.rs` — clap CLI: `serve` + `rotate` subcommands (server-side ops only)
-- `crates/sirr/src/main.rs` — clap CLI: `push`, `get`, `pull`, `run`, `share`, `list`, `delete`, `prune`, `webhooks`, `audit`, `keys`
+- `crates/sirr-server/src/store/db.rs` — redb open/read/write/patch/head/prune + GetResult enum + org/principal/role/key CRUD (watch borrow lifetimes — AccessGuard must be dropped before mutating the table)
+- `crates/sirr-server/src/store/model.rs` — SecretRecord with `delete` flag, `owner_id`, `org_id`, `allowed_keys`; is_expired/is_burned/is_sealed checks
+- `crates/sirr-server/src/store/org.rs` — OrgRecord, PrincipalRecord, PrincipalKeyRecord, RoleRecord structs + built-in role definitions
+- `crates/sirr-server/src/store/permissions.rs` — PermBit enum (15 bits) + Permissions bitflag with letter-string serde
+- `crates/sirr-server/src/server.rs` — axum router, CORS, auto-init bootstrap, key management (sirr.key)
+- `crates/sirr-server/src/auth.rs` — ResolvedAuth middleware: master key + principal key lookup + role resolution
+- `crates/sirr-server/src/org_handlers.rs` — org-scoped CRUD handlers (orgs, principals, roles, keys, secrets, webhooks, audit)
+- `crates/sirrd/src/main.rs` — clap CLI: `serve` (with `--init`) + `rotate` subcommands (server-side ops only)
+- `crates/sirr/src/main.rs` — clap CLI: `push`, `get`, `pull`, `run`, `share`, `list`, `delete`, `prune`, `webhooks`, `audit`, `keys`, `orgs`, `principals`, `roles`, `me`
 
 ## Key Constraints
 
 - `AccessGuard` from redb borrows the table immutably. Always `.to_vec()` the bytes before any mutation on the same table.
-- License check: >100 active secrets requires a valid `SIRR_LICENSE_KEY`. The check runs at secret creation time, not at startup.
+- License tiers are now org/principal-count based (Solo: 1 org / 3 principals, Team: 5 / 25, Business: unlimited). Free tier = Solo.
 - `delete` flag on SecretRecord: `true` (default) = burn on max_reads, `false` = seal (block reads, allow PATCH). PATCH only works on `delete=false` secrets.
 - `Store::get()` returns `GetResult` enum: `Value(String)`, `Sealed`, or `NotFound` — handler maps to 200, 410, 404.
 - Encryption key is a random 32-byte key stored as `sirr.key` (no more Argon2id derivation).
-- Auth is optional: `SIRR_API_KEY` env var protects write endpoints (POST/PATCH/DELETE/list). GET and HEAD are always public.
+- Auth: `SIRR_API_KEY` env var acts as master key. Org routes require either master key or principal key (via `require_auth` middleware). Public bucket reads are unauthenticated.
+- Deleting an org requires no principals; deleting a principal requires no active keys (cascading deletes not allowed).
+
+## Multi-Tenant Architecture
+
+- **Public bucket** (`/secrets/*`): backward compatible, no auth for reads, master key for writes
+- **Org buckets** (`/orgs/{org_id}/secrets/*`): require principal auth via `require_auth` middleware
+- **Roles**: reader, writer, admin, owner (built-in) + custom per-org. Permissions are a 15-bit bitflag serialized as a letter string (e.g. `"rRlLcCpPaAmMdD"`)
+- **Keys**: unlimited named keys per principal, time-windowed (`valid_after`/`valid_before`), hard-deletable
+- **`ENABLE_PUBLIC_BUCKET`**: env var to disable public bucket (default: true)
+- **`SIRR_AUTOINIT`** / `--init`: auto-create default org + admin principal + 2 temporary keys on first boot
 
 ## Testing
 
