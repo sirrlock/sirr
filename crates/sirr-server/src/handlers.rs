@@ -55,16 +55,6 @@ fn bad_key_name() -> Response {
         .into_response()
 }
 
-// ── Permission helpers ───────────────────────────────────────────────────────
-
-fn forbidden() -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(json!({"error": "insufficient permissions"})),
-    )
-        .into_response()
-}
-
 // ── IP extraction ────────────────────────────────────────────────────────────
 
 /// Returns the best-effort client IP for audit logging.

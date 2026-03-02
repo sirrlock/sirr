@@ -236,7 +236,7 @@ pub async fn create_principal(
     Path(org_id): Path<String>,
     Json(body): Json<CreatePrincipalRequest>,
 ) -> Response {
-    if !auth.is_master() && !(auth.can_manage_org() && auth.org_id() == Some(&org_id)) {
+    if !(auth.is_master() || auth.can_manage_org() && auth.org_id() == Some(&org_id)) {
         return forbidden();
     }
 
@@ -310,7 +310,7 @@ pub async fn list_principals(
     Extension(auth): Extension<ResolvedAuth>,
     Path(org_id): Path<String>,
 ) -> Response {
-    if !auth.is_master() && !(auth.can_account_read_org() && auth.org_id() == Some(&org_id)) {
+    if !(auth.is_master() || auth.can_account_read_org() && auth.org_id() == Some(&org_id)) {
         return forbidden();
     }
 
@@ -342,7 +342,7 @@ pub async fn delete_principal(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path((org_id, id)): Path<(String, String)>,
 ) -> Response {
-    if !auth.is_master() && !(auth.can_manage_org() && auth.org_id() == Some(&org_id)) {
+    if !(auth.is_master() || auth.can_manage_org() && auth.org_id() == Some(&org_id)) {
         return forbidden();
     }
 
@@ -390,7 +390,7 @@ pub async fn create_role(
     Path(org_id): Path<String>,
     Json(body): Json<CreateRoleRequest>,
 ) -> Response {
-    if !(auth.can_manage_org() && auth.org_id() == Some(&org_id)) && !auth.is_master() {
+    if !(auth.is_master() || auth.can_manage_org() && auth.org_id() == Some(&org_id)) {
         return forbidden();
     }
 
@@ -450,7 +450,7 @@ pub async fn list_roles(
     Extension(auth): Extension<ResolvedAuth>,
     Path(org_id): Path<String>,
 ) -> Response {
-    if !auth.is_master() && !(auth.can_account_read_org() && auth.org_id() == Some(&org_id)) {
+    if !(auth.is_master() || auth.can_account_read_org() && auth.org_id() == Some(&org_id)) {
         return forbidden();
     }
 
@@ -481,7 +481,7 @@ pub async fn delete_role(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path((org_id, name)): Path<(String, String)>,
 ) -> Response {
-    if !(auth.can_manage_org() && auth.org_id() == Some(&org_id)) && !auth.is_master() {
+    if !(auth.is_master() || auth.can_manage_org() && auth.org_id() == Some(&org_id)) {
         return forbidden();
     }
 

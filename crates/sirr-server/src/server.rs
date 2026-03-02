@@ -17,13 +17,21 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 use crate::{
-    auth::require_api_key,
+    auth::{require_auth, require_master_key},
     handlers::{
         audit_events, create_api_key, create_secret, create_webhook, delete_api_key, delete_secret,
         delete_webhook, get_secret, head_secret, health, list_api_keys, list_secrets,
         list_webhooks, patch_secret, prune_secrets,
     },
-    license, AppState,
+    license,
+    org_handlers::{
+        create_key, create_org, create_org_secret, create_org_webhook, create_principal,
+        create_role, delete_key, delete_org, delete_org_secret, delete_org_webhook,
+        delete_principal, delete_role, get_me, get_org_secret, head_org_secret, list_org_secrets,
+        list_org_webhooks, list_orgs, list_principals, list_roles, org_audit_events, patch_me,
+        patch_org_secret, prune_org_secrets,
+    },
+    AppState,
 };
 
 pub struct ServerConfig {
@@ -73,6 +81,10 @@ pub struct ServerConfig {
     /// shown when a key is auto-generated.  Has no effect when `api_key` was
     /// explicitly configured via `SIRR_API_KEY`.
     pub no_security_banner: bool,
+    /// When true (default), the legacy public /secrets bucket routes are
+    /// enabled. Set `ENABLE_PUBLIC_BUCKET=false` or `0` to disable them
+    /// and only serve multi-tenant org-scoped routes.
+    pub enable_public_bucket: bool,
 }
 
 impl Default for ServerConfig {
@@ -126,6 +138,9 @@ impl Default for ServerConfig {
             no_security_banner: std::env::var("NO_SECURITY_BANNER")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            enable_public_bucket: std::env::var("ENABLE_PUBLIC_BUCKET")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true),
         }
     }
 }
@@ -309,6 +324,8 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         );
     }
 
+    let enable_public_bucket = cfg.enable_public_bucket;
+
     let state = AppState {
         store,
         api_key: cfg.api_key,
@@ -318,6 +335,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         trusted_proxies: std::sync::Arc::new(trusted_proxies),
         redact_audit_keys: cfg.redact_audit_keys,
         webhook_allowed_origins,
+        enable_public_bucket,
     };
 
     // Per-IP rate limiting: configurable via SIRR_RATE_LIMIT_PER_SECOND / SIRR_RATE_LIMIT_BURST.
@@ -339,14 +357,6 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
 
     let cors = build_cors(cfg.cors_origins.as_deref(), cfg.cors_methods.as_deref());
 
-    // Secret-read routes carry NO CORS layer intentionally.
-    // Without Access-Control-Allow-Origin, browsers block cross-origin reads,
-    // preventing a malicious webpage from silently exfiltrating secrets.
-    // Non-browser clients (sirr CLI, curl) are unaffected.
-    let secret_read = Router::new()
-        .route("/secrets/{key}", get(get_secret))
-        .route("/secrets/{key}", head(head_secret));
-
     // Public informational routes (no auth, CORS allowed).
     let public = Router::new()
         .route("/health", get(health))
@@ -355,34 +365,86 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         .route("/.well-known/security.txt", get(security_txt))
         .layer(cors.clone());
 
-    // Protected routes (API key required if configured, CORS allowed for the web UI).
-    let protected = Router::new()
-        .route("/secrets", get(list_secrets))
-        .route("/secrets", post(create_secret))
-        .route("/secrets/{key}", patch(patch_secret))
-        .route("/secrets/{key}", delete(delete_secret))
-        .route("/prune", post(prune_secrets))
-        .route("/audit", get(audit_events))
-        .route("/webhooks", post(create_webhook))
-        .route("/webhooks", get(list_webhooks))
-        .route("/webhooks/{id}", delete(delete_webhook))
-        .route("/keys", post(create_api_key))
-        .route("/keys", get(list_api_keys))
-        .route("/keys/{id}", delete(delete_api_key))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_api_key,
-        ))
-        .layer(cors);
+    // Org-protected routes (require_auth middleware: master key or principal key).
+    let org_protected = Router::new()
+        // Org management
+        .route("/orgs", post(create_org))
+        .route("/orgs", get(list_orgs))
+        .route("/orgs/{org_id}", delete(delete_org))
+        // Principals
+        .route("/orgs/{org_id}/principals", post(create_principal))
+        .route("/orgs/{org_id}/principals", get(list_principals))
+        .route("/orgs/{org_id}/principals/{id}", delete(delete_principal))
+        // Roles
+        .route("/orgs/{org_id}/roles", post(create_role))
+        .route("/orgs/{org_id}/roles", get(list_roles))
+        .route("/orgs/{org_id}/roles/{name}", delete(delete_role))
+        // Principal self-service
+        .route("/me", get(get_me))
+        .route("/me", patch(patch_me))
+        .route("/me/keys", post(create_key))
+        .route("/me/keys/{key_id}", delete(delete_key))
+        // Org secrets
+        .route("/orgs/{org_id}/secrets", post(create_org_secret))
+        .route("/orgs/{org_id}/secrets", get(list_org_secrets))
+        .route("/orgs/{org_id}/secrets/{key}", get(get_org_secret))
+        .route("/orgs/{org_id}/secrets/{key}", head(head_org_secret))
+        .route("/orgs/{org_id}/secrets/{key}", patch(patch_org_secret))
+        .route("/orgs/{org_id}/secrets/{key}", delete(delete_org_secret))
+        .route("/orgs/{org_id}/prune", post(prune_org_secrets))
+        // Org audit + webhooks
+        .route("/orgs/{org_id}/audit", get(org_audit_events))
+        .route("/orgs/{org_id}/webhooks", post(create_org_webhook))
+        .route("/orgs/{org_id}/webhooks", get(list_org_webhooks))
+        .route("/orgs/{org_id}/webhooks/{id}", delete(delete_org_webhook))
+        .layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .layer(cors.clone());
 
-    let app = Router::new()
-        .merge(secret_read)
-        .merge(public)
-        .merge(protected)
-        .with_state(state)
-        .layer(GovernorLayer::new(governor_conf))
-        .layer(middleware::from_fn(add_security_headers))
-        .layer(TraceLayer::new_for_http());
+    // Build the merged app depending on whether the public bucket is enabled.
+    let app = if enable_public_bucket {
+        // Secret-read routes carry NO CORS layer intentionally.
+        // Without Access-Control-Allow-Origin, browsers block cross-origin reads,
+        // preventing a malicious webpage from silently exfiltrating secrets.
+        // Non-browser clients (sirr CLI, curl) are unaffected.
+        let secret_read = Router::new()
+            .route("/secrets/{key}", get(get_secret))
+            .route("/secrets/{key}", head(head_secret));
+
+        // Protected public bucket routes (require_master_key middleware).
+        let protected_public_bucket = Router::new()
+            .route("/secrets", get(list_secrets))
+            .route("/secrets", post(create_secret))
+            .route("/secrets/{key}", patch(patch_secret))
+            .route("/secrets/{key}", delete(delete_secret))
+            .route("/prune", post(prune_secrets))
+            .route("/audit", get(audit_events))
+            .route("/webhooks", post(create_webhook))
+            .route("/webhooks", get(list_webhooks))
+            .route("/webhooks/{id}", delete(delete_webhook))
+            .route("/keys", post(create_api_key))
+            .route("/keys", get(list_api_keys))
+            .route("/keys/{id}", delete(delete_api_key))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_master_key,
+            ))
+            .layer(cors);
+
+        Router::new()
+            .merge(secret_read)
+            .merge(public)
+            .merge(protected_public_bucket)
+            .merge(org_protected)
+            .with_state(state)
+    } else {
+        Router::new()
+            .merge(public)
+            .merge(org_protected)
+            .with_state(state)
+    }
+    .layer(GovernorLayer::new(governor_conf))
+    .layer(middleware::from_fn(add_security_headers))
+    .layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
         .parse()
