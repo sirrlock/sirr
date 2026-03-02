@@ -56,17 +56,26 @@ enum Commands {
         /// Path to write the .env file (default: .env)
         #[arg(default_value = ".env")]
         path: String,
+        /// Organization ID (if operating on org secrets)
+        #[arg(long)]
+        org: Option<String>,
     },
     /// Run a command with secrets injected as environment variables
     Run {
         /// Command and arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+        /// Organization ID (if operating on org secrets)
+        #[arg(long)]
+        org: Option<String>,
     },
     /// Print a shareable one-time URL for a secret
     Share {
         /// Secret key name
         key: String,
+        /// Organization ID (if operating on org secrets)
+        #[arg(long)]
+        org: Option<String>,
     },
     /// List all active secrets (metadata only)
     List {
@@ -83,7 +92,11 @@ enum Commands {
         org: Option<String>,
     },
     /// Delete all expired secrets immediately
-    Prune,
+    Prune {
+        /// Organization ID (if operating on org secrets)
+        #[arg(long)]
+        org: Option<String>,
+    },
     /// Manage webhooks
     #[command(subcommand)]
     Webhooks(WebhookCommand),
@@ -98,6 +111,9 @@ enum Commands {
         /// Maximum events to return
         #[arg(long, default_value = "50")]
         limit: usize,
+        /// Organization ID (if operating on org audit)
+        #[arg(long)]
+        org: Option<String>,
     },
     /// Manage scoped API keys
     #[command(subcommand)]
@@ -116,7 +132,11 @@ enum Commands {
 #[derive(Subcommand)]
 enum WebhookCommand {
     /// List registered webhooks
-    List,
+    List {
+        /// Organization ID (if operating on org webhooks)
+        #[arg(long)]
+        org: Option<String>,
+    },
     /// Register a webhook URL
     Add {
         /// Webhook endpoint URL
@@ -125,12 +145,18 @@ enum WebhookCommand {
         /// Comma-separated event types (default: all)
         #[arg(long, value_delimiter = ',')]
         events: Option<Vec<String>>,
+        /// Organization ID (if operating on org webhooks)
+        #[arg(long)]
+        org: Option<String>,
     },
     /// Remove a webhook by ID
     Remove {
         /// Webhook ID
         #[arg(name = "ID")]
         id: String,
+        /// Organization ID (if operating on org webhooks)
+        #[arg(long)]
+        org: Option<String>,
     },
 }
 
@@ -301,12 +327,13 @@ async fn main() -> Result<()> {
 
         Commands::Get { key, org } => cmd_get(&ctx, &key, org.as_deref()).await,
 
-        Commands::Pull { path } => cmd_pull(&ctx, &path).await,
+        Commands::Pull { path, org } => cmd_pull(&ctx, &path, org.as_deref()).await,
 
-        Commands::Run { command } => cmd_run(&ctx, &command).await,
+        Commands::Run { command, org } => cmd_run(&ctx, &command, org.as_deref()).await,
 
-        Commands::Share { key } => {
-            println!("{}/secrets/{}", ctx.server, key);
+        Commands::Share { key, org } => {
+            let path = secrets_path(org.as_deref());
+            println!("{}/{}/{}", ctx.server, path, key);
             Ok(())
         }
 
@@ -314,19 +341,24 @@ async fn main() -> Result<()> {
 
         Commands::Delete { key, org } => cmd_delete(&ctx, &key, org.as_deref()).await,
 
-        Commands::Prune => cmd_prune(&ctx).await,
+        Commands::Prune { org } => cmd_prune(&ctx, org.as_deref()).await,
 
         Commands::Webhooks(sub) => match sub {
-            WebhookCommand::List => cmd_webhook_list(&ctx).await,
-            WebhookCommand::Add { url, events } => cmd_webhook_add(&ctx, &url, events).await,
-            WebhookCommand::Remove { id } => cmd_webhook_remove(&ctx, &id).await,
+            WebhookCommand::List { org } => cmd_webhook_list(&ctx, org.as_deref()).await,
+            WebhookCommand::Add { url, events, org } => {
+                cmd_webhook_add(&ctx, &url, events, org.as_deref()).await
+            }
+            WebhookCommand::Remove { id, org } => {
+                cmd_webhook_remove(&ctx, &id, org.as_deref()).await
+            }
         },
 
         Commands::Audit {
             since,
             action,
             limit,
-        } => cmd_audit(&ctx, since, action.as_deref(), limit).await,
+            org,
+        } => cmd_audit(&ctx, since, action.as_deref(), limit, org.as_deref()).await,
 
         Commands::Keys(sub) => match sub {
             KeyCommand::List => cmd_key_list(&ctx).await,
@@ -424,6 +456,31 @@ fn secrets_path(org: Option<&str>) -> String {
     match org {
         Some(org_id) => format!("orgs/{org_id}/secrets"),
         None => "secrets".to_string(),
+    }
+}
+
+fn webhooks_path(org: Option<&str>, id: Option<&str>) -> String {
+    let base = match org {
+        Some(org_id) => format!("orgs/{org_id}/webhooks"),
+        None => "webhooks".to_string(),
+    };
+    match id {
+        Some(id) => format!("{base}/{id}"),
+        None => base,
+    }
+}
+
+fn prune_path(org: Option<&str>) -> String {
+    match org {
+        Some(org_id) => format!("orgs/{org_id}/prune"),
+        None => "prune".to_string(),
+    }
+}
+
+fn audit_path(org: Option<&str>) -> String {
+    match org {
+        Some(org_id) => format!("orgs/{org_id}/audit"),
+        None => "audit".to_string(),
     }
 }
 
@@ -541,12 +598,12 @@ async fn cmd_get(ctx: &Ctx, key: &str, org: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_pull(ctx: &Ctx, path: &str) -> Result<()> {
-    let metas = fetch_list(ctx, None).await?;
+async fn cmd_pull(ctx: &Ctx, path: &str, org: Option<&str>) -> Result<()> {
+    let metas = fetch_list(ctx, org).await?;
     let mut lines = Vec::new();
 
     for meta in &metas {
-        let value = fetch_value(ctx, &meta.key, None).await?;
+        let value = fetch_value(ctx, &meta.key, org).await?;
         lines.push(format!("{}={}", meta.key, shell_escape(&value)));
     }
 
@@ -555,16 +612,16 @@ async fn cmd_pull(ctx: &Ctx, path: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_run(ctx: &Ctx, command: &[String]) -> Result<()> {
+async fn cmd_run(ctx: &Ctx, command: &[String], org: Option<&str>) -> Result<()> {
     if command.is_empty() {
         anyhow::bail!("no command provided after --");
     }
 
-    let metas = fetch_list(ctx, None).await?;
+    let metas = fetch_list(ctx, org).await?;
     let mut env_vars: HashMap<String, String> = HashMap::new();
 
     for meta in &metas {
-        if let Ok(value) = fetch_value(ctx, &meta.key, None).await {
+        if let Ok(value) = fetch_value(ctx, &meta.key, org).await {
             env_vars.insert(meta.key.clone(), value);
         }
     }
@@ -626,9 +683,9 @@ async fn cmd_delete(ctx: &Ctx, key: &str, org: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_prune(ctx: &Ctx) -> Result<()> {
+async fn cmd_prune(ctx: &Ctx, org: Option<&str>) -> Result<()> {
     let resp = require_success(
-        ctx.post("prune")
+        ctx.post(&prune_path(org))
             .send()
             .await
             .context("HTTP request failed")?,
@@ -643,9 +700,9 @@ async fn cmd_prune(ctx: &Ctx) -> Result<()> {
 
 // ── Webhooks ─────────────────────────────────────────────────────────────
 
-async fn cmd_webhook_list(ctx: &Ctx) -> Result<()> {
+async fn cmd_webhook_list(ctx: &Ctx, org: Option<&str>) -> Result<()> {
     let resp = require_success(
-        ctx.get("webhooks")
+        ctx.get(&webhooks_path(org, None))
             .send()
             .await
             .context("HTTP request failed")?,
@@ -677,14 +734,19 @@ async fn cmd_webhook_list(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_webhook_add(ctx: &Ctx, url: &str, events: Option<Vec<String>>) -> Result<()> {
+async fn cmd_webhook_add(
+    ctx: &Ctx,
+    url: &str,
+    events: Option<Vec<String>>,
+    org: Option<&str>,
+) -> Result<()> {
     let mut body = serde_json::json!({"url": url});
     if let Some(evts) = events {
         body["events"] = serde_json::json!(evts);
     }
 
     let resp = require_success(
-        ctx.post("webhooks")
+        ctx.post(&webhooks_path(org, None))
             .json(&body)
             .send()
             .await
@@ -702,9 +764,9 @@ async fn cmd_webhook_add(ctx: &Ctx, url: &str, events: Option<Vec<String>>) -> R
     Ok(())
 }
 
-async fn cmd_webhook_remove(ctx: &Ctx, id: &str) -> Result<()> {
+async fn cmd_webhook_remove(ctx: &Ctx, id: &str, org: Option<&str>) -> Result<()> {
     require_success(
-        ctx.delete(&format!("webhooks/{id}"))
+        ctx.delete(&webhooks_path(org, Some(id)))
             .send()
             .await
             .context("HTTP request failed")?,
@@ -721,8 +783,9 @@ async fn cmd_audit(
     since: Option<i64>,
     action: Option<&str>,
     limit: usize,
+    org: Option<&str>,
 ) -> Result<()> {
-    let mut url = format!("audit?limit={limit}");
+    let mut url = format!("{}?limit={limit}", audit_path(org));
     if let Some(s) = since {
         url.push_str(&format!("&since={s}"));
     }
