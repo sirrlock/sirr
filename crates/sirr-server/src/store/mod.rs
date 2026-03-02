@@ -11,5 +11,7 @@ pub use api_keys::{ApiKeyRecord, Permission};
 pub use audit::{AuditEvent, AuditQuery};
 pub use db::{GetResult, Store};
 pub use model::{SecretMeta, SecretRecord};
-pub use org::{OrgRecord, PrincipalKeyRecord, PrincipalRecord, RoleRecord};
+pub use org::{
+    builtin_roles, validate_metadata, OrgRecord, PrincipalKeyRecord, PrincipalRecord, RoleRecord,
+};
 pub use permissions::{PermBit, Permissions};
