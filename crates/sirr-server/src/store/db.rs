@@ -733,6 +733,104 @@ impl Store {
         Ok(existed)
     }
 
+    // ── PrincipalKey CRUD ────────────────────────────────────────────────
+
+    /// Insert a principal key record. Writes to both PRINCIPAL_KEYS (hash->record)
+    /// and PRINCIPAL_KEY_IX ("{principal_id}:{key_id}"->hash).
+    pub fn put_principal_key(&self, key: &super::org::PrincipalKeyRecord) -> Result<()> {
+        let bytes = bincode::serde::encode_to_vec(key, bincode::config::standard())
+            .context("bincode encode principal key")?;
+        let ix_key = format!("{}:{}", key.principal_id, key.id);
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut keys_table = write_txn.open_table(super::org::PRINCIPAL_KEYS)?;
+            keys_table.insert(key.key_hash.as_slice(), bytes.as_slice())?;
+
+            let mut ix_table = write_txn.open_table(super::org::PRINCIPAL_KEY_IX)?;
+            ix_table.insert(ix_key.as_str(), key.key_hash.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// O(1) lookup of a principal key by its hash.
+    pub fn find_principal_key_by_hash(
+        &self,
+        hash: &[u8],
+    ) -> Result<Option<super::org::PrincipalKeyRecord>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(super::org::PRINCIPAL_KEYS)?;
+
+        let raw: Option<Vec<u8>> = table.get(hash)?.map(|g| g.value().to_vec());
+        match raw {
+            None => Ok(None),
+            Some(bytes) => {
+                let (record, _): (super::org::PrincipalKeyRecord, _) =
+                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                        .context("bincode decode principal key")?;
+                Ok(Some(record))
+            }
+        }
+    }
+
+    /// List all keys for a given principal by scanning the index.
+    pub fn list_principal_keys(
+        &self,
+        principal_id: &str,
+    ) -> Result<Vec<super::org::PrincipalKeyRecord>> {
+        let read_txn = self.db.begin_read()?;
+        let ix_table = read_txn.open_table(super::org::PRINCIPAL_KEY_IX)?;
+        let keys_table = read_txn.open_table(super::org::PRINCIPAL_KEYS)?;
+
+        let prefix = format!("{principal_id}:");
+        let mut records = Vec::new();
+        for item in ix_table.iter()? {
+            let (k, v) = item?;
+            if !k.value().starts_with(&prefix) {
+                continue;
+            }
+            let hash = v.value().to_vec();
+            if let Some(guard) = keys_table.get(hash.as_slice())? {
+                let key_bytes = guard.value().to_vec();
+                let (record, _): (super::org::PrincipalKeyRecord, _) =
+                    bincode::serde::decode_from_slice(&key_bytes, bincode::config::standard())
+                        .context("bincode decode principal key")?;
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    /// Delete a principal key by principal_id and key_id.
+    /// Removes from both PRINCIPAL_KEY_IX and PRINCIPAL_KEYS tables.
+    pub fn delete_principal_key(&self, principal_id: &str, key_id: &str) -> Result<bool> {
+        let ix_key = format!("{principal_id}:{key_id}");
+
+        // Look up the hash in the index first.
+        let hash: Option<Vec<u8>> = {
+            let read_txn = self.db.begin_read()?;
+            let ix_table = read_txn.open_table(super::org::PRINCIPAL_KEY_IX)?;
+            ix_table.get(ix_key.as_str())?.map(|g| g.value().to_vec())
+        };
+
+        let hash = match hash {
+            Some(h) => h,
+            None => return Ok(false),
+        };
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut ix_table = write_txn.open_table(super::org::PRINCIPAL_KEY_IX)?;
+            ix_table.remove(ix_key.as_str())?;
+
+            let mut keys_table = write_txn.open_table(super::org::PRINCIPAL_KEYS)?;
+            keys_table.remove(hash.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(true)
+    }
+
     /// Re-encrypt all non-expired records with `new_key`, tagging them with
     /// `new_key_version`. The current `self.key` is used to decrypt.
     /// Returns the number of records rotated.
@@ -1269,6 +1367,49 @@ mod tests {
         let err = s.delete_principal("org_1", "p_2");
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("has active keys"));
+    }
+
+    // ── PrincipalKey CRUD tests ─────────────────────────────────────────
+
+    #[test]
+    fn principal_key_crud() {
+        let (s, _dir) = make_store();
+
+        let key_hash = vec![0xBB; 32];
+        let key = super::super::org::PrincipalKeyRecord {
+            id: "pk_1".into(),
+            principal_id: "p_1".into(),
+            org_id: "org_1".into(),
+            name: "my-key".into(),
+            key_hash: key_hash.clone(),
+            valid_after: 1700000000,
+            valid_before: 1800000000,
+            created_at: 1700000000,
+        };
+        s.put_principal_key(&key).unwrap();
+
+        // find by hash
+        let found = s.find_principal_key_by_hash(&key_hash).unwrap().unwrap();
+        assert_eq!(found.id, "pk_1");
+        assert_eq!(found.principal_id, "p_1");
+
+        // list
+        let keys = s.list_principal_keys("p_1").unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].id, "pk_1");
+
+        // list for different principal returns empty
+        assert!(s.list_principal_keys("p_other").unwrap().is_empty());
+
+        // delete
+        assert!(s.delete_principal_key("p_1", "pk_1").unwrap());
+
+        // verify gone from both tables
+        assert!(s.find_principal_key_by_hash(&key_hash).unwrap().is_none());
+        assert!(s.list_principal_keys("p_1").unwrap().is_empty());
+
+        // delete non-existent returns false
+        assert!(!s.delete_principal_key("p_1", "pk_1").unwrap());
     }
 
     #[test]
