@@ -554,6 +554,83 @@ impl Store {
         Ok(max)
     }
 
+    // ── Org CRUD ──────────────────────────────────────────────────────────
+
+    /// Insert or overwrite an org record.
+    pub fn put_org(&self, org: &super::org::OrgRecord) -> Result<()> {
+        let bytes = bincode::serde::encode_to_vec(org, bincode::config::standard())
+            .context("bincode encode org")?;
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(super::org::ORGS)?;
+            table.insert(org.id.as_str(), bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Retrieve an org by ID.
+    pub fn get_org(&self, id: &str) -> Result<Option<super::org::OrgRecord>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(super::org::ORGS)?;
+
+        let raw: Option<Vec<u8>> = table.get(id)?.map(|g| g.value().to_vec());
+        match raw {
+            None => Ok(None),
+            Some(bytes) => {
+                let (record, _): (super::org::OrgRecord, _) =
+                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                        .context("bincode decode org")?;
+                Ok(Some(record))
+            }
+        }
+    }
+
+    /// List all orgs.
+    pub fn list_orgs(&self) -> Result<Vec<super::org::OrgRecord>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(super::org::ORGS)?;
+
+        let mut orgs = Vec::new();
+        for item in table.iter()? {
+            let (_k, v) = item?;
+            let (record, _): (super::org::OrgRecord, _) =
+                bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
+                    .context("bincode decode org")?;
+            orgs.push(record);
+        }
+        Ok(orgs)
+    }
+
+    /// Delete an org by ID. Returns true if it existed.
+    /// Fails if the org still has principals.
+    pub fn delete_org(&self, id: &str) -> Result<bool> {
+        let read_txn = self.db.begin_read()?;
+
+        // Check for existing principals with prefix "{org_id}:"
+        {
+            let table = read_txn.open_table(super::org::PRINCIPALS)?;
+            let prefix = format!("{id}:");
+            for item in table.iter()? {
+                let (k, _v) = item?;
+                if k.value().starts_with(&prefix) {
+                    anyhow::bail!("cannot delete org {id}: still has principals");
+                }
+            }
+        }
+        drop(read_txn);
+
+        let write_txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = write_txn.open_table(super::org::ORGS)?;
+            let existed = table.remove(id)?.is_some();
+            existed
+        };
+        write_txn.commit()?;
+        Ok(existed)
+    }
+
     /// Re-encrypt all non-expired records with `new_key`, tagging them with
     /// `new_key_version`. The current `self.key` is used to decrypt.
     /// Returns the number of records rotated.
@@ -933,6 +1010,42 @@ mod tests {
             .open_table(super::super::org::PRINCIPAL_KEY_IX)
             .unwrap();
         read_txn.open_table(super::super::org::ROLES).unwrap();
+    }
+
+    // ── Org CRUD tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn org_crud() {
+        use std::collections::HashMap;
+        let (s, _dir) = make_store();
+
+        let org = super::super::org::OrgRecord {
+            id: "org_1".into(),
+            name: "Acme".into(),
+            metadata: HashMap::from([("env".into(), "prod".into())]),
+            created_at: 1700000000,
+        };
+        s.put_org(&org).unwrap();
+
+        // get
+        let fetched = s.get_org("org_1").unwrap().unwrap();
+        assert_eq!(fetched.id, "org_1");
+        assert_eq!(fetched.name, "Acme");
+
+        // list
+        let orgs = s.list_orgs().unwrap();
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs[0].id, "org_1");
+
+        // delete
+        assert!(s.delete_org("org_1").unwrap());
+
+        // verify gone
+        assert!(s.get_org("org_1").unwrap().is_none());
+        assert!(s.list_orgs().unwrap().is_empty());
+
+        // delete non-existent returns false
+        assert!(!s.delete_org("org_1").unwrap());
     }
 
     #[test]
