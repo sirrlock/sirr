@@ -936,25 +936,31 @@ pub async fn get_org_secret(
         return bad_key_name();
     }
 
-    // Check key binding.
-    if let Some(key_name) = auth.key_name() {
-        match state.store.check_key_binding(&org_id, &key, key_name) {
-            Ok(false) => {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({"error": "key not authorized for this secret"})),
-                )
-                    .into_response();
+    // Pre-flight: check key binding and ownership via metadata.
+    match state.store.head_org_secret(&org_id, &key) {
+        Ok(Some((meta, _sealed))) => {
+            // Ownership check: ReadMy only grants access to own secrets.
+            if !auth.can_access_secret(meta.owner_id.as_deref(), PermBit::ReadMy, PermBit::ReadOrg)
+            {
+                return forbidden();
             }
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("not found") {
-                    return not_found("not found or expired");
+            // Key binding check.
+            if let Some(key_name) = auth.key_name() {
+                match state.store.check_key_binding(&org_id, &key, key_name) {
+                    Ok(false) => {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({"error": "key not authorized for this secret"})),
+                        )
+                            .into_response();
+                    }
+                    Err(e) => return internal_error(e),
+                    Ok(true) => {}
                 }
-                return internal_error(e);
             }
-            Ok(true) => {}
         }
+        Ok(None) => return not_found("not found or expired"),
+        Err(e) => return internal_error(e),
     }
 
     let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
@@ -1043,8 +1049,34 @@ pub async fn head_org_secret(
         return bad_key_name();
     }
 
+    // Key binding check (GB-01 fix).
+    if let Some(key_name) = auth.key_name() {
+        match state.store.check_key_binding(&org_id, &key, key_name) {
+            Ok(false) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": "key not authorized for this secret"})),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("not found") {
+                    return not_found("not found or expired");
+                }
+                return internal_error(e);
+            }
+            Ok(true) => {}
+        }
+    }
+
     match state.store.head_org_secret(&org_id, &key) {
         Ok(Some((meta, sealed))) => {
+            // Ownership check: ReadMy only grants access to own secrets.
+            if !auth.can_access_secret(meta.owner_id.as_deref(), PermBit::ReadMy, PermBit::ReadOrg)
+            {
+                return forbidden();
+            }
             let status = if sealed {
                 StatusCode::GONE
             } else {
@@ -1120,6 +1152,23 @@ pub async fn patch_org_secret(
         }
     }
 
+    // Ownership check: PatchMy only grants access to own secrets (GB-04 fix).
+    if !auth.can_patch_org() {
+        match state.store.head_org_secret(&org_id, &key) {
+            Ok(Some((meta, _))) => {
+                if !auth.can_access_secret(
+                    meta.owner_id.as_deref(),
+                    PermBit::PatchMy,
+                    PermBit::PatchOrg,
+                ) {
+                    return forbidden();
+                }
+            }
+            Ok(None) => return not_found("not found or expired"),
+            Err(e) => return internal_error(e),
+        }
+    }
+
     let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
 
     let new_expires_at = body.ttl_seconds.map(|ttl| now_epoch() + ttl as i64);
@@ -1187,6 +1236,23 @@ pub async fn delete_org_secret(
     }
     if !validate_key_name(&key) {
         return bad_key_name();
+    }
+
+    // Ownership check: DeleteMy only grants access to own secrets (GB-03 fix).
+    if !auth.can_delete_org() {
+        match state.store.head_org_secret(&org_id, &key) {
+            Ok(Some((meta, _))) => {
+                if !auth.can_access_secret(
+                    meta.owner_id.as_deref(),
+                    PermBit::DeleteMy,
+                    PermBit::DeleteOrg,
+                ) {
+                    return forbidden();
+                }
+            }
+            Ok(None) => return not_found("not found or expired"),
+            Err(e) => return internal_error(e),
+        }
     }
 
     let ip = extract_ip(&headers, &addr, &state.trusted_proxies);

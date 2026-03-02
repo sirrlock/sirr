@@ -557,7 +557,8 @@ impl Store {
                     anyhow::bail!("secret not found");
                 }
                 match &record.allowed_keys {
-                    None => Ok(true), // no restriction
+                    None => Ok(true),                                // no restriction
+                    Some(allowed) if allowed.is_empty() => Ok(true), // empty = no restriction
                     Some(allowed) => Ok(allowed.iter().any(|k| k == key_name)),
                 }
             }

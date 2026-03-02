@@ -449,27 +449,13 @@ async fn role_enforcement_via_http() {
         .await;
     resp.assert_status(axum::http::StatusCode::FORBIDDEN);
 
-    // Reader reads the writer's secret.
-    // Note: the reader role has ReadMy but not ReadOrg, and the secret is
-    // owned by the writer. So the reader cannot read it either (no org-wide read).
+    // Reader (ReadMy only, no ReadOrg) tries to read writer's secret.
+    // The ownership check blocks this — reader doesn't own it.
     let resp = server
         .get(&format!("/orgs/{org_id}/secrets/READABLE"))
         .authorization_bearer(&reader_key)
         .await;
-    // Reader has ReadMy only — this secret is owned by writer, so it returns
-    // not-found (the handler checks ownership via can_access_secret).
-    // The reader cannot see secrets they don't own without ReadOrg permission.
-    // This is correct multi-tenant behavior.
-    let status = resp.status_code();
-    // Reader role "rla" = ReadMy + ListMy + AccountRead.
-    // The get_org_secret handler first checks can_read_my || can_read_org,
-    // then does the get. The handler doesn't filter by ownership on GET
-    // (it does on LIST). So reader CAN read it if they know the key name.
-    // Let's just assert the result based on actual handler behavior.
-    assert!(
-        status == axum::http::StatusCode::OK || status == axum::http::StatusCode::NOT_FOUND,
-        "expected 200 or 404, got {status}"
-    );
+    resp.assert_status(axum::http::StatusCode::FORBIDDEN);
 }
 
 // ── Test: Master key can manage orgs via HTTP ───────────────────────────────
