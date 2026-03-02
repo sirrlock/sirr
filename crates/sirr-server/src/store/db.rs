@@ -1446,6 +1446,8 @@ mod tests {
             "127.0.0.1".into(),
             true,
             None,
+            None,
+            None,
         ))
         .unwrap();
         s.record_audit(AuditEvent::new(
@@ -1453,6 +1455,8 @@ mod tests {
             Some("KEY1".into()),
             "10.0.0.1".into(),
             true,
+            None,
+            None,
             None,
         ))
         .unwrap();
@@ -1488,6 +1492,8 @@ mod tests {
                 Some(format!("K{i}")),
                 "127.0.0.1".into(),
                 true,
+                None,
+                None,
                 None,
             ))
             .unwrap();
@@ -1527,6 +1533,8 @@ mod tests {
             "127.0.0.1".into(),
             true,
             None,
+            None,
+            None,
         );
         old_event.timestamp = 1000; // far in the past
 
@@ -1536,6 +1544,8 @@ mod tests {
             Some("NEW".into()),
             "127.0.0.1".into(),
             true,
+            None,
+            None,
             None,
         ))
         .unwrap();

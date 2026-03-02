@@ -28,6 +28,10 @@ pub struct AuditEvent {
     pub source_ip: String,
     pub success: bool,
     pub detail: Option<String>,
+    #[serde(default)]
+    pub org_id: Option<String>,
+    #[serde(default)]
+    pub principal_id: Option<String>,
 }
 
 impl AuditEvent {
@@ -37,6 +41,8 @@ impl AuditEvent {
         source_ip: String,
         success: bool,
         detail: Option<String>,
+        org_id: Option<String>,
+        principal_id: Option<String>,
     ) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -51,6 +57,8 @@ impl AuditEvent {
             source_ip,
             success,
             detail,
+            org_id,
+            principal_id,
         }
     }
 }

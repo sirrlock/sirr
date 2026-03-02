@@ -107,6 +107,8 @@ impl OnlineValidator {
                     "server".into(),
                     valid,
                     Some(detail),
+                    None,
+                    None,
                 ));
 
                 if valid {
@@ -130,6 +132,8 @@ impl OnlineValidator {
                     "server".into(),
                     true,
                     Some(format!("startup;unreachable;error={e}")),
+                    None,
+                    None,
                 ));
                 // Seed cache with a "valid but unchecked" entry so grace period begins.
                 let now = Instant::now();
@@ -220,6 +224,8 @@ impl OnlineValidator {
                         "server".into(),
                         valid,
                         Some(detail),
+                        None,
+                        None,
                     ));
                 }
                 Err(e) => {
@@ -236,6 +242,8 @@ impl OnlineValidator {
                         "server".into(),
                         false,
                         Some(format!("revalidate;unreachable;error={e}")),
+                        None,
+                        None,
                     ));
                 }
             }

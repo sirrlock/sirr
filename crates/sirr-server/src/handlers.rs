@@ -169,6 +169,8 @@ pub async fn list_secrets(
                 ip,
                 true,
                 Some(format!("count={}", metas.len())),
+                None,
+                None,
             ));
             Json(json!({ "secrets": metas })).into_response()
         }
@@ -252,6 +254,8 @@ pub async fn create_secret(
                     ip,
                     false,
                     Some("free tier limit reached".into()),
+                    None,
+                    None,
                 ));
                 return (
                     StatusCode::PAYMENT_REQUIRED,
@@ -275,6 +279,8 @@ pub async fn create_secret(
                         ip,
                         false,
                         Some("license validation failed".into()),
+                        None,
+                        None,
                     ));
                     return (
                         StatusCode::PAYMENT_REQUIRED,
@@ -312,6 +318,8 @@ pub async fn create_secret(
                 ip,
                 true,
                 None,
+                None,
+                None,
             ));
             if let Some(ref sender) = state.webhook_sender {
                 sender.fire("secret.created", &body.key, json!({}));
@@ -342,6 +350,8 @@ pub async fn get_secret(
                 ip,
                 true,
                 None,
+                None,
+                None,
             ));
             if let Some(ref sender) = state.webhook_sender {
                 sender.fire("secret.read", &key, json!({}));
@@ -357,6 +367,8 @@ pub async fn get_secret(
                 Some(key.clone()),
                 ip,
                 true,
+                None,
+                None,
                 None,
             ));
             if let Some(ref sender) = state.webhook_sender {
@@ -374,6 +386,8 @@ pub async fn get_secret(
                 ip,
                 false,
                 Some("sealed".into()),
+                None,
+                None,
             ));
             (
                 StatusCode::GONE,
@@ -388,6 +402,8 @@ pub async fn get_secret(
                 ip,
                 false,
                 Some("not found or expired".into()),
+                None,
+                None,
             ));
             (
                 StatusCode::NOT_FOUND,
@@ -420,6 +436,8 @@ pub async fn head_secret(
                 ip,
                 true,
                 Some(detail.into()),
+                None,
+                None,
             ));
 
             let status = if sealed {
@@ -459,6 +477,8 @@ pub async fn head_secret(
                 ip,
                 false,
                 Some("head;not found or expired".into()),
+                None,
+                None,
             ));
             (
                 StatusCode::NOT_FOUND,
@@ -534,6 +554,8 @@ pub async fn patch_secret(
                 ip,
                 true,
                 None,
+                None,
+                None,
             ));
             Json(meta).into_response()
         }
@@ -544,6 +566,8 @@ pub async fn patch_secret(
                 ip,
                 false,
                 Some("not found or expired".into()),
+                None,
+                None,
             ));
             (
                 StatusCode::NOT_FOUND,
@@ -560,6 +584,8 @@ pub async fn patch_secret(
                     ip,
                     false,
                     Some("conflict: delete=true".into()),
+                    None,
+                    None,
                 ));
                 (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response()
             } else if msg.starts_with("sealed:") {
@@ -569,6 +595,8 @@ pub async fn patch_secret(
                     ip,
                     false,
                     Some("gone: secret read limit exhausted".into()),
+                    None,
+                    None,
                 ));
                 (
                     StatusCode::GONE,
@@ -607,6 +635,8 @@ pub async fn delete_secret(
                 ip,
                 true,
                 None,
+                None,
+                None,
             ));
             if let Some(ref sender) = state.webhook_sender {
                 sender.fire("secret.deleted", &key, json!({}));
@@ -621,6 +651,8 @@ pub async fn delete_secret(
                 ip,
                 false,
                 Some("not found".into()),
+                None,
+                None,
             ));
             (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
         }
@@ -650,6 +682,8 @@ pub async fn prune_secrets(
                 ip,
                 true,
                 Some(format!("pruned={n}")),
+                None,
+                None,
             ));
             if let Some(ref sender) = state.webhook_sender {
                 for key in &pruned_keys {
@@ -736,6 +770,8 @@ pub async fn create_webhook(
                 ip,
                 true,
                 Some(format!("id={id}")),
+                None,
+                None,
             ));
             (
                 StatusCode::CREATED,
@@ -793,6 +829,8 @@ pub async fn delete_webhook(
                 ip,
                 true,
                 Some(format!("id={id}")),
+                None,
+                None,
             ));
             Json(json!({"deleted": true})).into_response()
         }
@@ -867,6 +905,8 @@ pub async fn create_api_key(
                 ip,
                 true,
                 Some(format!("id={id}")),
+                None,
+                None,
             ));
             let perm_strs: Vec<&str> = record.permissions.iter().map(|p| p.as_str()).collect();
             (
@@ -932,6 +972,8 @@ pub async fn delete_api_key(
                 ip,
                 true,
                 Some(format!("id={id}")),
+                None,
+                None,
             ));
             Json(json!({"deleted": true})).into_response()
         }
