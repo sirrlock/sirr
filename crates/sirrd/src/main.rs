@@ -28,6 +28,9 @@ enum Commands {
         /// Log level: error, warn, info, debug, verbose (default: $SIRR_LOG_LEVEL or warn)
         #[arg(long, env = "SIRR_LOG_LEVEL")]
         log_level: Option<String>,
+        /// Auto-initialize with default org and principal
+        #[arg(long)]
+        init: bool,
     },
     /// Rotate the encryption key (offline). Re-encrypts all records with a new
     /// master key. Requires direct access to the sirr.key and sirr.db files.
@@ -63,7 +66,8 @@ async fn main() -> Result<()> {
             port,
             host,
             log_level: _,
-        } => cmd_serve(host, port, effective_log_level).await,
+            init,
+        } => cmd_serve(host, port, effective_log_level, init).await,
 
         Commands::Rotate => cmd_rotate().await,
     }
@@ -71,7 +75,7 @@ async fn main() -> Result<()> {
 
 // ── Command implementations ───────────────────────────────────────────────────
 
-async fn cmd_serve(host: String, port: u16, log_level: String) -> Result<()> {
+async fn cmd_serve(host: String, port: u16, log_level: String, init: bool) -> Result<()> {
     let no_banner = std::env::var("NO_BANNER")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -92,6 +96,11 @@ async fn cmd_serve(host: String, port: u16, log_level: String) -> Result<()> {
         }
     };
 
+    let auto_init = init
+        || std::env::var("SIRR_AUTOINIT")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
     let cfg = sirr_server::ServerConfig {
         host,
         port,
@@ -102,6 +111,7 @@ async fn cmd_serve(host: String, port: u16, log_level: String) -> Result<()> {
         log_level,
         no_banner,
         no_security_banner,
+        auto_init,
         ..Default::default()
     };
 

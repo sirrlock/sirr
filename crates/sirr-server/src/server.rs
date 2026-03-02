@@ -85,6 +85,9 @@ pub struct ServerConfig {
     /// enabled. Set `ENABLE_PUBLIC_BUCKET=false` or `0` to disable them
     /// and only serve multi-tenant org-scoped routes.
     pub enable_public_bucket: bool,
+    /// When true, auto-initialize with a default org and admin principal
+    /// if no orgs exist yet. Triggered by `--init` or `SIRR_AUTOINIT=true`.
+    pub auto_init: bool,
 }
 
 impl Default for ServerConfig {
@@ -141,6 +144,9 @@ impl Default for ServerConfig {
             enable_public_bucket: std::env::var("ENABLE_PUBLIC_BUCKET")
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(true),
+            auto_init: std::env::var("SIRR_AUTOINIT")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
         }
     }
 }
@@ -208,6 +214,11 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     // Open redb store.
     let db_path = data_dir.join("sirr.db");
     let store = crate::store::Store::open(&db_path, enc_key).context("open store")?;
+
+    // Auto-init bootstrap: create default org + admin principal + keys if no orgs exist.
+    if cfg.auto_init {
+        auto_init_bootstrap(&store)?;
+    }
 
     // Resolve instance ID for webhook payloads.
     let webhook_instance_id = cfg
@@ -458,6 +469,104 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     )
     .await
     .context("server error")
+}
+
+/// Auto-initialize with a default org, admin principal, and temporary keys.
+/// Only runs if no orgs exist yet.
+fn auto_init_bootstrap(store: &crate::store::Store) -> Result<()> {
+    use crate::store::{
+        api_keys::{generate_api_key, hash_key},
+        org::{OrgRecord, PrincipalKeyRecord, PrincipalRecord},
+    };
+
+    // Check if any orgs exist already.
+    let orgs = store.list_orgs().context("list orgs for auto-init")?;
+    if !orgs.is_empty() {
+        info!("auto-init: orgs already exist, skipping bootstrap");
+        return Ok(());
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    // Generate IDs.
+    let org_id = format!("{:032x}", rand::random::<u128>());
+    let principal_id = format!("{:032x}", rand::random::<u128>());
+
+    // Create default org.
+    let org = OrgRecord {
+        id: org_id.clone(),
+        name: "default".to_string(),
+        metadata: std::collections::HashMap::new(),
+        created_at: now,
+    };
+    store.put_org(&org).context("auto-init: create org")?;
+
+    // Create admin principal.
+    let principal = PrincipalRecord {
+        id: principal_id.clone(),
+        org_id: org_id.clone(),
+        name: "admin".to_string(),
+        role: "admin".to_string(),
+        metadata: std::collections::HashMap::new(),
+        created_at: now,
+    };
+    store
+        .put_principal(&principal)
+        .context("auto-init: create principal")?;
+
+    // Create 2 temporary keys valid for 30 minutes.
+    let valid_before = now + 1800; // 30 minutes
+    let mut keys_output = Vec::new();
+
+    for i in 1..=2 {
+        let raw_key = generate_api_key();
+        let key_hash = hash_key(&raw_key);
+        let key_id = format!("{:016x}", rand::random::<u64>());
+
+        let key_record = PrincipalKeyRecord {
+            id: key_id.clone(),
+            principal_id: principal_id.clone(),
+            org_id: org_id.clone(),
+            name: format!("bootstrap-key-{i}"),
+            key_hash,
+            valid_after: now,
+            valid_before,
+            created_at: now,
+        };
+        store
+            .put_principal_key(&key_record)
+            .context("auto-init: create key")?;
+
+        keys_output.push((key_id, raw_key));
+    }
+
+    // Print bootstrap info to stdout.
+    eprintln!();
+    eprintln!("  ╔══════════════════════════════════════════════════════════════╗");
+    eprintln!("  ║  AUTO-INIT BOOTSTRAP                                       ║");
+    eprintln!("  ╚══════════════════════════════════════════════════════════════╝");
+    eprintln!();
+    eprintln!("  Default org created:");
+    eprintln!("    org_id:       {org_id}");
+    eprintln!("    name:         default");
+    eprintln!();
+    eprintln!("  Admin principal created:");
+    eprintln!("    principal_id: {principal_id}");
+    eprintln!("    name:         admin");
+    eprintln!("    role:         admin");
+    eprintln!();
+    eprintln!("  Temporary API keys (valid 30 minutes):");
+    for (kid, raw) in &keys_output {
+        eprintln!("    id={kid}  key={raw}");
+    }
+    eprintln!();
+    warn!("auto-init keys expire in 30 minutes — create permanent keys via `sirr me create-key`");
+    eprintln!();
+
+    Ok(())
 }
 
 fn load_or_create_key(data_dir: &std::path::Path) -> Result<crate::store::crypto::EncryptionKey> {
