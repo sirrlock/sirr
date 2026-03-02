@@ -152,6 +152,12 @@ impl Store {
     /// Returns `GetResult::Sealed` if the secret exists but reads are exhausted (delete=false).
     /// Returns `GetResult::Value(value)` on success.
     pub fn get(&self, secret_key: &str) -> Result<GetResult> {
+        self.get_by_table_key(secret_key)
+    }
+
+    /// Internal helper that performs the get-and-increment logic for any table key.
+    /// Both public-bucket `get()` and org-scoped `get_org_secret()` delegate here.
+    fn get_by_table_key(&self, table_key: &str) -> Result<GetResult> {
         let now = Self::now();
 
         // We need a write transaction to atomically increment read_count.
@@ -162,7 +168,7 @@ impl Store {
             // Read the raw bytes and immediately clone them so the AccessGuard
             // (which borrows `table`) is dropped before any mutation.
             let raw_bytes: Option<Vec<u8>> =
-                table.get(secret_key)?.map(|guard| guard.value().to_vec());
+                table.get(table_key)?.map(|guard| guard.value().to_vec());
 
             match raw_bytes {
                 None => GetResult::NotFound,
@@ -170,8 +176,8 @@ impl Store {
                     let (mut record, record_key_version) = decode(&bytes)?;
 
                     if record.is_expired(now) {
-                        table.remove(secret_key)?;
-                        debug!(key = %secret_key, "lazy-evicted expired secret");
+                        table.remove(table_key)?;
+                        debug!(key = %table_key, "lazy-evicted expired secret");
                         GetResult::NotFound
                     } else if record.is_sealed() {
                         GetResult::Sealed
@@ -190,12 +196,12 @@ impl Store {
 
                         let webhook_url = record.webhook_url.clone();
                         if record.is_burned() {
-                            table.remove(secret_key)?;
-                            debug!(key = %secret_key, "burned after final read");
+                            table.remove(table_key)?;
+                            debug!(key = %table_key, "burned after final read");
                             GetResult::Burned(value, webhook_url)
                         } else {
                             let updated = encode(&record, record_key_version)?;
-                            table.insert(secret_key, updated.as_slice())?;
+                            table.insert(table_key, updated.as_slice())?;
                             GetResult::Value(value, webhook_url)
                         }
                     }
@@ -287,11 +293,21 @@ impl Store {
     /// Retrieve metadata for a secret without incrementing read_count.
     /// Returns (meta, is_sealed). Returns None if not found or TTL-expired.
     pub fn head(&self, secret_key: &str) -> Result<Option<(SecretMeta, bool)>> {
+        self.head_by_table_key(secret_key, secret_key)
+    }
+
+    /// Internal helper for head logic. `table_key` is the key in SECRETS,
+    /// `display_key` is the key to use in the returned SecretMeta.
+    fn head_by_table_key(
+        &self,
+        table_key: &str,
+        display_key: &str,
+    ) -> Result<Option<(SecretMeta, bool)>> {
         let now = Self::now();
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(SECRETS)?;
 
-        let raw_bytes: Option<Vec<u8>> = table.get(secret_key)?.map(|guard| guard.value().to_vec());
+        let raw_bytes: Option<Vec<u8>> = table.get(table_key)?.map(|guard| guard.value().to_vec());
 
         match raw_bytes {
             None => Ok(None),
@@ -303,7 +319,7 @@ impl Store {
                 let sealed = record.is_sealed();
                 Ok(Some((
                     SecretMeta {
-                        key: secret_key.to_owned(),
+                        key: display_key.to_owned(),
                         created_at: record.created_at,
                         expires_at: record.expires_at,
                         max_reads: record.max_reads,
@@ -381,6 +397,232 @@ impl Store {
 
                     Ok(Some(SecretMeta {
                         key: secret_key.to_owned(),
+                        created_at: record.created_at,
+                        expires_at: record.expires_at,
+                        max_reads: record.max_reads,
+                        read_count: 0,
+                        delete: record.delete,
+                        owner_id: record.owner_id.clone(),
+                        org_id: record.org_id.clone(),
+                    }))
+                }
+            }
+        };
+        write_txn.commit()?;
+        result
+    }
+
+    // ── Org-scoped secret methods ───────────────────────────────────────
+
+    /// Build the compound table key for an org-scoped secret: "{org_id}:{key}".
+    fn org_secret_key(org_id: &str, key: &str) -> String {
+        format!("{org_id}:{key}")
+    }
+
+    /// Insert or overwrite an org-scoped secret.
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_org_secret(
+        &self,
+        org_id: &str,
+        key: &str,
+        value: &str,
+        expires_at: Option<i64>,
+        max_reads: Option<u32>,
+        delete: bool,
+        webhook_url: Option<String>,
+        owner_id: Option<&str>,
+        allowed_keys: Option<Vec<String>>,
+    ) -> Result<()> {
+        let now = Self::now();
+
+        let (value_encrypted, nonce) =
+            super::crypto::encrypt(&self.key, value.as_bytes()).context("encrypt value")?;
+
+        let record = SecretRecord {
+            value_encrypted,
+            nonce,
+            created_at: now,
+            expires_at,
+            max_reads,
+            read_count: 0,
+            delete,
+            webhook_url,
+            owner_id: owner_id.map(|s| s.to_owned()),
+            org_id: Some(org_id.to_owned()),
+            allowed_keys,
+        };
+
+        let table_key = Self::org_secret_key(org_id, key);
+        let bytes = encode(&record, self.key_version)?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(SECRETS)?;
+            table.insert(table_key.as_str(), bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+
+        debug!(org_id = %org_id, key = %key, "stored org-scoped secret");
+        Ok(())
+    }
+
+    /// Retrieve an org-scoped secret, incrementing its read counter.
+    pub fn get_org_secret(&self, org_id: &str, key: &str) -> Result<GetResult> {
+        let table_key = Self::org_secret_key(org_id, key);
+        self.get_by_table_key(&table_key)
+    }
+
+    /// Retrieve metadata for an org-scoped secret without incrementing read_count.
+    pub fn head_org_secret(&self, org_id: &str, key: &str) -> Result<Option<(SecretMeta, bool)>> {
+        let table_key = Self::org_secret_key(org_id, key);
+        self.head_by_table_key(&table_key, key)
+    }
+
+    /// Delete an org-scoped secret. Returns true if it existed.
+    pub fn delete_org_secret(&self, org_id: &str, key: &str) -> Result<bool> {
+        let table_key = Self::org_secret_key(org_id, key);
+        let write_txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = write_txn.open_table(SECRETS)?;
+            let existed = table.remove(table_key.as_str())?.is_some();
+            existed
+        };
+        write_txn.commit()?;
+        Ok(existed)
+    }
+
+    /// List metadata for all non-expired secrets belonging to an org.
+    /// Optionally filter by `owner_id`.
+    pub fn list_org_secrets(
+        &self,
+        org_id: &str,
+        owner_id: Option<&str>,
+    ) -> Result<Vec<SecretMeta>> {
+        let now = Self::now();
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SECRETS)?;
+
+        let prefix = format!("{org_id}:");
+        let mut metas = Vec::new();
+        for item in table.iter()? {
+            let (k, v) = item?;
+            let key_str = k.value();
+            if !key_str.starts_with(&prefix) {
+                continue;
+            }
+            let (record, _kv) = decode(v.value())?;
+            if record.is_expired(now) {
+                continue;
+            }
+            // Filter by owner if requested.
+            if let Some(filter_owner) = owner_id {
+                if record.owner_id.as_deref() != Some(filter_owner) {
+                    continue;
+                }
+            }
+            // Strip the prefix from the display key.
+            let display_key = &key_str[prefix.len()..];
+            metas.push(SecretMeta {
+                key: display_key.to_owned(),
+                created_at: record.created_at,
+                expires_at: record.expires_at,
+                max_reads: record.max_reads,
+                read_count: record.read_count,
+                delete: record.delete,
+                owner_id: record.owner_id.clone(),
+                org_id: record.org_id.clone(),
+            });
+        }
+        Ok(metas)
+    }
+
+    /// Check if a principal key is allowed to access an org-scoped secret.
+    /// Returns `true` if the secret has no `allowed_keys` restriction (open access)
+    /// or if `key_name` is in the allowed list.
+    /// Returns `Err` if the secret is not found or expired.
+    pub fn check_key_binding(&self, org_id: &str, key: &str, key_name: &str) -> Result<bool> {
+        let table_key = Self::org_secret_key(org_id, key);
+        let now = Self::now();
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SECRETS)?;
+
+        let raw_bytes: Option<Vec<u8>> = table.get(table_key.as_str())?.map(|g| g.value().to_vec());
+
+        match raw_bytes {
+            None => anyhow::bail!("secret not found"),
+            Some(bytes) => {
+                let (record, _kv) = decode(&bytes)?;
+                if record.is_expired(now) {
+                    anyhow::bail!("secret not found");
+                }
+                match &record.allowed_keys {
+                    None => Ok(true), // no restriction
+                    Some(allowed) => Ok(allowed.iter().any(|k| k == key_name)),
+                }
+            }
+        }
+    }
+
+    /// Update an existing org-scoped secret (only if delete=false).
+    /// Resets read_count to 0. Returns updated metadata.
+    pub fn patch_org_secret(
+        &self,
+        org_id: &str,
+        key: &str,
+        new_value: Option<&str>,
+        new_max_reads: Option<u32>,
+        new_expires_at: Option<i64>,
+    ) -> Result<Option<SecretMeta>> {
+        let table_key = Self::org_secret_key(org_id, key);
+        let now = Self::now();
+
+        let write_txn = self.db.begin_write()?;
+        let result = {
+            let mut table = write_txn.open_table(SECRETS)?;
+
+            let raw_bytes: Option<Vec<u8>> = table
+                .get(table_key.as_str())?
+                .map(|guard| guard.value().to_vec());
+
+            match raw_bytes {
+                None => Ok(None),
+                Some(bytes) => {
+                    let (mut record, record_key_version) = decode(&bytes)?;
+
+                    if record.is_expired(now) {
+                        table.remove(table_key.as_str())?;
+                        return Ok(None);
+                    }
+
+                    if record.delete {
+                        anyhow::bail!("cannot patch a secret with delete=true");
+                    }
+
+                    if record.is_sealed() {
+                        anyhow::bail!("sealed: secret read limit exhausted");
+                    }
+
+                    if let Some(val) = new_value {
+                        let (encrypted, nonce) = super::crypto::encrypt(&self.key, val.as_bytes())
+                            .context("encrypt patched value")?;
+                        record.value_encrypted = encrypted;
+                        record.nonce = nonce;
+                    }
+
+                    if let Some(max) = new_max_reads {
+                        record.max_reads = Some(max);
+                    }
+
+                    if let Some(exp) = new_expires_at {
+                        record.expires_at = Some(exp);
+                    }
+
+                    record.read_count = 0;
+
+                    let updated = encode(&record, record_key_version)?;
+                    table.insert(table_key.as_str(), updated.as_slice())?;
+
+                    Ok(Some(SecretMeta {
+                        key: key.to_owned(),
                         created_at: record.created_at,
                         expires_at: record.expires_at,
                         max_reads: record.max_reads,
@@ -1588,6 +1830,215 @@ mod tests {
         let err = s.delete_role(None, "admin");
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("built-in"));
+    }
+
+    // ── Org-scoped secret tests ────────────────────────────────────────
+
+    #[test]
+    fn org_scoped_secret_put_and_get() {
+        let (s, _dir) = make_store();
+
+        // Same key name in two different orgs
+        s.put_org_secret(
+            "org_a",
+            "DB_PASS",
+            "alpha-pass",
+            None,
+            None,
+            true,
+            None,
+            Some("p1"),
+            None,
+        )
+        .unwrap();
+        s.put_org_secret(
+            "org_b",
+            "DB_PASS",
+            "beta-pass",
+            None,
+            None,
+            true,
+            None,
+            Some("p2"),
+            None,
+        )
+        .unwrap();
+
+        // Each org gets its own value
+        assert_eq!(
+            s.get_org_secret("org_a", "DB_PASS").unwrap(),
+            GetResult::Value("alpha-pass".into(), None)
+        );
+        assert_eq!(
+            s.get_org_secret("org_b", "DB_PASS").unwrap(),
+            GetResult::Value("beta-pass".into(), None)
+        );
+
+        // Public bucket doesn't see org-scoped secrets
+        assert_eq!(s.get("DB_PASS").unwrap(), GetResult::NotFound);
+
+        // Delete from one org doesn't affect the other
+        assert!(s.delete_org_secret("org_a", "DB_PASS").unwrap());
+        assert_eq!(
+            s.get_org_secret("org_a", "DB_PASS").unwrap(),
+            GetResult::NotFound
+        );
+        assert_eq!(
+            s.get_org_secret("org_b", "DB_PASS").unwrap(),
+            GetResult::Value("beta-pass".into(), None)
+        );
+    }
+
+    #[test]
+    fn org_scoped_list_my_vs_org() {
+        let (s, _dir) = make_store();
+
+        s.put_org_secret(
+            "org_1",
+            "S1",
+            "v1",
+            None,
+            None,
+            true,
+            None,
+            Some("alice"),
+            None,
+        )
+        .unwrap();
+        s.put_org_secret(
+            "org_1",
+            "S2",
+            "v2",
+            None,
+            None,
+            true,
+            None,
+            Some("bob"),
+            None,
+        )
+        .unwrap();
+        s.put_org_secret(
+            "org_1",
+            "S3",
+            "v3",
+            None,
+            None,
+            true,
+            None,
+            Some("alice"),
+            None,
+        )
+        .unwrap();
+
+        // List all for org
+        let all = s.list_org_secrets("org_1", None).unwrap();
+        assert_eq!(all.len(), 3);
+
+        // List only alice's
+        let alice_secrets = s.list_org_secrets("org_1", Some("alice")).unwrap();
+        assert_eq!(alice_secrets.len(), 2);
+        assert!(alice_secrets
+            .iter()
+            .all(|m| m.owner_id.as_deref() == Some("alice")));
+
+        // List only bob's
+        let bob_secrets = s.list_org_secrets("org_1", Some("bob")).unwrap();
+        assert_eq!(bob_secrets.len(), 1);
+        assert_eq!(bob_secrets[0].key, "S2");
+    }
+
+    #[test]
+    fn key_binding_check() {
+        let (s, _dir) = make_store();
+
+        // Secret with allowed_keys restriction
+        s.put_org_secret(
+            "org_1",
+            "RESTRICTED",
+            "val",
+            None,
+            None,
+            true,
+            None,
+            Some("alice"),
+            Some(vec!["deploy-key".into(), "ci-key".into()]),
+        )
+        .unwrap();
+
+        // Secret with no restriction
+        s.put_org_secret(
+            "org_1",
+            "OPEN",
+            "val",
+            None,
+            None,
+            true,
+            None,
+            Some("alice"),
+            None,
+        )
+        .unwrap();
+
+        // Allowed key passes
+        assert!(s
+            .check_key_binding("org_1", "RESTRICTED", "deploy-key")
+            .unwrap());
+        assert!(s
+            .check_key_binding("org_1", "RESTRICTED", "ci-key")
+            .unwrap());
+
+        // Disallowed key fails
+        assert!(!s
+            .check_key_binding("org_1", "RESTRICTED", "random-key")
+            .unwrap());
+
+        // Open secret allows any key
+        assert!(s
+            .check_key_binding("org_1", "OPEN", "any-key-name")
+            .unwrap());
+
+        // Non-existent secret returns error
+        assert!(s.check_key_binding("org_1", "NOPE", "key").is_err());
+    }
+
+    #[test]
+    fn org_scoped_head_and_patch() {
+        let (s, _dir) = make_store();
+
+        s.put_org_secret(
+            "org_1",
+            "PATCHME",
+            "old",
+            None,
+            Some(5),
+            false,
+            None,
+            Some("alice"),
+            None,
+        )
+        .unwrap();
+
+        // head
+        let (meta, sealed) = s.head_org_secret("org_1", "PATCHME").unwrap().unwrap();
+        assert_eq!(meta.key, "PATCHME");
+        assert_eq!(meta.read_count, 0);
+        assert!(!sealed);
+
+        // read once
+        s.get_org_secret("org_1", "PATCHME").unwrap();
+
+        // patch
+        let meta = s
+            .patch_org_secret("org_1", "PATCHME", Some("new"), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.read_count, 0);
+
+        // verify new value
+        assert_eq!(
+            s.get_org_secret("org_1", "PATCHME").unwrap(),
+            GetResult::Value("new".into(), None)
+        );
     }
 
     #[test]
