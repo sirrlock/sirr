@@ -21,6 +21,8 @@ pub struct WebhookRegistration {
     pub secret: String,
     pub events: Vec<String>,
     pub created_at: i64,
+    #[serde(default)]
+    pub org_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

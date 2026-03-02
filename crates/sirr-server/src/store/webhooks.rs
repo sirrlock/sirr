@@ -55,4 +55,28 @@ impl super::db::Store {
         let table = read_txn.open_table(WEBHOOKS)?;
         Ok(table.len()? as usize)
     }
+
+    /// List webhooks belonging to a specific org.
+    pub fn list_webhooks_for_org(&self, org_id: &str) -> Result<Vec<WebhookRegistration>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(WEBHOOKS)?;
+
+        let mut regs = Vec::new();
+        for item in table.iter()? {
+            let (_k, v) = item?;
+            let bytes: &[u8] = v.value();
+            let (reg, _): (WebhookRegistration, _) =
+                bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+                    .context("bincode decode webhook")?;
+            if reg.org_id.as_deref() == Some(org_id) {
+                regs.push(reg);
+            }
+        }
+        Ok(regs)
+    }
+
+    /// Count webhooks belonging to a specific org.
+    pub fn count_webhooks_for_org(&self, org_id: &str) -> Result<usize> {
+        Ok(self.list_webhooks_for_org(org_id)?.len())
+    }
 }

@@ -306,11 +306,9 @@ pub async fn require_auth(
         .and_then(|v| v.strip_prefix("Bearer "));
 
     // Open mode: no admin key configured and no token provided.
-    if !has_admin_key {
-        if token.is_none() {
-            request.extensions_mut().insert(ResolvedAuth::Master);
-            return next.run(request).await;
-        }
+    if !has_admin_key && token.is_none() {
+        request.extensions_mut().insert(ResolvedAuth::Master);
+        return next.run(request).await;
     }
 
     let Some(token) = token else {
