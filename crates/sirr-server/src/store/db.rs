@@ -831,6 +831,123 @@ impl Store {
         Ok(true)
     }
 
+    // ── Role CRUD ────────────────────────────────────────────────────────
+
+    /// Build the table key for a role: "builtin:{name}" or "{org_id}:{name}".
+    fn role_table_key(org_id: Option<&str>, name: &str) -> String {
+        match org_id {
+            None => format!("builtin:{name}"),
+            Some(oid) => format!("{oid}:{name}"),
+        }
+    }
+
+    /// Insert or overwrite a role record.
+    pub fn put_role(&self, role: &super::org::RoleRecord) -> Result<()> {
+        let key = Self::role_table_key(role.org_id.as_deref(), &role.name);
+        let bytes = bincode::serde::encode_to_vec(role, bincode::config::standard())
+            .context("bincode encode role")?;
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(super::org::ROLES)?;
+            table.insert(key.as_str(), bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Retrieve a role by org_id (None = built-in) and name.
+    pub fn get_role(
+        &self,
+        org_id: Option<&str>,
+        name: &str,
+    ) -> Result<Option<super::org::RoleRecord>> {
+        let key = Self::role_table_key(org_id, name);
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(super::org::ROLES)?;
+
+        let raw: Option<Vec<u8>> = table.get(key.as_str())?.map(|g| g.value().to_vec());
+        match raw {
+            None => Ok(None),
+            Some(bytes) => {
+                let (record, _): (super::org::RoleRecord, _) =
+                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                        .context("bincode decode role")?;
+                Ok(Some(record))
+            }
+        }
+    }
+
+    /// List roles: all built-in roles + custom roles for the given org.
+    /// If org_id is None, returns only built-in roles.
+    pub fn list_roles(&self, org_id: Option<&str>) -> Result<Vec<super::org::RoleRecord>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(super::org::ROLES)?;
+
+        let builtin_prefix = "builtin:";
+        let org_prefix = org_id.map(|oid| format!("{oid}:"));
+
+        let mut roles = Vec::new();
+        for item in table.iter()? {
+            let (k, v) = item?;
+            let key_str = k.value();
+            let include = key_str.starts_with(builtin_prefix)
+                || org_prefix
+                    .as_ref()
+                    .is_some_and(|p| key_str.starts_with(p.as_str()));
+            if include {
+                let (record, _): (super::org::RoleRecord, _) =
+                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
+                        .context("bincode decode role")?;
+                roles.push(record);
+            }
+        }
+        Ok(roles)
+    }
+
+    /// Delete a role. Fails if built-in or if any principal in the org uses this role.
+    pub fn delete_role(&self, org_id: Option<&str>, name: &str) -> Result<bool> {
+        // Cannot delete built-in roles.
+        if org_id.is_none() {
+            anyhow::bail!("cannot delete built-in role \"{name}\"");
+        }
+
+        let oid = org_id.unwrap();
+
+        // Check if any principal in this org uses this role.
+        {
+            let read_txn = self.db.begin_read()?;
+            let table = read_txn.open_table(super::org::PRINCIPALS)?;
+            let prefix = format!("{oid}:");
+            for item in table.iter()? {
+                let (k, v) = item?;
+                if !k.value().starts_with(&prefix) {
+                    continue;
+                }
+                let bytes = v.value().to_vec();
+                let (principal, _): (super::org::PrincipalRecord, _) =
+                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                        .context("bincode decode principal")?;
+                if principal.role == name {
+                    anyhow::bail!(
+                        "cannot delete role \"{name}\": in use by principal \"{}\"",
+                        principal.id
+                    );
+                }
+            }
+        }
+
+        let key = Self::role_table_key(Some(oid), name);
+        let write_txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = write_txn.open_table(super::org::ROLES)?;
+            let existed = table.remove(key.as_str())?.is_some();
+            existed
+        };
+        write_txn.commit()?;
+        Ok(existed)
+    }
+
     /// Re-encrypt all non-expired records with `new_key`, tagging them with
     /// `new_key_version`. The current `self.key` is used to decrypt.
     /// Returns the number of records rotated.
@@ -1412,6 +1529,8 @@ mod tests {
         assert!(!s.delete_principal_key("p_1", "pk_1").unwrap());
     }
 
+    // ── Role CRUD tests ─────────────────────────────────────────────────
+
     #[test]
     fn builtin_roles_seeded_on_open() {
         let (store, _dir) = make_store();
@@ -1424,5 +1543,81 @@ mod tests {
                 "builtin role {name} not found"
             );
         }
+    }
+
+    #[test]
+    fn custom_role_crud() {
+        let (s, _dir) = make_store();
+
+        let role = super::super::org::RoleRecord {
+            name: "deployer".into(),
+            org_id: Some("org_1".into()),
+            permissions: super::super::permissions::Permissions::parse("rlc").unwrap(),
+            built_in: false,
+            created_at: 1700000000,
+        };
+        s.put_role(&role).unwrap();
+
+        // get
+        let fetched = s.get_role(Some("org_1"), "deployer").unwrap().unwrap();
+        assert_eq!(fetched.name, "deployer");
+        assert!(!fetched.built_in);
+
+        // list should include built-ins + custom
+        let roles = s.list_roles(Some("org_1")).unwrap();
+        let names: Vec<&str> = roles.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"reader"));
+        assert!(names.contains(&"writer"));
+        assert!(names.contains(&"admin"));
+        assert!(names.contains(&"owner"));
+        assert!(names.contains(&"deployer"));
+
+        // list with None only returns built-ins
+        let builtin_only = s.list_roles(None).unwrap();
+        assert_eq!(builtin_only.len(), 4);
+        assert!(builtin_only.iter().all(|r| r.built_in));
+
+        // delete custom role
+        assert!(s.delete_role(Some("org_1"), "deployer").unwrap());
+        assert!(s.get_role(Some("org_1"), "deployer").unwrap().is_none());
+    }
+
+    #[test]
+    fn cannot_delete_builtin_role() {
+        let (s, _dir) = make_store();
+        let err = s.delete_role(None, "admin");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("built-in"));
+    }
+
+    #[test]
+    fn cannot_delete_role_in_use() {
+        use std::collections::HashMap;
+        let (s, _dir) = make_store();
+
+        // Create custom role
+        let role = super::super::org::RoleRecord {
+            name: "tester".into(),
+            org_id: Some("org_1".into()),
+            permissions: super::super::permissions::Permissions::parse("rl").unwrap(),
+            built_in: false,
+            created_at: 1700000000,
+        };
+        s.put_role(&role).unwrap();
+
+        // Create a principal that uses this role
+        let p = super::super::org::PrincipalRecord {
+            id: "p_1".into(),
+            org_id: "org_1".into(),
+            name: "carol".into(),
+            role: "tester".into(),
+            metadata: HashMap::new(),
+            created_at: 1700000000,
+        };
+        s.put_principal(&p).unwrap();
+
+        let err = s.delete_role(Some("org_1"), "tester");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("in use"));
     }
 }
