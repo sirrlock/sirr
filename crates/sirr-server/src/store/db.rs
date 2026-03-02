@@ -631,6 +631,108 @@ impl Store {
         Ok(existed)
     }
 
+    // ── Principal CRUD ───────────────────────────────────────────────────
+
+    /// Insert or overwrite a principal record.
+    /// Compound key: "{org_id}:{principal_id}".
+    pub fn put_principal(&self, p: &super::org::PrincipalRecord) -> Result<()> {
+        let key = format!("{}:{}", p.org_id, p.id);
+        let bytes = bincode::serde::encode_to_vec(p, bincode::config::standard())
+            .context("bincode encode principal")?;
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(super::org::PRINCIPALS)?;
+            table.insert(key.as_str(), bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Retrieve a principal by org_id and principal_id.
+    pub fn get_principal(
+        &self,
+        org_id: &str,
+        principal_id: &str,
+    ) -> Result<Option<super::org::PrincipalRecord>> {
+        let key = format!("{org_id}:{principal_id}");
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(super::org::PRINCIPALS)?;
+
+        let raw: Option<Vec<u8>> = table.get(key.as_str())?.map(|g| g.value().to_vec());
+        match raw {
+            None => Ok(None),
+            Some(bytes) => {
+                let (record, _): (super::org::PrincipalRecord, _) =
+                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                        .context("bincode decode principal")?;
+                Ok(Some(record))
+            }
+        }
+    }
+
+    /// List all principals for a given org.
+    pub fn list_principals(&self, org_id: &str) -> Result<Vec<super::org::PrincipalRecord>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(super::org::PRINCIPALS)?;
+
+        let prefix = format!("{org_id}:");
+        let mut principals = Vec::new();
+        for item in table.iter()? {
+            let (k, v) = item?;
+            if !k.value().starts_with(&prefix) {
+                continue;
+            }
+            let (record, _): (super::org::PrincipalRecord, _) =
+                bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
+                    .context("bincode decode principal")?;
+            principals.push(record);
+        }
+        Ok(principals)
+    }
+
+    /// Delete a principal by org_id and principal_id. Returns true if it existed.
+    /// Fails if the principal has active (unexpired) keys.
+    pub fn delete_principal(&self, org_id: &str, principal_id: &str) -> Result<bool> {
+        let now = Self::now();
+
+        // Check for active keys in PRINCIPAL_KEY_IX with prefix "{principal_id}:"
+        {
+            let read_txn = self.db.begin_read()?;
+            let ix_table = read_txn.open_table(super::org::PRINCIPAL_KEY_IX)?;
+            let keys_table = read_txn.open_table(super::org::PRINCIPAL_KEYS)?;
+            let prefix = format!("{principal_id}:");
+
+            for item in ix_table.iter()? {
+                let (k, v) = item?;
+                if !k.value().starts_with(&prefix) {
+                    continue;
+                }
+                // Look up the key record to check valid_before
+                let hash = v.value().to_vec();
+                if let Some(key_guard) = keys_table.get(hash.as_slice())? {
+                    let key_bytes = key_guard.value().to_vec();
+                    let (key_record, _): (super::org::PrincipalKeyRecord, _) =
+                        bincode::serde::decode_from_slice(&key_bytes, bincode::config::standard())
+                            .context("bincode decode principal key")?;
+                    if key_record.valid_before > now {
+                        anyhow::bail!("cannot delete principal {principal_id}: has active keys");
+                    }
+                }
+            }
+        }
+
+        let compound_key = format!("{org_id}:{principal_id}");
+        let write_txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = write_txn.open_table(super::org::PRINCIPALS)?;
+            let existed = table.remove(compound_key.as_str())?.is_some();
+            existed
+        };
+        write_txn.commit()?;
+        Ok(existed)
+    }
+
     /// Re-encrypt all non-expired records with `new_key`, tagging them with
     /// `new_key_version`. The current `self.key` is used to decrypt.
     /// Returns the number of records rotated.
@@ -1046,6 +1148,127 @@ mod tests {
 
         // delete non-existent returns false
         assert!(!s.delete_org("org_1").unwrap());
+    }
+
+    #[test]
+    fn delete_org_blocked_by_principals() {
+        use std::collections::HashMap;
+        let (s, _dir) = make_store();
+
+        let org = super::super::org::OrgRecord {
+            id: "org_2".into(),
+            name: "Test".into(),
+            metadata: HashMap::new(),
+            created_at: 1700000000,
+        };
+        s.put_org(&org).unwrap();
+
+        let principal = super::super::org::PrincipalRecord {
+            id: "p_1".into(),
+            org_id: "org_2".into(),
+            name: "alice".into(),
+            role: "admin".into(),
+            metadata: HashMap::new(),
+            created_at: 1700000000,
+        };
+        s.put_principal(&principal).unwrap();
+
+        let err = s.delete_org("org_2");
+        assert!(err.is_err());
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("still has principals"));
+    }
+
+    // ── Principal CRUD tests ────────────────────────────────────────────
+
+    #[test]
+    fn principal_crud() {
+        use std::collections::HashMap;
+        let (s, _dir) = make_store();
+
+        let p = super::super::org::PrincipalRecord {
+            id: "p_1".into(),
+            org_id: "org_1".into(),
+            name: "alice".into(),
+            role: "admin".into(),
+            metadata: HashMap::new(),
+            created_at: 1700000000,
+        };
+        s.put_principal(&p).unwrap();
+
+        // get
+        let fetched = s.get_principal("org_1", "p_1").unwrap().unwrap();
+        assert_eq!(fetched.id, "p_1");
+        assert_eq!(fetched.org_id, "org_1");
+        assert_eq!(fetched.name, "alice");
+
+        // list
+        let principals = s.list_principals("org_1").unwrap();
+        assert_eq!(principals.len(), 1);
+
+        // list for different org returns empty
+        assert!(s.list_principals("org_other").unwrap().is_empty());
+
+        // delete
+        assert!(s.delete_principal("org_1", "p_1").unwrap());
+
+        // verify gone
+        assert!(s.get_principal("org_1", "p_1").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_principal_blocked_by_active_keys() {
+        use std::collections::HashMap;
+        let (s, _dir) = make_store();
+
+        let p = super::super::org::PrincipalRecord {
+            id: "p_2".into(),
+            org_id: "org_1".into(),
+            name: "bob".into(),
+            role: "writer".into(),
+            metadata: HashMap::new(),
+            created_at: 1700000000,
+        };
+        s.put_principal(&p).unwrap();
+
+        // Create an unexpired key (valid_before far in the future)
+        let key = super::super::org::PrincipalKeyRecord {
+            id: "pk_1".into(),
+            principal_id: "p_2".into(),
+            org_id: "org_1".into(),
+            name: "default".into(),
+            key_hash: vec![0xAA; 32],
+            valid_after: 1700000000,
+            valid_before: 9999999999,
+            created_at: 1700000000,
+        };
+        // Manually insert the key into both tables so delete_principal can find it
+        {
+            let bytes = bincode::serde::encode_to_vec(&key, bincode::config::standard()).unwrap();
+            let ix_key = format!("{}:{}", key.principal_id, key.id);
+            let write_txn = s.db.begin_write().unwrap();
+            {
+                let mut keys_table = write_txn
+                    .open_table(super::super::org::PRINCIPAL_KEYS)
+                    .unwrap();
+                keys_table
+                    .insert(key.key_hash.as_slice(), bytes.as_slice())
+                    .unwrap();
+                let mut ix_table = write_txn
+                    .open_table(super::super::org::PRINCIPAL_KEY_IX)
+                    .unwrap();
+                ix_table
+                    .insert(ix_key.as_str(), key.key_hash.as_slice())
+                    .unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let err = s.delete_principal("org_1", "p_2");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("has active keys"));
     }
 
     #[test]
