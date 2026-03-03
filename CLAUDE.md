@@ -80,7 +80,7 @@ key + per-record nonce --ChaCha20Poly1305--> encrypted value stored in redb
 ## Key Constraints
 
 - `AccessGuard` from redb borrows the table immutably. Always `.to_vec()` the bytes before any mutation on the same table.
-- License tiers are now org/principal-count based (Solo: 1 org / 3 principals, Team: 5 / 25, Business: unlimited). Free tier = Solo.
+- License tiers are now org/principal-count based (Solo: 1 org / 1 principal, Solo+: 1 / 5, Team: 1 / unlimited, Business: unlimited / unlimited). Free tier = Solo.
 - `delete` flag on SecretRecord: `true` (default) = burn on max_reads, `false` = seal (block reads, allow PATCH). PATCH only works on `delete=false` secrets.
 - `Store::get()` returns `GetResult` enum: `Value(String)`, `Sealed`, or `NotFound` — handler maps to 200, 410, 404.
 - Encryption key is a random 32-byte key stored as `sirr.key` (no more Argon2id derivation).
