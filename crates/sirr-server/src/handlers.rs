@@ -183,12 +183,11 @@ pub struct CreateResponse {
 
 pub async fn create_secret(
     State(state): State<AppState>,
-    Extension(_auth): Extension<ResolvedAuth>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<CreateRequest>,
 ) -> Response {
-    // Auth is handled by require_master_key middleware.
+    // Public bucket: no auth required — the secret key itself is the access token.
     let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
 
     if !validate_key_name(&body.key) {

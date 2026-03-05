@@ -409,18 +409,20 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
 
     // Build the merged app depending on whether the public bucket is enabled.
     let app = if enable_public_bucket {
-        // Secret-read routes carry NO CORS layer intentionally.
+        // Public bucket open routes: reads and creates carry NO CORS layer intentionally.
         // Without Access-Control-Allow-Origin, browsers block cross-origin reads,
         // preventing a malicious webpage from silently exfiltrating secrets.
         // Non-browser clients (sirr CLI, curl) are unaffected.
-        let secret_read = Router::new()
+        // POST /secrets is also open: the secret key itself is the access token,
+        // so writes don't require the master key any more than reads do.
+        let secret_public = Router::new()
+            .route("/secrets", post(create_secret))
             .route("/secrets/{key}", get(get_secret))
             .route("/secrets/{key}", head(head_secret));
 
         // Protected public bucket routes (require_master_key middleware).
         let protected_public_bucket = Router::new()
             .route("/secrets", get(list_secrets))
-            .route("/secrets", post(create_secret))
             .route("/secrets/{key}", patch(patch_secret))
             .route("/secrets/{key}", delete(delete_secret))
             .route("/prune", post(prune_secrets))
@@ -435,7 +437,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
             .layer(cors);
 
         Router::new()
-            .merge(secret_read)
+            .merge(secret_public)
             .merge(public)
             .merge(protected_public_bucket)
             .merge(org_protected)
