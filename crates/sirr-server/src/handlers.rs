@@ -11,14 +11,13 @@ use serde_json::json;
 use tracing::info;
 
 use crate::{
-    auth::ResolvedPermissions,
-    license::{LicenseStatus, FREE_TIER_LIMIT},
+    auth::ResolvedAuth,
+    license::LicenseStatus,
     store::{
-        api_keys::{self, Permission},
         audit::{
-            AuditEvent, ACTION_KEY_CREATE, ACTION_KEY_DELETE, ACTION_SECRET_BURNED,
-            ACTION_SECRET_CREATE, ACTION_SECRET_DELETE, ACTION_SECRET_LIST, ACTION_SECRET_PATCH,
-            ACTION_SECRET_PRUNE, ACTION_SECRET_READ, ACTION_WEBHOOK_CREATE, ACTION_WEBHOOK_DELETE,
+            AuditEvent, ACTION_SECRET_BURNED, ACTION_SECRET_CREATE, ACTION_SECRET_DELETE,
+            ACTION_SECRET_LIST, ACTION_SECRET_PATCH, ACTION_SECRET_PRUNE, ACTION_SECRET_READ,
+            ACTION_WEBHOOK_CREATE, ACTION_WEBHOOK_DELETE,
         },
         AuditQuery, GetResult,
     },
@@ -51,16 +50,6 @@ fn bad_key_name() -> Response {
     (
         StatusCode::BAD_REQUEST,
         Json(json!({"error": "key must be 1–256 characters: alphanumeric, -, _, . only"})),
-    )
-        .into_response()
-}
-
-// ── Permission helpers ───────────────────────────────────────────────────────
-
-fn forbidden() -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(json!({"error": "insufficient permissions"})),
     )
         .into_response()
 }
@@ -112,18 +101,17 @@ pub struct AuditQueryParams {
 
 pub async fn audit_events(
     State(state): State<AppState>,
-    Extension(perms): Extension<ResolvedPermissions>,
+    Extension(_auth): Extension<ResolvedAuth>,
     Query(params): Query<AuditQueryParams>,
 ) -> Response {
-    if !perms.can_admin() {
-        return forbidden();
-    }
+    // Auth is handled by require_master_key middleware.
     let limit = params.limit.unwrap_or(100).min(1000);
     let query = AuditQuery {
         since: params.since,
         until: params.until,
         action: params.action,
         limit,
+        org_id: None,
     };
     match state.store.list_audit(&query) {
         Ok(events) => {
@@ -152,13 +140,11 @@ pub async fn audit_events(
 
 pub async fn list_secrets(
     State(state): State<AppState>,
-    Extension(perms): Extension<ResolvedPermissions>,
+    Extension(_auth): Extension<ResolvedAuth>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
-    if !perms.can_read() {
-        return forbidden();
-    }
+    // Auth is handled by require_master_key middleware.
     let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
     match state.store.list() {
         Ok(metas) => {
@@ -169,6 +155,8 @@ pub async fn list_secrets(
                 ip,
                 true,
                 Some(format!("count={}", metas.len())),
+                None,
+                None,
             ));
             Json(json!({ "secrets": metas })).into_response()
         }
@@ -195,14 +183,11 @@ pub struct CreateResponse {
 
 pub async fn create_secret(
     State(state): State<AppState>,
-    Extension(perms): Extension<ResolvedPermissions>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<CreateRequest>,
 ) -> Response {
-    if !perms.can_write() || !perms.matches_prefix(&body.key) {
-        return forbidden();
-    }
+    // Public bucket: no auth required — the secret key itself is the access token.
     let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
 
     if !validate_key_name(&body.key) {
@@ -241,55 +226,7 @@ pub async fn create_secret(
         }
     }
 
-    // License check: free tier capped at FREE_TIER_LIMIT active secrets.
-    // Licensed users are validated online when exceeding the free tier threshold.
-    match state.store.list() {
-        Ok(metas) if metas.len() >= FREE_TIER_LIMIT => {
-            if state.license == LicenseStatus::Free {
-                let _ = state.store.record_audit(AuditEvent::new(
-                    ACTION_SECRET_CREATE,
-                    Some(body.key.clone()),
-                    ip,
-                    false,
-                    Some("free tier limit reached".into()),
-                ));
-                return (
-                    StatusCode::PAYMENT_REQUIRED,
-                    Json(json!({
-                        "error": format!(
-                            "free tier limit of {FREE_TIER_LIMIT} secrets reached — \
-                             add SIRR_LICENSE_KEY to continue. \
-                             Get a license at https://sirrlock.com/pricing"
-                        )
-                    })),
-                )
-                    .into_response();
-            }
-
-            // Licensed — verify online if a validator is configured.
-            if let Some(ref validator) = state.validator {
-                if !validator.is_valid(&state.store).await {
-                    let _ = state.store.record_audit(AuditEvent::new(
-                        ACTION_SECRET_CREATE,
-                        Some(body.key.clone()),
-                        ip,
-                        false,
-                        Some("license validation failed".into()),
-                    ));
-                    return (
-                        StatusCode::PAYMENT_REQUIRED,
-                        Json(json!({
-                            "error": "license validation failed — \
-                                      please check your SIRR_LICENSE_KEY or contact support"
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-        }
-        Err(e) => return internal_error(e),
-        _ => {}
-    }
+    // Licensing is now enforced at org/principal creation, not per-secret.
 
     match state.store.put(
         &body.key,
@@ -311,6 +248,8 @@ pub async fn create_secret(
                 Some(body.key.clone()),
                 ip,
                 true,
+                None,
+                None,
                 None,
             ));
             if let Some(ref sender) = state.webhook_sender {
@@ -342,6 +281,8 @@ pub async fn get_secret(
                 ip,
                 true,
                 None,
+                None,
+                None,
             ));
             if let Some(ref sender) = state.webhook_sender {
                 sender.fire("secret.read", &key, json!({}));
@@ -357,6 +298,8 @@ pub async fn get_secret(
                 Some(key.clone()),
                 ip,
                 true,
+                None,
+                None,
                 None,
             ));
             if let Some(ref sender) = state.webhook_sender {
@@ -374,6 +317,8 @@ pub async fn get_secret(
                 ip,
                 false,
                 Some("sealed".into()),
+                None,
+                None,
             ));
             (
                 StatusCode::GONE,
@@ -388,6 +333,8 @@ pub async fn get_secret(
                 ip,
                 false,
                 Some("not found or expired".into()),
+                None,
+                None,
             ));
             (
                 StatusCode::NOT_FOUND,
@@ -420,6 +367,8 @@ pub async fn head_secret(
                 ip,
                 true,
                 Some(detail.into()),
+                None,
+                None,
             ));
 
             let status = if sealed {
@@ -459,6 +408,8 @@ pub async fn head_secret(
                 ip,
                 false,
                 Some("head;not found or expired".into()),
+                None,
+                None,
             ));
             (
                 StatusCode::NOT_FOUND,
@@ -481,17 +432,15 @@ pub struct PatchRequest {
 
 pub async fn patch_secret(
     State(state): State<AppState>,
-    Extension(perms): Extension<ResolvedPermissions>,
+    Extension(_auth): Extension<ResolvedAuth>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(key): Path<String>,
     Json(body): Json<PatchRequest>,
 ) -> Response {
+    // Auth is handled by require_master_key middleware.
     if !validate_key_name(&key) {
         return bad_key_name();
-    }
-    if !perms.can_write() || !perms.matches_prefix(&key) {
-        return forbidden();
     }
     if body.max_reads == Some(0) {
         return (
@@ -534,6 +483,8 @@ pub async fn patch_secret(
                 ip,
                 true,
                 None,
+                None,
+                None,
             ));
             Json(meta).into_response()
         }
@@ -544,6 +495,8 @@ pub async fn patch_secret(
                 ip,
                 false,
                 Some("not found or expired".into()),
+                None,
+                None,
             ));
             (
                 StatusCode::NOT_FOUND,
@@ -560,6 +513,8 @@ pub async fn patch_secret(
                     ip,
                     false,
                     Some("conflict: delete=true".into()),
+                    None,
+                    None,
                 ));
                 (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response()
             } else if msg.starts_with("sealed:") {
@@ -569,6 +524,8 @@ pub async fn patch_secret(
                     ip,
                     false,
                     Some("gone: secret read limit exhausted".into()),
+                    None,
+                    None,
                 ));
                 (
                     StatusCode::GONE,
@@ -586,16 +543,14 @@ pub async fn patch_secret(
 
 pub async fn delete_secret(
     State(state): State<AppState>,
-    Extension(perms): Extension<ResolvedPermissions>,
+    Extension(_auth): Extension<ResolvedAuth>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(key): Path<String>,
 ) -> Response {
+    // Auth is handled by require_master_key middleware.
     if !validate_key_name(&key) {
         return bad_key_name();
-    }
-    if !perms.can_delete() || !perms.matches_prefix(&key) {
-        return forbidden();
     }
     let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
     match state.store.delete(&key) {
@@ -606,6 +561,8 @@ pub async fn delete_secret(
                 Some(key.clone()),
                 ip,
                 true,
+                None,
+                None,
                 None,
             ));
             if let Some(ref sender) = state.webhook_sender {
@@ -621,6 +578,8 @@ pub async fn delete_secret(
                 ip,
                 false,
                 Some("not found".into()),
+                None,
+                None,
             ));
             (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
         }
@@ -632,13 +591,11 @@ pub async fn delete_secret(
 
 pub async fn prune_secrets(
     State(state): State<AppState>,
-    Extension(perms): Extension<ResolvedPermissions>,
+    Extension(_auth): Extension<ResolvedAuth>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
-    if !perms.can_admin() {
-        return forbidden();
-    }
+    // Auth is handled by require_master_key middleware.
     let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
     match state.store.prune() {
         Ok(pruned_keys) => {
@@ -650,6 +607,8 @@ pub async fn prune_secrets(
                 ip,
                 true,
                 Some(format!("pruned={n}")),
+                None,
+                None,
             ));
             if let Some(ref sender) = state.webhook_sender {
                 for key in &pruned_keys {
@@ -672,14 +631,12 @@ pub struct CreateWebhookRequest {
 
 pub async fn create_webhook(
     State(state): State<AppState>,
-    Extension(perms): Extension<ResolvedPermissions>,
+    Extension(_auth): Extension<ResolvedAuth>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<CreateWebhookRequest>,
 ) -> Response {
-    if !perms.can_admin() {
-        return forbidden();
-    }
+    // Auth is handled by require_master_key middleware.
     let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
 
     // License gate: free tier gets 0 webhooks.
@@ -726,6 +683,7 @@ pub async fn create_webhook(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64,
+        org_id: None,
     };
 
     match state.store.put_webhook(&reg) {
@@ -736,6 +694,8 @@ pub async fn create_webhook(
                 ip,
                 true,
                 Some(format!("id={id}")),
+                None,
+                None,
             ));
             (
                 StatusCode::CREATED,
@@ -749,11 +709,9 @@ pub async fn create_webhook(
 
 pub async fn list_webhooks(
     State(state): State<AppState>,
-    Extension(perms): Extension<ResolvedPermissions>,
+    Extension(_auth): Extension<ResolvedAuth>,
 ) -> Response {
-    if !perms.can_admin() {
-        return forbidden();
-    }
+    // Auth is handled by require_master_key middleware.
     match state.store.list_webhooks() {
         Ok(regs) => {
             // Redact signing secrets in the response.
@@ -776,14 +734,12 @@ pub async fn list_webhooks(
 
 pub async fn delete_webhook(
     State(state): State<AppState>,
-    Extension(perms): Extension<ResolvedPermissions>,
+    Extension(_auth): Extension<ResolvedAuth>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(id): Path<String>,
 ) -> Response {
-    if !perms.can_admin() {
-        return forbidden();
-    }
+    // Auth is handled by require_master_key middleware.
     let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
     match state.store.delete_webhook(&id) {
         Ok(true) => {
@@ -793,6 +749,8 @@ pub async fn delete_webhook(
                 ip,
                 true,
                 Some(format!("id={id}")),
+                None,
+                None,
             ));
             Json(json!({"deleted": true})).into_response()
         }
@@ -806,143 +764,6 @@ pub async fn delete_webhook(
 }
 
 // ── API Keys ──────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-pub struct CreateApiKeyRequest {
-    pub label: String,
-    pub permissions: Vec<String>,
-    pub prefix: Option<String>,
-}
-
-pub async fn create_api_key(
-    State(state): State<AppState>,
-    Extension(perms): Extension<ResolvedPermissions>,
-    headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Json(body): Json<CreateApiKeyRequest>,
-) -> Response {
-    if !perms.can_admin() {
-        return forbidden();
-    }
-    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
-
-    // Parse permissions.
-    let parsed_perms: Vec<Permission> = body
-        .permissions
-        .iter()
-        .filter_map(|s| Permission::parse(s))
-        .collect();
-
-    if parsed_perms.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "at least one valid permission required (read, write, delete, admin)"})),
-        )
-            .into_response();
-    }
-
-    let raw_key = api_keys::generate_api_key();
-    let key_hash = api_keys::hash_key(&raw_key);
-    let id = api_keys::generate_key_id();
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    let record = crate::store::ApiKeyRecord {
-        id: id.clone(),
-        key_hash,
-        label: body.label.clone(),
-        permissions: parsed_perms,
-        prefix: body.prefix.clone(),
-        created_at: now,
-    };
-
-    match state.store.put_api_key(&record) {
-        Ok(()) => {
-            let _ = state.store.record_audit(AuditEvent::new(
-                ACTION_KEY_CREATE,
-                None,
-                ip,
-                true,
-                Some(format!("id={id}")),
-            ));
-            let perm_strs: Vec<&str> = record.permissions.iter().map(|p| p.as_str()).collect();
-            (
-                StatusCode::CREATED,
-                Json(json!({
-                    "id": id,
-                    "key": raw_key,
-                    "label": record.label,
-                    "permissions": perm_strs,
-                    "prefix": record.prefix,
-                })),
-            )
-                .into_response()
-        }
-        Err(e) => internal_error(e),
-    }
-}
-
-pub async fn list_api_keys(
-    State(state): State<AppState>,
-    Extension(perms): Extension<ResolvedPermissions>,
-) -> Response {
-    if !perms.can_admin() {
-        return forbidden();
-    }
-    match state.store.list_api_keys() {
-        Ok(records) => {
-            let keys: Vec<_> = records
-                .iter()
-                .map(|r| {
-                    let perm_strs: Vec<&str> = r.permissions.iter().map(|p| p.as_str()).collect();
-                    json!({
-                        "id": r.id,
-                        "label": r.label,
-                        "permissions": perm_strs,
-                        "prefix": r.prefix,
-                        "created_at": r.created_at,
-                    })
-                })
-                .collect();
-            Json(json!({"keys": keys})).into_response()
-        }
-        Err(e) => internal_error(e),
-    }
-}
-
-pub async fn delete_api_key(
-    State(state): State<AppState>,
-    Extension(perms): Extension<ResolvedPermissions>,
-    headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Path(id): Path<String>,
-) -> Response {
-    if !perms.can_admin() {
-        return forbidden();
-    }
-    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
-    match state.store.delete_api_key(&id) {
-        Ok(true) => {
-            let _ = state.store.record_audit(AuditEvent::new(
-                ACTION_KEY_DELETE,
-                None,
-                ip,
-                true,
-                Some(format!("id={id}")),
-            ));
-            Json(json!({"deleted": true})).into_response()
-        }
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "api key not found"})),
-        )
-            .into_response(),
-        Err(e) => internal_error(e),
-    }
-}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

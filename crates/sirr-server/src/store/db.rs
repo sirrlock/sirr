@@ -61,8 +61,33 @@ impl Store {
         write_txn.open_table(AUDIT_LOG)?;
         write_txn.open_table(COUNTERS)?;
         write_txn.open_table(super::webhooks::WEBHOOKS)?;
-        write_txn.open_table(super::api_keys::API_KEYS)?;
+        // Legacy api_keys table: kept so existing databases don't lose the table on open.
+        const LEGACY_API_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("api_keys");
+        write_txn.open_table(LEGACY_API_KEYS)?;
+        write_txn.open_table(super::org::ORGS)?;
+        write_txn.open_table(super::org::PRINCIPALS)?;
+        write_txn.open_table(super::org::PRINCIPAL_KEYS)?;
+        write_txn.open_table(super::org::PRINCIPAL_KEY_IX)?;
+        write_txn.open_table(super::org::ROLES)?;
         write_txn.commit()?;
+
+        // Seed built-in roles (idempotent).
+        {
+            let write_txn = db.begin_write()?;
+            {
+                let mut table = write_txn.open_table(super::org::ROLES)?;
+                for role in super::org::builtin_roles() {
+                    let key = format!("builtin:{}", role.name);
+                    if table.get(key.as_str())?.is_none() {
+                        let bytes =
+                            bincode::serde::encode_to_vec(&role, bincode::config::standard())
+                                .context("encode builtin role")?;
+                        table.insert(key.as_str(), bytes.as_slice())?;
+                    }
+                }
+            }
+            write_txn.commit()?;
+        }
 
         Ok(Self {
             db: Arc::new(db),
@@ -107,6 +132,9 @@ impl Store {
             read_count: 0,
             delete,
             webhook_url,
+            owner_id: None,
+            org_id: None,
+            allowed_keys: None,
         };
 
         let bytes = encode(&record, self.key_version)?;
@@ -126,6 +154,12 @@ impl Store {
     /// Returns `GetResult::Sealed` if the secret exists but reads are exhausted (delete=false).
     /// Returns `GetResult::Value(value)` on success.
     pub fn get(&self, secret_key: &str) -> Result<GetResult> {
+        self.get_by_table_key(secret_key)
+    }
+
+    /// Internal helper that performs the get-and-increment logic for any table key.
+    /// Both public-bucket `get()` and org-scoped `get_org_secret()` delegate here.
+    fn get_by_table_key(&self, table_key: &str) -> Result<GetResult> {
         let now = Self::now();
 
         // We need a write transaction to atomically increment read_count.
@@ -136,7 +170,7 @@ impl Store {
             // Read the raw bytes and immediately clone them so the AccessGuard
             // (which borrows `table`) is dropped before any mutation.
             let raw_bytes: Option<Vec<u8>> =
-                table.get(secret_key)?.map(|guard| guard.value().to_vec());
+                table.get(table_key)?.map(|guard| guard.value().to_vec());
 
             match raw_bytes {
                 None => GetResult::NotFound,
@@ -144,8 +178,8 @@ impl Store {
                     let (mut record, record_key_version) = decode(&bytes)?;
 
                     if record.is_expired(now) {
-                        table.remove(secret_key)?;
-                        debug!(key = %secret_key, "lazy-evicted expired secret");
+                        table.remove(table_key)?;
+                        debug!(key = %table_key, "lazy-evicted expired secret");
                         GetResult::NotFound
                     } else if record.is_sealed() {
                         GetResult::Sealed
@@ -164,12 +198,12 @@ impl Store {
 
                         let webhook_url = record.webhook_url.clone();
                         if record.is_burned() {
-                            table.remove(secret_key)?;
-                            debug!(key = %secret_key, "burned after final read");
+                            table.remove(table_key)?;
+                            debug!(key = %table_key, "burned after final read");
                             GetResult::Burned(value, webhook_url)
                         } else {
                             let updated = encode(&record, record_key_version)?;
-                            table.insert(secret_key, updated.as_slice())?;
+                            table.insert(table_key, updated.as_slice())?;
                             GetResult::Value(value, webhook_url)
                         }
                     }
@@ -211,6 +245,8 @@ impl Store {
                     max_reads: record.max_reads,
                     read_count: record.read_count,
                     delete: record.delete,
+                    owner_id: record.owner_id.clone(),
+                    org_id: record.org_id.clone(),
                 });
             }
         }
@@ -259,11 +295,21 @@ impl Store {
     /// Retrieve metadata for a secret without incrementing read_count.
     /// Returns (meta, is_sealed). Returns None if not found or TTL-expired.
     pub fn head(&self, secret_key: &str) -> Result<Option<(SecretMeta, bool)>> {
+        self.head_by_table_key(secret_key, secret_key)
+    }
+
+    /// Internal helper for head logic. `table_key` is the key in SECRETS,
+    /// `display_key` is the key to use in the returned SecretMeta.
+    fn head_by_table_key(
+        &self,
+        table_key: &str,
+        display_key: &str,
+    ) -> Result<Option<(SecretMeta, bool)>> {
         let now = Self::now();
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(SECRETS)?;
 
-        let raw_bytes: Option<Vec<u8>> = table.get(secret_key)?.map(|guard| guard.value().to_vec());
+        let raw_bytes: Option<Vec<u8>> = table.get(table_key)?.map(|guard| guard.value().to_vec());
 
         match raw_bytes {
             None => Ok(None),
@@ -275,12 +321,14 @@ impl Store {
                 let sealed = record.is_sealed();
                 Ok(Some((
                     SecretMeta {
-                        key: secret_key.to_owned(),
+                        key: display_key.to_owned(),
                         created_at: record.created_at,
                         expires_at: record.expires_at,
                         max_reads: record.max_reads,
                         read_count: record.read_count,
                         delete: record.delete,
+                        owner_id: record.owner_id.clone(),
+                        org_id: record.org_id.clone(),
                     },
                     sealed,
                 )))
@@ -356,12 +404,290 @@ impl Store {
                         max_reads: record.max_reads,
                         read_count: 0,
                         delete: record.delete,
+                        owner_id: record.owner_id.clone(),
+                        org_id: record.org_id.clone(),
                     }))
                 }
             }
         };
         write_txn.commit()?;
         result
+    }
+
+    // ── Org-scoped secret methods ───────────────────────────────────────
+
+    /// Build the compound table key for an org-scoped secret: "{org_id}:{key}".
+    fn org_secret_key(org_id: &str, key: &str) -> String {
+        format!("{org_id}:{key}")
+    }
+
+    /// Insert or overwrite an org-scoped secret.
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_org_secret(
+        &self,
+        org_id: &str,
+        key: &str,
+        value: &str,
+        expires_at: Option<i64>,
+        max_reads: Option<u32>,
+        delete: bool,
+        webhook_url: Option<String>,
+        owner_id: Option<&str>,
+        allowed_keys: Option<Vec<String>>,
+    ) -> Result<()> {
+        let now = Self::now();
+
+        let (value_encrypted, nonce) =
+            super::crypto::encrypt(&self.key, value.as_bytes()).context("encrypt value")?;
+
+        let record = SecretRecord {
+            value_encrypted,
+            nonce,
+            created_at: now,
+            expires_at,
+            max_reads,
+            read_count: 0,
+            delete,
+            webhook_url,
+            owner_id: owner_id.map(|s| s.to_owned()),
+            org_id: Some(org_id.to_owned()),
+            allowed_keys,
+        };
+
+        let table_key = Self::org_secret_key(org_id, key);
+        let bytes = encode(&record, self.key_version)?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(SECRETS)?;
+            table.insert(table_key.as_str(), bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+
+        debug!(org_id = %org_id, key = %key, "stored org-scoped secret");
+        Ok(())
+    }
+
+    /// Retrieve an org-scoped secret, incrementing its read counter.
+    pub fn get_org_secret(&self, org_id: &str, key: &str) -> Result<GetResult> {
+        let table_key = Self::org_secret_key(org_id, key);
+        self.get_by_table_key(&table_key)
+    }
+
+    /// Retrieve metadata for an org-scoped secret without incrementing read_count.
+    pub fn head_org_secret(&self, org_id: &str, key: &str) -> Result<Option<(SecretMeta, bool)>> {
+        let table_key = Self::org_secret_key(org_id, key);
+        self.head_by_table_key(&table_key, key)
+    }
+
+    /// Delete an org-scoped secret. Returns true if it existed.
+    pub fn delete_org_secret(&self, org_id: &str, key: &str) -> Result<bool> {
+        let table_key = Self::org_secret_key(org_id, key);
+        let write_txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = write_txn.open_table(SECRETS)?;
+            let existed = table.remove(table_key.as_str())?.is_some();
+            existed
+        };
+        write_txn.commit()?;
+        Ok(existed)
+    }
+
+    /// List metadata for all non-expired secrets belonging to an org.
+    /// Optionally filter by `owner_id`.
+    pub fn list_org_secrets(
+        &self,
+        org_id: &str,
+        owner_id: Option<&str>,
+    ) -> Result<Vec<SecretMeta>> {
+        let now = Self::now();
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SECRETS)?;
+
+        let prefix = format!("{org_id}:");
+        let mut metas = Vec::new();
+        for item in table.iter()? {
+            let (k, v) = item?;
+            let key_str = k.value();
+            if !key_str.starts_with(&prefix) {
+                continue;
+            }
+            let (record, _kv) = decode(v.value())?;
+            if record.is_expired(now) {
+                continue;
+            }
+            // Filter by owner if requested.
+            if let Some(filter_owner) = owner_id {
+                if record.owner_id.as_deref() != Some(filter_owner) {
+                    continue;
+                }
+            }
+            // Strip the prefix from the display key.
+            let display_key = &key_str[prefix.len()..];
+            metas.push(SecretMeta {
+                key: display_key.to_owned(),
+                created_at: record.created_at,
+                expires_at: record.expires_at,
+                max_reads: record.max_reads,
+                read_count: record.read_count,
+                delete: record.delete,
+                owner_id: record.owner_id.clone(),
+                org_id: record.org_id.clone(),
+            });
+        }
+        Ok(metas)
+    }
+
+    /// Check if a principal key is allowed to access an org-scoped secret.
+    /// Returns `true` if the secret has no `allowed_keys` restriction (open access)
+    /// or if `key_name` is in the allowed list.
+    /// Returns `Err` if the secret is not found or expired.
+    pub fn check_key_binding(&self, org_id: &str, key: &str, key_name: &str) -> Result<bool> {
+        let table_key = Self::org_secret_key(org_id, key);
+        let now = Self::now();
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SECRETS)?;
+
+        let raw_bytes: Option<Vec<u8>> = table.get(table_key.as_str())?.map(|g| g.value().to_vec());
+
+        match raw_bytes {
+            None => anyhow::bail!("secret not found"),
+            Some(bytes) => {
+                let (record, _kv) = decode(&bytes)?;
+                if record.is_expired(now) {
+                    anyhow::bail!("secret not found");
+                }
+                match &record.allowed_keys {
+                    None => Ok(true),                                // no restriction
+                    Some(allowed) if allowed.is_empty() => Ok(true), // empty = no restriction
+                    Some(allowed) => Ok(allowed.iter().any(|k| k == key_name)),
+                }
+            }
+        }
+    }
+
+    /// Update an existing org-scoped secret (only if delete=false).
+    /// Resets read_count to 0. Returns updated metadata.
+    pub fn patch_org_secret(
+        &self,
+        org_id: &str,
+        key: &str,
+        new_value: Option<&str>,
+        new_max_reads: Option<u32>,
+        new_expires_at: Option<i64>,
+    ) -> Result<Option<SecretMeta>> {
+        let table_key = Self::org_secret_key(org_id, key);
+        let now = Self::now();
+
+        let write_txn = self.db.begin_write()?;
+        let result = {
+            let mut table = write_txn.open_table(SECRETS)?;
+
+            let raw_bytes: Option<Vec<u8>> = table
+                .get(table_key.as_str())?
+                .map(|guard| guard.value().to_vec());
+
+            match raw_bytes {
+                None => Ok(None),
+                Some(bytes) => {
+                    let (mut record, record_key_version) = decode(&bytes)?;
+
+                    if record.is_expired(now) {
+                        table.remove(table_key.as_str())?;
+                        return Ok(None);
+                    }
+
+                    if record.delete {
+                        anyhow::bail!("cannot patch a secret with delete=true");
+                    }
+
+                    if record.is_sealed() {
+                        anyhow::bail!("sealed: secret read limit exhausted");
+                    }
+
+                    if let Some(val) = new_value {
+                        let (encrypted, nonce) = super::crypto::encrypt(&self.key, val.as_bytes())
+                            .context("encrypt patched value")?;
+                        record.value_encrypted = encrypted;
+                        record.nonce = nonce;
+                    }
+
+                    if let Some(max) = new_max_reads {
+                        record.max_reads = Some(max);
+                    }
+
+                    if let Some(exp) = new_expires_at {
+                        record.expires_at = Some(exp);
+                    }
+
+                    record.read_count = 0;
+
+                    let updated = encode(&record, record_key_version)?;
+                    table.insert(table_key.as_str(), updated.as_slice())?;
+
+                    Ok(Some(SecretMeta {
+                        key: key.to_owned(),
+                        created_at: record.created_at,
+                        expires_at: record.expires_at,
+                        max_reads: record.max_reads,
+                        read_count: 0,
+                        delete: record.delete,
+                        owner_id: record.owner_id.clone(),
+                        org_id: record.org_id.clone(),
+                    }))
+                }
+            }
+        };
+        write_txn.commit()?;
+        result
+    }
+
+    /// Prune expired/burned secrets scoped to a specific org. Returns pruned key names.
+    pub fn prune_org_secrets(&self, org_id: &str) -> Result<Vec<String>> {
+        let now = Self::now();
+        let prefix = format!("{org_id}:");
+
+        let expired_keys: Vec<String> = {
+            let read_txn = self.db.begin_read()?;
+            let table = read_txn.open_table(SECRETS)?;
+            let mut keys = Vec::new();
+            for item in table.iter()? {
+                let (k, v) = item?;
+                let key_str = k.value();
+                if !key_str.starts_with(&prefix) {
+                    continue;
+                }
+                let (record, _kv) = decode(v.value())?;
+                if record.is_expired(now) || record.is_burned() {
+                    keys.push(key_str.to_owned());
+                }
+            }
+            keys
+        };
+
+        if expired_keys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(SECRETS)?;
+            for key in &expired_keys {
+                table.remove(key.as_str())?;
+            }
+        }
+        write_txn.commit()?;
+
+        // Return display keys (without prefix).
+        let display_keys: Vec<String> = expired_keys
+            .into_iter()
+            .map(|k| k[prefix.len()..].to_owned())
+            .collect();
+
+        let removed = display_keys.len();
+        if removed > 0 {
+            info!(org_id = %org_id, removed, "pruned expired org secrets");
+        }
+        Ok(display_keys)
     }
 
     // ── Audit log ─────────────────────────────────────────────────────────
@@ -408,6 +734,11 @@ impl Store {
             }
             if let Some(ref action) = query.action {
                 if event.action != *action {
+                    continue;
+                }
+            }
+            if let Some(ref org_id) = query.org_id {
+                if event.org_id.as_deref() != Some(org_id.as_str()) {
                     continue;
                 }
             }
@@ -522,6 +853,400 @@ impl Store {
         Ok(max)
     }
 
+    // ── Org CRUD ──────────────────────────────────────────────────────────
+
+    /// Insert or overwrite an org record.
+    pub fn put_org(&self, org: &super::org::OrgRecord) -> Result<()> {
+        let bytes = bincode::serde::encode_to_vec(org, bincode::config::standard())
+            .context("bincode encode org")?;
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(super::org::ORGS)?;
+            table.insert(org.id.as_str(), bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Retrieve an org by ID.
+    pub fn get_org(&self, id: &str) -> Result<Option<super::org::OrgRecord>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(super::org::ORGS)?;
+
+        let raw: Option<Vec<u8>> = table.get(id)?.map(|g| g.value().to_vec());
+        match raw {
+            None => Ok(None),
+            Some(bytes) => {
+                let (record, _): (super::org::OrgRecord, _) =
+                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                        .context("bincode decode org")?;
+                Ok(Some(record))
+            }
+        }
+    }
+
+    /// List all orgs.
+    pub fn list_orgs(&self) -> Result<Vec<super::org::OrgRecord>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(super::org::ORGS)?;
+
+        let mut orgs = Vec::new();
+        for item in table.iter()? {
+            let (_k, v) = item?;
+            let (record, _): (super::org::OrgRecord, _) =
+                bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
+                    .context("bincode decode org")?;
+            orgs.push(record);
+        }
+        Ok(orgs)
+    }
+
+    /// Delete an org by ID. Returns true if it existed.
+    /// Fails if the org still has principals.
+    pub fn delete_org(&self, id: &str) -> Result<bool> {
+        let read_txn = self.db.begin_read()?;
+
+        // Check for existing principals with prefix "{org_id}:"
+        {
+            let table = read_txn.open_table(super::org::PRINCIPALS)?;
+            let prefix = format!("{id}:");
+            for item in table.iter()? {
+                let (k, _v) = item?;
+                if k.value().starts_with(&prefix) {
+                    anyhow::bail!("cannot delete org {id}: still has principals");
+                }
+            }
+        }
+        drop(read_txn);
+
+        let write_txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = write_txn.open_table(super::org::ORGS)?;
+            let existed = table.remove(id)?.is_some();
+            existed
+        };
+        write_txn.commit()?;
+        Ok(existed)
+    }
+
+    // ── Principal CRUD ───────────────────────────────────────────────────
+
+    /// Insert or overwrite a principal record.
+    /// Compound key: "{org_id}:{principal_id}".
+    pub fn put_principal(&self, p: &super::org::PrincipalRecord) -> Result<()> {
+        let key = format!("{}:{}", p.org_id, p.id);
+        let bytes = bincode::serde::encode_to_vec(p, bincode::config::standard())
+            .context("bincode encode principal")?;
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(super::org::PRINCIPALS)?;
+            table.insert(key.as_str(), bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Retrieve a principal by org_id and principal_id.
+    pub fn get_principal(
+        &self,
+        org_id: &str,
+        principal_id: &str,
+    ) -> Result<Option<super::org::PrincipalRecord>> {
+        let key = format!("{org_id}:{principal_id}");
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(super::org::PRINCIPALS)?;
+
+        let raw: Option<Vec<u8>> = table.get(key.as_str())?.map(|g| g.value().to_vec());
+        match raw {
+            None => Ok(None),
+            Some(bytes) => {
+                let (record, _): (super::org::PrincipalRecord, _) =
+                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                        .context("bincode decode principal")?;
+                Ok(Some(record))
+            }
+        }
+    }
+
+    /// List all principals for a given org.
+    pub fn list_principals(&self, org_id: &str) -> Result<Vec<super::org::PrincipalRecord>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(super::org::PRINCIPALS)?;
+
+        let prefix = format!("{org_id}:");
+        let mut principals = Vec::new();
+        for item in table.iter()? {
+            let (k, v) = item?;
+            if !k.value().starts_with(&prefix) {
+                continue;
+            }
+            let (record, _): (super::org::PrincipalRecord, _) =
+                bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
+                    .context("bincode decode principal")?;
+            principals.push(record);
+        }
+        Ok(principals)
+    }
+
+    /// Delete a principal by org_id and principal_id. Returns true if it existed.
+    /// Fails if the principal has active (unexpired) keys.
+    pub fn delete_principal(&self, org_id: &str, principal_id: &str) -> Result<bool> {
+        let now = Self::now();
+
+        // Check for active keys in PRINCIPAL_KEY_IX with prefix "{principal_id}:"
+        {
+            let read_txn = self.db.begin_read()?;
+            let ix_table = read_txn.open_table(super::org::PRINCIPAL_KEY_IX)?;
+            let keys_table = read_txn.open_table(super::org::PRINCIPAL_KEYS)?;
+            let prefix = format!("{principal_id}:");
+
+            for item in ix_table.iter()? {
+                let (k, v) = item?;
+                if !k.value().starts_with(&prefix) {
+                    continue;
+                }
+                // Look up the key record to check valid_before
+                let hash = v.value().to_vec();
+                if let Some(key_guard) = keys_table.get(hash.as_slice())? {
+                    let key_bytes = key_guard.value().to_vec();
+                    let (key_record, _): (super::org::PrincipalKeyRecord, _) =
+                        bincode::serde::decode_from_slice(&key_bytes, bincode::config::standard())
+                            .context("bincode decode principal key")?;
+                    if key_record.valid_before > now {
+                        anyhow::bail!("cannot delete principal {principal_id}: has active keys");
+                    }
+                }
+            }
+        }
+
+        let compound_key = format!("{org_id}:{principal_id}");
+        let write_txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = write_txn.open_table(super::org::PRINCIPALS)?;
+            let existed = table.remove(compound_key.as_str())?.is_some();
+            existed
+        };
+        write_txn.commit()?;
+        Ok(existed)
+    }
+
+    // ── PrincipalKey CRUD ────────────────────────────────────────────────
+
+    /// Insert a principal key record. Writes to both PRINCIPAL_KEYS (hash->record)
+    /// and PRINCIPAL_KEY_IX ("{principal_id}:{key_id}"->hash).
+    pub fn put_principal_key(&self, key: &super::org::PrincipalKeyRecord) -> Result<()> {
+        let bytes = bincode::serde::encode_to_vec(key, bincode::config::standard())
+            .context("bincode encode principal key")?;
+        let ix_key = format!("{}:{}", key.principal_id, key.id);
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut keys_table = write_txn.open_table(super::org::PRINCIPAL_KEYS)?;
+            keys_table.insert(key.key_hash.as_slice(), bytes.as_slice())?;
+
+            let mut ix_table = write_txn.open_table(super::org::PRINCIPAL_KEY_IX)?;
+            ix_table.insert(ix_key.as_str(), key.key_hash.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// O(1) lookup of a principal key by its hash.
+    pub fn find_principal_key_by_hash(
+        &self,
+        hash: &[u8],
+    ) -> Result<Option<super::org::PrincipalKeyRecord>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(super::org::PRINCIPAL_KEYS)?;
+
+        let raw: Option<Vec<u8>> = table.get(hash)?.map(|g| g.value().to_vec());
+        match raw {
+            None => Ok(None),
+            Some(bytes) => {
+                let (record, _): (super::org::PrincipalKeyRecord, _) =
+                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                        .context("bincode decode principal key")?;
+                Ok(Some(record))
+            }
+        }
+    }
+
+    /// List all keys for a given principal by scanning the index.
+    pub fn list_principal_keys(
+        &self,
+        principal_id: &str,
+    ) -> Result<Vec<super::org::PrincipalKeyRecord>> {
+        let read_txn = self.db.begin_read()?;
+        let ix_table = read_txn.open_table(super::org::PRINCIPAL_KEY_IX)?;
+        let keys_table = read_txn.open_table(super::org::PRINCIPAL_KEYS)?;
+
+        let prefix = format!("{principal_id}:");
+        let mut records = Vec::new();
+        for item in ix_table.iter()? {
+            let (k, v) = item?;
+            if !k.value().starts_with(&prefix) {
+                continue;
+            }
+            let hash = v.value().to_vec();
+            if let Some(guard) = keys_table.get(hash.as_slice())? {
+                let key_bytes = guard.value().to_vec();
+                let (record, _): (super::org::PrincipalKeyRecord, _) =
+                    bincode::serde::decode_from_slice(&key_bytes, bincode::config::standard())
+                        .context("bincode decode principal key")?;
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    /// Delete a principal key by principal_id and key_id.
+    /// Removes from both PRINCIPAL_KEY_IX and PRINCIPAL_KEYS tables.
+    pub fn delete_principal_key(&self, principal_id: &str, key_id: &str) -> Result<bool> {
+        let ix_key = format!("{principal_id}:{key_id}");
+
+        // Look up the hash in the index first.
+        let hash: Option<Vec<u8>> = {
+            let read_txn = self.db.begin_read()?;
+            let ix_table = read_txn.open_table(super::org::PRINCIPAL_KEY_IX)?;
+            ix_table.get(ix_key.as_str())?.map(|g| g.value().to_vec())
+        };
+
+        let hash = match hash {
+            Some(h) => h,
+            None => return Ok(false),
+        };
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut ix_table = write_txn.open_table(super::org::PRINCIPAL_KEY_IX)?;
+            ix_table.remove(ix_key.as_str())?;
+
+            let mut keys_table = write_txn.open_table(super::org::PRINCIPAL_KEYS)?;
+            keys_table.remove(hash.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(true)
+    }
+
+    // ── Role CRUD ────────────────────────────────────────────────────────
+
+    /// Build the table key for a role: "builtin:{name}" or "{org_id}:{name}".
+    fn role_table_key(org_id: Option<&str>, name: &str) -> String {
+        match org_id {
+            None => format!("builtin:{name}"),
+            Some(oid) => format!("{oid}:{name}"),
+        }
+    }
+
+    /// Insert or overwrite a role record.
+    pub fn put_role(&self, role: &super::org::RoleRecord) -> Result<()> {
+        let key = Self::role_table_key(role.org_id.as_deref(), &role.name);
+        let bytes = bincode::serde::encode_to_vec(role, bincode::config::standard())
+            .context("bincode encode role")?;
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(super::org::ROLES)?;
+            table.insert(key.as_str(), bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Retrieve a role by org_id (None = built-in) and name.
+    pub fn get_role(
+        &self,
+        org_id: Option<&str>,
+        name: &str,
+    ) -> Result<Option<super::org::RoleRecord>> {
+        let key = Self::role_table_key(org_id, name);
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(super::org::ROLES)?;
+
+        let raw: Option<Vec<u8>> = table.get(key.as_str())?.map(|g| g.value().to_vec());
+        match raw {
+            None => Ok(None),
+            Some(bytes) => {
+                let (record, _): (super::org::RoleRecord, _) =
+                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                        .context("bincode decode role")?;
+                Ok(Some(record))
+            }
+        }
+    }
+
+    /// List roles: all built-in roles + custom roles for the given org.
+    /// If org_id is None, returns only built-in roles.
+    pub fn list_roles(&self, org_id: Option<&str>) -> Result<Vec<super::org::RoleRecord>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(super::org::ROLES)?;
+
+        let builtin_prefix = "builtin:";
+        let org_prefix = org_id.map(|oid| format!("{oid}:"));
+
+        let mut roles = Vec::new();
+        for item in table.iter()? {
+            let (k, v) = item?;
+            let key_str = k.value();
+            let include = key_str.starts_with(builtin_prefix)
+                || org_prefix
+                    .as_ref()
+                    .is_some_and(|p| key_str.starts_with(p.as_str()));
+            if include {
+                let (record, _): (super::org::RoleRecord, _) =
+                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
+                        .context("bincode decode role")?;
+                roles.push(record);
+            }
+        }
+        Ok(roles)
+    }
+
+    /// Delete a role. Fails if built-in or if any principal in the org uses this role.
+    pub fn delete_role(&self, org_id: Option<&str>, name: &str) -> Result<bool> {
+        // Cannot delete built-in roles.
+        if org_id.is_none() {
+            anyhow::bail!("cannot delete built-in role \"{name}\"");
+        }
+
+        let oid = org_id.unwrap();
+
+        // Check if any principal in this org uses this role.
+        {
+            let read_txn = self.db.begin_read()?;
+            let table = read_txn.open_table(super::org::PRINCIPALS)?;
+            let prefix = format!("{oid}:");
+            for item in table.iter()? {
+                let (k, v) = item?;
+                if !k.value().starts_with(&prefix) {
+                    continue;
+                }
+                let bytes = v.value().to_vec();
+                let (principal, _): (super::org::PrincipalRecord, _) =
+                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                        .context("bincode decode principal")?;
+                if principal.role == name {
+                    anyhow::bail!(
+                        "cannot delete role \"{name}\": in use by principal \"{}\"",
+                        principal.id
+                    );
+                }
+            }
+        }
+
+        let key = Self::role_table_key(Some(oid), name);
+        let write_txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = write_txn.open_table(super::org::ROLES)?;
+            let existed = table.remove(key.as_str())?.is_some();
+            existed
+        };
+        write_txn.commit()?;
+        Ok(existed)
+    }
+
     /// Re-encrypt all non-expired records with `new_key`, tagging them with
     /// `new_key_version`. The current `self.key` is used to decrypt.
     /// Returns the number of records rotated.
@@ -575,6 +1300,9 @@ impl Store {
                     read_count: record.read_count,
                     delete: record.delete,
                     webhook_url: record.webhook_url.clone(),
+                    owner_id: record.owner_id.clone(),
+                    org_id: record.org_id.clone(),
+                    allowed_keys: record.allowed_keys.clone(),
                 };
 
                 let new_bytes = encode(&new_record, new_key_version)?;
@@ -775,6 +1503,8 @@ mod tests {
             "127.0.0.1".into(),
             true,
             None,
+            None,
+            None,
         ))
         .unwrap();
         s.record_audit(AuditEvent::new(
@@ -782,6 +1512,8 @@ mod tests {
             Some("KEY1".into()),
             "10.0.0.1".into(),
             true,
+            None,
+            None,
             None,
         ))
         .unwrap();
@@ -791,6 +1523,7 @@ mod tests {
             until: None,
             action: None,
             limit: 100,
+            org_id: None,
         };
         let events = s.list_audit(&query).unwrap();
         assert_eq!(events.len(), 2);
@@ -818,6 +1551,8 @@ mod tests {
                 "127.0.0.1".into(),
                 true,
                 None,
+                None,
+                None,
             ))
             .unwrap();
         }
@@ -829,6 +1564,7 @@ mod tests {
                 until: None,
                 action: Some("secret.create".into()),
                 limit: 100,
+                org_id: None,
             })
             .unwrap();
         assert_eq!(events.len(), 3); // indices 0, 2, 4
@@ -840,6 +1576,7 @@ mod tests {
                 until: None,
                 action: None,
                 limit: 2,
+                org_id: None,
             })
             .unwrap();
         assert_eq!(events.len(), 2);
@@ -856,6 +1593,8 @@ mod tests {
             "127.0.0.1".into(),
             true,
             None,
+            None,
+            None,
         );
         old_event.timestamp = 1000; // far in the past
 
@@ -865,6 +1604,8 @@ mod tests {
             Some("NEW".into()),
             "127.0.0.1".into(),
             true,
+            None,
+            None,
             None,
         ))
         .unwrap();
@@ -879,9 +1620,526 @@ mod tests {
                 until: None,
                 action: None,
                 limit: 100,
+                org_id: None,
             })
             .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action, "secret.read");
+    }
+
+    #[test]
+    fn new_tables_created_on_open() {
+        let (store, _dir) = make_store();
+        let read_txn = store.db.begin_read().unwrap();
+        read_txn.open_table(super::super::org::ORGS).unwrap();
+        read_txn.open_table(super::super::org::PRINCIPALS).unwrap();
+        read_txn
+            .open_table(super::super::org::PRINCIPAL_KEYS)
+            .unwrap();
+        read_txn
+            .open_table(super::super::org::PRINCIPAL_KEY_IX)
+            .unwrap();
+        read_txn.open_table(super::super::org::ROLES).unwrap();
+    }
+
+    // ── Org CRUD tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn org_crud() {
+        use std::collections::HashMap;
+        let (s, _dir) = make_store();
+
+        let org = super::super::org::OrgRecord {
+            id: "org_1".into(),
+            name: "Acme".into(),
+            metadata: HashMap::from([("env".into(), "prod".into())]),
+            created_at: 1700000000,
+        };
+        s.put_org(&org).unwrap();
+
+        // get
+        let fetched = s.get_org("org_1").unwrap().unwrap();
+        assert_eq!(fetched.id, "org_1");
+        assert_eq!(fetched.name, "Acme");
+
+        // list
+        let orgs = s.list_orgs().unwrap();
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs[0].id, "org_1");
+
+        // delete
+        assert!(s.delete_org("org_1").unwrap());
+
+        // verify gone
+        assert!(s.get_org("org_1").unwrap().is_none());
+        assert!(s.list_orgs().unwrap().is_empty());
+
+        // delete non-existent returns false
+        assert!(!s.delete_org("org_1").unwrap());
+    }
+
+    #[test]
+    fn delete_org_blocked_by_principals() {
+        use std::collections::HashMap;
+        let (s, _dir) = make_store();
+
+        let org = super::super::org::OrgRecord {
+            id: "org_2".into(),
+            name: "Test".into(),
+            metadata: HashMap::new(),
+            created_at: 1700000000,
+        };
+        s.put_org(&org).unwrap();
+
+        let principal = super::super::org::PrincipalRecord {
+            id: "p_1".into(),
+            org_id: "org_2".into(),
+            name: "alice".into(),
+            role: "admin".into(),
+            metadata: HashMap::new(),
+            created_at: 1700000000,
+        };
+        s.put_principal(&principal).unwrap();
+
+        let err = s.delete_org("org_2");
+        assert!(err.is_err());
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("still has principals"));
+    }
+
+    // ── Principal CRUD tests ────────────────────────────────────────────
+
+    #[test]
+    fn principal_crud() {
+        use std::collections::HashMap;
+        let (s, _dir) = make_store();
+
+        let p = super::super::org::PrincipalRecord {
+            id: "p_1".into(),
+            org_id: "org_1".into(),
+            name: "alice".into(),
+            role: "admin".into(),
+            metadata: HashMap::new(),
+            created_at: 1700000000,
+        };
+        s.put_principal(&p).unwrap();
+
+        // get
+        let fetched = s.get_principal("org_1", "p_1").unwrap().unwrap();
+        assert_eq!(fetched.id, "p_1");
+        assert_eq!(fetched.org_id, "org_1");
+        assert_eq!(fetched.name, "alice");
+
+        // list
+        let principals = s.list_principals("org_1").unwrap();
+        assert_eq!(principals.len(), 1);
+
+        // list for different org returns empty
+        assert!(s.list_principals("org_other").unwrap().is_empty());
+
+        // delete
+        assert!(s.delete_principal("org_1", "p_1").unwrap());
+
+        // verify gone
+        assert!(s.get_principal("org_1", "p_1").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_principal_blocked_by_active_keys() {
+        use std::collections::HashMap;
+        let (s, _dir) = make_store();
+
+        let p = super::super::org::PrincipalRecord {
+            id: "p_2".into(),
+            org_id: "org_1".into(),
+            name: "bob".into(),
+            role: "writer".into(),
+            metadata: HashMap::new(),
+            created_at: 1700000000,
+        };
+        s.put_principal(&p).unwrap();
+
+        // Create an unexpired key (valid_before far in the future)
+        let key = super::super::org::PrincipalKeyRecord {
+            id: "pk_1".into(),
+            principal_id: "p_2".into(),
+            org_id: "org_1".into(),
+            name: "default".into(),
+            key_hash: vec![0xAA; 32],
+            valid_after: 1700000000,
+            valid_before: 9999999999,
+            created_at: 1700000000,
+        };
+        // Manually insert the key into both tables so delete_principal can find it
+        {
+            let bytes = bincode::serde::encode_to_vec(&key, bincode::config::standard()).unwrap();
+            let ix_key = format!("{}:{}", key.principal_id, key.id);
+            let write_txn = s.db.begin_write().unwrap();
+            {
+                let mut keys_table = write_txn
+                    .open_table(super::super::org::PRINCIPAL_KEYS)
+                    .unwrap();
+                keys_table
+                    .insert(key.key_hash.as_slice(), bytes.as_slice())
+                    .unwrap();
+                let mut ix_table = write_txn
+                    .open_table(super::super::org::PRINCIPAL_KEY_IX)
+                    .unwrap();
+                ix_table
+                    .insert(ix_key.as_str(), key.key_hash.as_slice())
+                    .unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let err = s.delete_principal("org_1", "p_2");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("has active keys"));
+    }
+
+    // ── PrincipalKey CRUD tests ─────────────────────────────────────────
+
+    #[test]
+    fn principal_key_crud() {
+        let (s, _dir) = make_store();
+
+        let key_hash = vec![0xBB; 32];
+        let key = super::super::org::PrincipalKeyRecord {
+            id: "pk_1".into(),
+            principal_id: "p_1".into(),
+            org_id: "org_1".into(),
+            name: "my-key".into(),
+            key_hash: key_hash.clone(),
+            valid_after: 1700000000,
+            valid_before: 1800000000,
+            created_at: 1700000000,
+        };
+        s.put_principal_key(&key).unwrap();
+
+        // find by hash
+        let found = s.find_principal_key_by_hash(&key_hash).unwrap().unwrap();
+        assert_eq!(found.id, "pk_1");
+        assert_eq!(found.principal_id, "p_1");
+
+        // list
+        let keys = s.list_principal_keys("p_1").unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].id, "pk_1");
+
+        // list for different principal returns empty
+        assert!(s.list_principal_keys("p_other").unwrap().is_empty());
+
+        // delete
+        assert!(s.delete_principal_key("p_1", "pk_1").unwrap());
+
+        // verify gone from both tables
+        assert!(s.find_principal_key_by_hash(&key_hash).unwrap().is_none());
+        assert!(s.list_principal_keys("p_1").unwrap().is_empty());
+
+        // delete non-existent returns false
+        assert!(!s.delete_principal_key("p_1", "pk_1").unwrap());
+    }
+
+    // ── Role CRUD tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn builtin_roles_seeded_on_open() {
+        let (store, _dir) = make_store();
+        let read_txn = store.db.begin_read().unwrap();
+        let table = read_txn.open_table(super::super::org::ROLES).unwrap();
+        for name in &["reader", "writer", "admin", "owner"] {
+            let key = format!("builtin:{name}");
+            assert!(
+                table.get(key.as_str()).unwrap().is_some(),
+                "builtin role {name} not found"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_role_crud() {
+        let (s, _dir) = make_store();
+
+        let role = super::super::org::RoleRecord {
+            name: "deployer".into(),
+            org_id: Some("org_1".into()),
+            permissions: super::super::permissions::Permissions::parse("rlc").unwrap(),
+            built_in: false,
+            created_at: 1700000000,
+        };
+        s.put_role(&role).unwrap();
+
+        // get
+        let fetched = s.get_role(Some("org_1"), "deployer").unwrap().unwrap();
+        assert_eq!(fetched.name, "deployer");
+        assert!(!fetched.built_in);
+
+        // list should include built-ins + custom
+        let roles = s.list_roles(Some("org_1")).unwrap();
+        let names: Vec<&str> = roles.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"reader"));
+        assert!(names.contains(&"writer"));
+        assert!(names.contains(&"admin"));
+        assert!(names.contains(&"owner"));
+        assert!(names.contains(&"deployer"));
+
+        // list with None only returns built-ins
+        let builtin_only = s.list_roles(None).unwrap();
+        assert_eq!(builtin_only.len(), 4);
+        assert!(builtin_only.iter().all(|r| r.built_in));
+
+        // delete custom role
+        assert!(s.delete_role(Some("org_1"), "deployer").unwrap());
+        assert!(s.get_role(Some("org_1"), "deployer").unwrap().is_none());
+    }
+
+    #[test]
+    fn cannot_delete_builtin_role() {
+        let (s, _dir) = make_store();
+        let err = s.delete_role(None, "admin");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("built-in"));
+    }
+
+    // ── Org-scoped secret tests ────────────────────────────────────────
+
+    #[test]
+    fn org_scoped_secret_put_and_get() {
+        let (s, _dir) = make_store();
+
+        // Same key name in two different orgs
+        s.put_org_secret(
+            "org_a",
+            "DB_PASS",
+            "alpha-pass",
+            None,
+            None,
+            true,
+            None,
+            Some("p1"),
+            None,
+        )
+        .unwrap();
+        s.put_org_secret(
+            "org_b",
+            "DB_PASS",
+            "beta-pass",
+            None,
+            None,
+            true,
+            None,
+            Some("p2"),
+            None,
+        )
+        .unwrap();
+
+        // Each org gets its own value
+        assert_eq!(
+            s.get_org_secret("org_a", "DB_PASS").unwrap(),
+            GetResult::Value("alpha-pass".into(), None)
+        );
+        assert_eq!(
+            s.get_org_secret("org_b", "DB_PASS").unwrap(),
+            GetResult::Value("beta-pass".into(), None)
+        );
+
+        // Public bucket doesn't see org-scoped secrets
+        assert_eq!(s.get("DB_PASS").unwrap(), GetResult::NotFound);
+
+        // Delete from one org doesn't affect the other
+        assert!(s.delete_org_secret("org_a", "DB_PASS").unwrap());
+        assert_eq!(
+            s.get_org_secret("org_a", "DB_PASS").unwrap(),
+            GetResult::NotFound
+        );
+        assert_eq!(
+            s.get_org_secret("org_b", "DB_PASS").unwrap(),
+            GetResult::Value("beta-pass".into(), None)
+        );
+    }
+
+    #[test]
+    fn org_scoped_list_my_vs_org() {
+        let (s, _dir) = make_store();
+
+        s.put_org_secret(
+            "org_1",
+            "S1",
+            "v1",
+            None,
+            None,
+            true,
+            None,
+            Some("alice"),
+            None,
+        )
+        .unwrap();
+        s.put_org_secret(
+            "org_1",
+            "S2",
+            "v2",
+            None,
+            None,
+            true,
+            None,
+            Some("bob"),
+            None,
+        )
+        .unwrap();
+        s.put_org_secret(
+            "org_1",
+            "S3",
+            "v3",
+            None,
+            None,
+            true,
+            None,
+            Some("alice"),
+            None,
+        )
+        .unwrap();
+
+        // List all for org
+        let all = s.list_org_secrets("org_1", None).unwrap();
+        assert_eq!(all.len(), 3);
+
+        // List only alice's
+        let alice_secrets = s.list_org_secrets("org_1", Some("alice")).unwrap();
+        assert_eq!(alice_secrets.len(), 2);
+        assert!(alice_secrets
+            .iter()
+            .all(|m| m.owner_id.as_deref() == Some("alice")));
+
+        // List only bob's
+        let bob_secrets = s.list_org_secrets("org_1", Some("bob")).unwrap();
+        assert_eq!(bob_secrets.len(), 1);
+        assert_eq!(bob_secrets[0].key, "S2");
+    }
+
+    #[test]
+    fn key_binding_check() {
+        let (s, _dir) = make_store();
+
+        // Secret with allowed_keys restriction
+        s.put_org_secret(
+            "org_1",
+            "RESTRICTED",
+            "val",
+            None,
+            None,
+            true,
+            None,
+            Some("alice"),
+            Some(vec!["deploy-key".into(), "ci-key".into()]),
+        )
+        .unwrap();
+
+        // Secret with no restriction
+        s.put_org_secret(
+            "org_1",
+            "OPEN",
+            "val",
+            None,
+            None,
+            true,
+            None,
+            Some("alice"),
+            None,
+        )
+        .unwrap();
+
+        // Allowed key passes
+        assert!(s
+            .check_key_binding("org_1", "RESTRICTED", "deploy-key")
+            .unwrap());
+        assert!(s
+            .check_key_binding("org_1", "RESTRICTED", "ci-key")
+            .unwrap());
+
+        // Disallowed key fails
+        assert!(!s
+            .check_key_binding("org_1", "RESTRICTED", "random-key")
+            .unwrap());
+
+        // Open secret allows any key
+        assert!(s
+            .check_key_binding("org_1", "OPEN", "any-key-name")
+            .unwrap());
+
+        // Non-existent secret returns error
+        assert!(s.check_key_binding("org_1", "NOPE", "key").is_err());
+    }
+
+    #[test]
+    fn org_scoped_head_and_patch() {
+        let (s, _dir) = make_store();
+
+        s.put_org_secret(
+            "org_1",
+            "PATCHME",
+            "old",
+            None,
+            Some(5),
+            false,
+            None,
+            Some("alice"),
+            None,
+        )
+        .unwrap();
+
+        // head
+        let (meta, sealed) = s.head_org_secret("org_1", "PATCHME").unwrap().unwrap();
+        assert_eq!(meta.key, "PATCHME");
+        assert_eq!(meta.read_count, 0);
+        assert!(!sealed);
+
+        // read once
+        s.get_org_secret("org_1", "PATCHME").unwrap();
+
+        // patch
+        let meta = s
+            .patch_org_secret("org_1", "PATCHME", Some("new"), None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.read_count, 0);
+
+        // verify new value
+        assert_eq!(
+            s.get_org_secret("org_1", "PATCHME").unwrap(),
+            GetResult::Value("new".into(), None)
+        );
+    }
+
+    #[test]
+    fn cannot_delete_role_in_use() {
+        use std::collections::HashMap;
+        let (s, _dir) = make_store();
+
+        // Create custom role
+        let role = super::super::org::RoleRecord {
+            name: "tester".into(),
+            org_id: Some("org_1".into()),
+            permissions: super::super::permissions::Permissions::parse("rl").unwrap(),
+            built_in: false,
+            created_at: 1700000000,
+        };
+        s.put_role(&role).unwrap();
+
+        // Create a principal that uses this role
+        let p = super::super::org::PrincipalRecord {
+            id: "p_1".into(),
+            org_id: "org_1".into(),
+            name: "carol".into(),
+            role: "tester".into(),
+            metadata: HashMap::new(),
+            created_at: 1700000000,
+        };
+        s.put_principal(&p).unwrap();
+
+        let err = s.delete_role(Some("org_1"), "tester");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("in use"));
     }
 }

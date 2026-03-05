@@ -16,6 +16,12 @@ pub const ACTION_WEBHOOK_CREATE: &str = "webhook.create";
 pub const ACTION_WEBHOOK_DELETE: &str = "webhook.delete";
 pub const ACTION_KEY_CREATE: &str = "key.create";
 pub const ACTION_KEY_DELETE: &str = "key.delete";
+pub const ACTION_ORG_CREATE: &str = "org.create";
+pub const ACTION_ORG_DELETE: &str = "org.delete";
+pub const ACTION_PRINCIPAL_CREATE: &str = "principal.create";
+pub const ACTION_PRINCIPAL_DELETE: &str = "principal.delete";
+pub const ACTION_ROLE_CREATE: &str = "role.create";
+pub const ACTION_ROLE_DELETE: &str = "role.delete";
 
 // ── AuditEvent ───────────────────────────────────────────────────────────────
 
@@ -28,6 +34,10 @@ pub struct AuditEvent {
     pub source_ip: String,
     pub success: bool,
     pub detail: Option<String>,
+    #[serde(default)]
+    pub org_id: Option<String>,
+    #[serde(default)]
+    pub principal_id: Option<String>,
 }
 
 impl AuditEvent {
@@ -37,6 +47,8 @@ impl AuditEvent {
         source_ip: String,
         success: bool,
         detail: Option<String>,
+        org_id: Option<String>,
+        principal_id: Option<String>,
     ) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -51,6 +63,8 @@ impl AuditEvent {
             source_ip,
             success,
             detail,
+            org_id,
+            principal_id,
         }
     }
 }
@@ -62,4 +76,5 @@ pub struct AuditQuery {
     pub until: Option<i64>,
     pub action: Option<String>,
     pub limit: usize,
+    pub org_id: Option<String>,
 }

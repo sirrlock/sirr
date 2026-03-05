@@ -14,6 +14,15 @@ pub struct SecretRecord {
     /// Optional per-secret webhook URL for event notifications.
     #[serde(default)]
     pub webhook_url: Option<String>,
+    /// Principal that created this secret (multi-tenant).
+    #[serde(default)]
+    pub owner_id: Option<String>,
+    /// Organisation this secret belongs to (multi-tenant).
+    #[serde(default)]
+    pub org_id: Option<String>,
+    /// If set, only these principal key IDs may read the secret.
+    #[serde(default)]
+    pub allowed_keys: Option<Vec<String>>,
 }
 
 fn default_delete() -> bool {
@@ -46,6 +55,8 @@ pub struct SecretMeta {
     pub max_reads: Option<u32>,
     pub read_count: u32,
     pub delete: bool,
+    pub owner_id: Option<String>,
+    pub org_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -62,6 +73,9 @@ mod tests {
             read_count,
             delete,
             webhook_url: None,
+            owner_id: None,
+            org_id: None,
+            allowed_keys: None,
         }
     }
 

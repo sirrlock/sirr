@@ -17,13 +17,20 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 use crate::{
-    auth::require_api_key,
+    auth::{require_auth, require_master_key},
     handlers::{
-        audit_events, create_api_key, create_secret, create_webhook, delete_api_key, delete_secret,
-        delete_webhook, get_secret, head_secret, health, list_api_keys, list_secrets,
-        list_webhooks, patch_secret, prune_secrets,
+        audit_events, create_secret, create_webhook, delete_secret, delete_webhook, get_secret,
+        head_secret, health, list_secrets, list_webhooks, patch_secret, prune_secrets,
     },
-    license, AppState,
+    license,
+    org_handlers::{
+        create_key, create_org, create_org_secret, create_org_webhook, create_principal,
+        create_role, delete_key, delete_org, delete_org_secret, delete_org_webhook,
+        delete_principal, delete_role, get_me, get_org_secret, head_org_secret, list_org_secrets,
+        list_org_webhooks, list_orgs, list_principals, list_roles, org_audit_events, patch_me,
+        patch_org_secret, prune_org_secrets,
+    },
+    AppState,
 };
 
 pub struct ServerConfig {
@@ -73,6 +80,13 @@ pub struct ServerConfig {
     /// shown when a key is auto-generated.  Has no effect when `api_key` was
     /// explicitly configured via `SIRR_API_KEY`.
     pub no_security_banner: bool,
+    /// When true (default), the legacy public /secrets bucket routes are
+    /// enabled. Set `ENABLE_PUBLIC_BUCKET=false` or `0` to disable them
+    /// and only serve multi-tenant org-scoped routes.
+    pub enable_public_bucket: bool,
+    /// When true, auto-initialize with a default org and admin principal
+    /// if no orgs exist yet. Triggered by `--init` or `SIRR_AUTOINIT=true`.
+    pub auto_init: bool,
 }
 
 impl Default for ServerConfig {
@@ -125,6 +139,12 @@ impl Default for ServerConfig {
             auto_generated_key: None,
             no_security_banner: std::env::var("NO_SECURITY_BANNER")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            enable_public_bucket: std::env::var("ENABLE_PUBLIC_BUCKET")
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(true),
+            auto_init: std::env::var("SIRR_AUTOINIT")
+                .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
         }
     }
@@ -194,6 +214,11 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     let db_path = data_dir.join("sirr.db");
     let store = crate::store::Store::open(&db_path, enc_key).context("open store")?;
 
+    // Auto-init bootstrap: create default org + admin principal + keys if no orgs exist.
+    if cfg.auto_init {
+        auto_init_bootstrap(&store)?;
+    }
+
     // Resolve instance ID for webhook payloads.
     let webhook_instance_id = cfg
         .instance_id
@@ -231,13 +256,10 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     let lic_status = license::effective_status(cfg.license_key.as_deref());
     match &lic_status {
         license::LicenseStatus::Free => {
-            info!(
-                "running on free tier (≤{} secrets)",
-                license::FREE_TIER_LIMIT
-            );
+            info!("running on free tier (Solo limits)");
         }
-        license::LicenseStatus::Licensed => {
-            info!("license key accepted — unlimited secrets");
+        license::LicenseStatus::Licensed(tier) => {
+            info!(?tier, "license key accepted");
         }
         license::LicenseStatus::Invalid(reason) => {
             anyhow::bail!("invalid SIRR_LICENSE_KEY: {reason}");
@@ -255,7 +277,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         .replace("/api/validate", "/api/instances/heartbeat");
 
     // Set up online license validation if a license key is configured and format is valid.
-    let validator = if lic_status == license::LicenseStatus::Licensed {
+    let validator = if matches!(lic_status, license::LicenseStatus::Licensed(_)) {
         if let Some(ref key) = cfg.license_key {
             let v = crate::validator::OnlineValidator::new(
                 key.clone(),
@@ -309,6 +331,8 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         );
     }
 
+    let enable_public_bucket = cfg.enable_public_bucket;
+
     let state = AppState {
         store,
         api_key: cfg.api_key,
@@ -318,6 +342,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         trusted_proxies: std::sync::Arc::new(trusted_proxies),
         redact_audit_keys: cfg.redact_audit_keys,
         webhook_allowed_origins,
+        enable_public_bucket,
     };
 
     // Per-IP rate limiting: configurable via SIRR_RATE_LIMIT_PER_SECOND / SIRR_RATE_LIMIT_BURST.
@@ -339,14 +364,6 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
 
     let cors = build_cors(cfg.cors_origins.as_deref(), cfg.cors_methods.as_deref());
 
-    // Secret-read routes carry NO CORS layer intentionally.
-    // Without Access-Control-Allow-Origin, browsers block cross-origin reads,
-    // preventing a malicious webpage from silently exfiltrating secrets.
-    // Non-browser clients (sirr CLI, curl) are unaffected.
-    let secret_read = Router::new()
-        .route("/secrets/{key}", get(get_secret))
-        .route("/secrets/{key}", head(head_secret));
-
     // Public informational routes (no auth, CORS allowed).
     let public = Router::new()
         .route("/health", get(health))
@@ -355,34 +372,85 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         .route("/.well-known/security.txt", get(security_txt))
         .layer(cors.clone());
 
-    // Protected routes (API key required if configured, CORS allowed for the web UI).
-    let protected = Router::new()
-        .route("/secrets", get(list_secrets))
-        .route("/secrets", post(create_secret))
-        .route("/secrets/{key}", patch(patch_secret))
-        .route("/secrets/{key}", delete(delete_secret))
-        .route("/prune", post(prune_secrets))
-        .route("/audit", get(audit_events))
-        .route("/webhooks", post(create_webhook))
-        .route("/webhooks", get(list_webhooks))
-        .route("/webhooks/{id}", delete(delete_webhook))
-        .route("/keys", post(create_api_key))
-        .route("/keys", get(list_api_keys))
-        .route("/keys/{id}", delete(delete_api_key))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_api_key,
-        ))
-        .layer(cors);
+    // Org-protected routes (require_auth middleware: master key or principal key).
+    let org_protected = Router::new()
+        // Org management
+        .route("/orgs", post(create_org))
+        .route("/orgs", get(list_orgs))
+        .route("/orgs/{org_id}", delete(delete_org))
+        // Principals
+        .route("/orgs/{org_id}/principals", post(create_principal))
+        .route("/orgs/{org_id}/principals", get(list_principals))
+        .route("/orgs/{org_id}/principals/{id}", delete(delete_principal))
+        // Roles
+        .route("/orgs/{org_id}/roles", post(create_role))
+        .route("/orgs/{org_id}/roles", get(list_roles))
+        .route("/orgs/{org_id}/roles/{name}", delete(delete_role))
+        // Principal self-service
+        .route("/me", get(get_me))
+        .route("/me", patch(patch_me))
+        .route("/me/keys", post(create_key))
+        .route("/me/keys/{key_id}", delete(delete_key))
+        // Org secrets
+        .route("/orgs/{org_id}/secrets", post(create_org_secret))
+        .route("/orgs/{org_id}/secrets", get(list_org_secrets))
+        .route("/orgs/{org_id}/secrets/{key}", get(get_org_secret))
+        .route("/orgs/{org_id}/secrets/{key}", head(head_org_secret))
+        .route("/orgs/{org_id}/secrets/{key}", patch(patch_org_secret))
+        .route("/orgs/{org_id}/secrets/{key}", delete(delete_org_secret))
+        .route("/orgs/{org_id}/prune", post(prune_org_secrets))
+        // Org audit + webhooks
+        .route("/orgs/{org_id}/audit", get(org_audit_events))
+        .route("/orgs/{org_id}/webhooks", post(create_org_webhook))
+        .route("/orgs/{org_id}/webhooks", get(list_org_webhooks))
+        .route("/orgs/{org_id}/webhooks/{id}", delete(delete_org_webhook))
+        .layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .layer(cors.clone());
 
-    let app = Router::new()
-        .merge(secret_read)
-        .merge(public)
-        .merge(protected)
-        .with_state(state)
-        .layer(GovernorLayer::new(governor_conf))
-        .layer(middleware::from_fn(add_security_headers))
-        .layer(TraceLayer::new_for_http());
+    // Build the merged app depending on whether the public bucket is enabled.
+    let app = if enable_public_bucket {
+        // Public bucket open routes: reads and creates carry NO CORS layer intentionally.
+        // Without Access-Control-Allow-Origin, browsers block cross-origin reads,
+        // preventing a malicious webpage from silently exfiltrating secrets.
+        // Non-browser clients (sirr CLI, curl) are unaffected.
+        // POST /secrets is also open: the secret key itself is the access token,
+        // so writes don't require the master key any more than reads do.
+        let secret_public = Router::new()
+            .route("/secrets", post(create_secret))
+            .route("/secrets/{key}", get(get_secret))
+            .route("/secrets/{key}", head(head_secret));
+
+        // Protected public bucket routes (require_master_key middleware).
+        let protected_public_bucket = Router::new()
+            .route("/secrets", get(list_secrets))
+            .route("/secrets/{key}", patch(patch_secret))
+            .route("/secrets/{key}", delete(delete_secret))
+            .route("/prune", post(prune_secrets))
+            .route("/audit", get(audit_events))
+            .route("/webhooks", post(create_webhook))
+            .route("/webhooks", get(list_webhooks))
+            .route("/webhooks/{id}", delete(delete_webhook))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_master_key,
+            ))
+            .layer(cors);
+
+        Router::new()
+            .merge(secret_public)
+            .merge(public)
+            .merge(protected_public_bucket)
+            .merge(org_protected)
+            .with_state(state)
+    } else {
+        Router::new()
+            .merge(public)
+            .merge(org_protected)
+            .with_state(state)
+    }
+    .layer(GovernorLayer::new(governor_conf))
+    .layer(middleware::from_fn(add_security_headers))
+    .layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
         .parse()
@@ -399,6 +467,109 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     )
     .await
     .context("server error")
+}
+
+/// Auto-initialize with a default org, admin principal, and temporary keys.
+/// Only runs if no orgs exist yet.
+fn auto_init_bootstrap(store: &crate::store::Store) -> Result<()> {
+    use crate::store::org::{OrgRecord, PrincipalKeyRecord, PrincipalRecord};
+
+    // Check if any orgs exist already.
+    let orgs = store.list_orgs().context("list orgs for auto-init")?;
+    if !orgs.is_empty() {
+        info!("auto-init: orgs already exist, skipping bootstrap");
+        return Ok(());
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    // Generate IDs.
+    let org_id = format!("{:032x}", rand::random::<u128>());
+    let principal_id = format!("{:032x}", rand::random::<u128>());
+
+    // Create default org.
+    let org = OrgRecord {
+        id: org_id.clone(),
+        name: "default".to_string(),
+        metadata: std::collections::HashMap::new(),
+        created_at: now,
+    };
+    store.put_org(&org).context("auto-init: create org")?;
+
+    // Create admin principal.
+    let principal = PrincipalRecord {
+        id: principal_id.clone(),
+        org_id: org_id.clone(),
+        name: "admin".to_string(),
+        role: "admin".to_string(),
+        metadata: std::collections::HashMap::new(),
+        created_at: now,
+    };
+    store
+        .put_principal(&principal)
+        .context("auto-init: create principal")?;
+
+    // Create 2 temporary keys valid for 30 minutes.
+    let valid_before = now + 1800; // 30 minutes
+    let mut keys_output = Vec::new();
+
+    for i in 1..=2 {
+        // Generate a random API key and its SHA-256 hash.
+        let raw_key = {
+            let mut bytes = [0u8; 16];
+            rand::Rng::fill(&mut rand::thread_rng(), &mut bytes);
+            format!("sirr_key_{}", hex::encode(bytes))
+        };
+        let key_hash = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(raw_key.as_bytes()).to_vec()
+        };
+        let key_id = format!("{:016x}", rand::random::<u64>());
+
+        let key_record = PrincipalKeyRecord {
+            id: key_id.clone(),
+            principal_id: principal_id.clone(),
+            org_id: org_id.clone(),
+            name: format!("bootstrap-key-{i}"),
+            key_hash,
+            valid_after: now,
+            valid_before,
+            created_at: now,
+        };
+        store
+            .put_principal_key(&key_record)
+            .context("auto-init: create key")?;
+
+        keys_output.push((key_id, raw_key));
+    }
+
+    // Print bootstrap info to stdout.
+    eprintln!();
+    eprintln!("  ╔══════════════════════════════════════════════════════════════╗");
+    eprintln!("  ║  AUTO-INIT BOOTSTRAP                                       ║");
+    eprintln!("  ╚══════════════════════════════════════════════════════════════╝");
+    eprintln!();
+    eprintln!("  Default org created:");
+    eprintln!("    org_id:       {org_id}");
+    eprintln!("    name:         default");
+    eprintln!();
+    eprintln!("  Admin principal created:");
+    eprintln!("    principal_id: {principal_id}");
+    eprintln!("    name:         admin");
+    eprintln!("    role:         admin");
+    eprintln!();
+    eprintln!("  Temporary API keys (valid 30 minutes):");
+    for (kid, raw) in &keys_output {
+        eprintln!("    id={kid}  key={raw}");
+    }
+    eprintln!();
+    warn!("auto-init keys expire in 30 minutes — create permanent keys via `sirr me create-key`");
+    eprintln!();
+
+    Ok(())
 }
 
 fn load_or_create_key(data_dir: &std::path::Path) -> Result<crate::store::crypto::EncryptionKey> {
@@ -447,10 +618,8 @@ fn print_banner(
     };
 
     let tier = match lic_status {
-        license::LicenseStatus::Free => {
-            format!("free  (≤{} active secrets)", license::FREE_TIER_LIMIT)
-        }
-        license::LicenseStatus::Licensed => "licensed  (unlimited secrets)".to_string(),
+        license::LicenseStatus::Free => "free  (Solo tier)".to_string(),
+        license::LicenseStatus::Licensed(ref t) => format!("licensed  ({t:?})"),
         license::LicenseStatus::Invalid(_) => return,
     };
 
