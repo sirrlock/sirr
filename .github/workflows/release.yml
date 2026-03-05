@@ -54,6 +54,23 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Set version
+        shell: bash
+        env:
+          VER: ${{ env.VERSION }}
+        run: |
+          python3 -c "
+import re, os
+ver = os.environ['VER']
+with open('Cargo.toml') as f:
+    t = f.read()
+t = re.sub(r'^version = \"[^\"]*\"', f'version = \"{ver}\"', t, count=1, flags=re.MULTILINE)
+t = re.sub(r'(sirr-server = \{ path = \"[^\"]*\", version = )\"[^\"]*\"', f'\\\\1\"{ver}\"', t)
+with open('Cargo.toml', 'w') as f:
+    f.write(t)
+print(f'Set Cargo.toml version to {ver}')
+"
+
       - name: Install cross
         if: matrix.use_cross
         run: cargo install cross --git https://github.com/cross-rs/cross
@@ -219,8 +236,17 @@ jobs:
         env:
           VER: ${{ env.VERSION }}
         run: |
-          sed -i "s/^version = \"[^\"]*\"/version = \"${VER}\"/" Cargo.toml
-          sed -i "s/sirr-server = { path = \"[^\"]*\", version = \"[^\"]*\" }/sirr-server = { path = \"crates\/sirr-server\", version = \"${VER}\" }/" Cargo.toml
+          python3 -c "
+import re, os
+ver = os.environ['VER']
+with open('Cargo.toml') as f:
+    t = f.read()
+t = re.sub(r'^version = \"[^\"]*\"', f'version = \"{ver}\"', t, count=1, flags=re.MULTILINE)
+t = re.sub(r'(sirr-server = \{ path = \"[^\"]*\", version = )\"[^\"]*\"', f'\\\\1\"{ver}\"', t)
+with open('Cargo.toml', 'w') as f:
+    f.write(t)
+print(f'Set Cargo.toml version to {ver}')
+"
 
       - name: Check if version already published
         id: check
@@ -433,3 +459,4 @@ jobs:
           git add bucket/sirrd.json bucket/sirr.json
           git diff --staged --quiet || git commit -m "chore: bump sirrd + sirr to v${VERSION}"
           git push
+
