@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "crates/sirr",
+    "crates/sirrd",
+    "crates/sirr-server",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.1"
+edition = "2021"
+authors = ["Sirr Contributors"]
+license-file = "LICENSE"
+repository = "https://github.com/sirrlock/sirr"
+homepage = "https://sirr.dev"
+documentation = "https://sirr.dev/en/api-reference"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+anyhow = "1"
+sirr-server = { path = "crates/sirr-server", version = "0.1.0" }
