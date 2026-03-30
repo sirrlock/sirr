@@ -60,10 +60,14 @@ jobs:
 
       - name: Build (cross)
         if: matrix.use_cross
+        env:
+          SIRR_BUILD_VERSION: ${{ env.VERSION }}
         run: cross build --release --bin sirrd --bin sirr --target ${{ matrix.target }}
 
       - name: Build (cargo)
         if: "!matrix.use_cross"
+        env:
+          SIRR_BUILD_VERSION: ${{ env.VERSION }}
         run: cargo build --release --bin sirrd --bin sirr --target ${{ matrix.target }}
 
       - name: Package (Unix)

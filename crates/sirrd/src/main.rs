@@ -4,11 +4,17 @@ use tracing_subscriber::EnvFilter;
 
 // ── CLI definition ─────────────────────────────────────────────────────────────
 
+/// Build version: CI sets SIRR_BUILD_VERSION at compile time; local builds use Cargo.toml version.
+const BUILD_VERSION: &str = match option_env!("SIRR_BUILD_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
 #[command(
     name = "sirrd",
     about = "Sirrd — ephemeral secret vault server daemon",
-    version
+    version = BUILD_VERSION
 )]
 struct Cli {
     #[command(subcommand)]
