@@ -31,7 +31,7 @@ pub struct AppState {
     /// Empty = per-secret webhooks disabled (secure default).
     pub webhook_allowed_origins: std::sync::Arc<Vec<String>>,
     /// When true (default), the public /secrets bucket routes are enabled.
-    /// Set `ENABLE_PUBLIC_BUCKET=false` to disable the legacy single-tenant routes.
+    /// Set `SIRR_ENABLE_PUBLIC_BUCKET=false` to disable the legacy single-tenant routes.
     pub enable_public_bucket: bool,
 }
 

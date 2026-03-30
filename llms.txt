@@ -123,7 +123,7 @@ SIRR_DATA_DIR          Storage dir (default: ~/.local/share/sirr/)
 SIRR_SERVER            CLI: server URL (default: sirr://localhost:39999)
 SIRR_TOKEN             CLI: bearer token
 SIRR_ORG               CLI/MCP: org ID for multi-tenant mode
-ENABLE_PUBLIC_BUCKET   Set to false to disable legacy /secrets routes (default: true)
+SIRR_ENABLE_PUBLIC_BUCKET   Set to false to disable legacy /secrets routes (default: true)
 SIRR_AUTOINIT          Set to true to auto-create org/admin on first boot
 
 ## SDKs

@@ -56,8 +56,10 @@ pub struct ServerConfig {
     pub instance_id: Option<String>,
     /// Effective log level string shown in the startup banner.
     pub log_level: String,
-    /// Set `NO_BANNER=1` to suppress the startup banner.
+    /// Set `SIRR_NO_BANNER=1` to suppress the startup banner.
     pub no_banner: bool,
+    /// Version string shown in the startup banner (passed from binary).
+    pub version: String,
     /// When true, key names in /audit responses are hashed instead of returned verbatim.
     /// Set `SIRR_AUDIT_REDACT_KEYS=1` to enable.
     pub redact_audit_keys: bool,
@@ -76,12 +78,12 @@ pub struct ServerConfig {
     /// Set when `SIRR_MASTER_API_KEY` was absent and a key was auto-generated.
     /// The value is the raw generated key, printed in the security notice.
     pub auto_generated_key: Option<String>,
-    /// Set `NO_SECURITY_BANNER=1` to suppress the mandatory security notice
+    /// Set `SIRR_NO_SECURITY_BANNER=1` to suppress the mandatory security notice
     /// shown when a key is auto-generated.  Has no effect when `api_key` was
     /// explicitly configured via `SIRR_MASTER_API_KEY`.
     pub no_security_banner: bool,
     /// When true (default), the legacy public /secrets bucket routes are
-    /// enabled. Set `ENABLE_PUBLIC_BUCKET=false` or `0` to disable them
+    /// enabled. Set `SIRR_ENABLE_PUBLIC_BUCKET=false` or `0` to disable them
     /// and only serve multi-tenant org-scoped routes.
     pub enable_public_bucket: bool,
     /// When true, auto-initialize with a default org and admin principal
@@ -119,7 +121,8 @@ impl Default for ServerConfig {
             webhook_secret: std::env::var("SIRR_WEBHOOK_SECRET").ok(),
             instance_id: std::env::var("SIRR_INSTANCE_ID").ok(),
             log_level: std::env::var("SIRR_LOG_LEVEL").unwrap_or_else(|_| "warn".into()),
-            no_banner: std::env::var("NO_BANNER")
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            no_banner: std::env::var("SIRR_NO_BANNER")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             webhook_allowed_origins: std::env::var("SIRR_WEBHOOK_ALLOWED_ORIGINS")
@@ -137,10 +140,10 @@ impl Default for ServerConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
             auto_generated_key: None,
-            no_security_banner: std::env::var("NO_SECURITY_BANNER")
+            no_security_banner: std::env::var("SIRR_NO_SECURITY_BANNER")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
-            enable_public_bucket: std::env::var("ENABLE_PUBLIC_BUCKET")
+            enable_public_bucket: std::env::var("SIRR_ENABLE_PUBLIC_BUCKET")
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(true),
             auto_init: std::env::var("SIRR_AUTOINIT")
@@ -268,7 +271,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
 
     // Print startup banner (before any values are moved into AppState).
     print_banner(&cfg, &data_dir, &lic_status);
-    // Always printed when a key was auto-generated; bypasses NO_BANNER.
+    // Always printed when a key was auto-generated; bypasses SIRR_NO_BANNER.
     print_security_notice(&cfg);
 
     // Derive the heartbeat endpoint from the validation URL base.
@@ -612,20 +615,26 @@ fn print_banner(
         return;
     }
 
-    let version = env!("CARGO_PKG_VERSION");
-    let addr = format!("http://{}:{}", cfg.host, cfg.port);
+    let version = &cfg.version;
 
     let enc_key_source = if std::env::var("SIRR_MASTER_ENCRYPTION_KEY_FILE").is_ok() {
-        "SIRR_MASTER_ENCRYPTION_KEY_FILE"
+        "file"
     } else {
-        "SIRR_MASTER_ENCRYPTION_KEY"
+        "env"
     };
 
     let tier = match lic_status {
-        license::LicenseStatus::Free => "free  (Solo tier)".to_string(),
-        license::LicenseStatus::Licensed(ref t) => format!("licensed  ({t:?})"),
+        license::LicenseStatus::Free => "free (Solo tier)".to_string(),
+        license::LicenseStatus::Licensed(ref t) => format!("licensed ({t:?})"),
         license::LicenseStatus::Invalid(_) => return,
     };
+
+    let mask = |opt: &Option<String>| match opt {
+        Some(_) => "set",
+        None => "—",
+    };
+
+    let bool_str = |b: bool| if b { "true" } else { "false" };
 
     // compact ASCII art: s i r r
     eprintln!();
@@ -634,13 +643,81 @@ fn print_banner(
     eprintln!(" \\__ \\ | '_| '_| ");
     eprintln!(" |___/_|_| |_|   ");
     eprintln!();
-    eprintln!("  sirr v{version}  ·  ephemeral secret vault");
+    eprintln!("  sirrd v{version}  ·  ephemeral secret vault");
     eprintln!();
-    eprintln!("  address   {addr}");
-    eprintln!("  data      {}", data_dir.display());
-    eprintln!("  log       {}", cfg.log_level);
-    eprintln!("  enc key   {enc_key_source}");
-    eprintln!("  tier      {tier}");
+    eprintln!("  ── server ──────────────────────────────────");
+    eprintln!("  SIRR_HOST                    {}", cfg.host);
+    eprintln!("  SIRR_PORT                    {}", cfg.port);
+    eprintln!("  SIRR_DATA_DIR                {}", data_dir.display());
+    eprintln!("  SIRR_LOG_LEVEL               {}", cfg.log_level);
+    eprintln!("  SIRR_AUTOINIT                {}", bool_str(cfg.auto_init));
+    eprintln!();
+    eprintln!("  ── security ────────────────────────────────");
+    eprintln!("  SIRR_MASTER_API_KEY          {}", mask(&cfg.api_key));
+    eprintln!("  SIRR_MASTER_ENCRYPTION_KEY   {enc_key_source}");
+    eprintln!(
+        "  SIRR_TRUSTED_PROXIES         {}",
+        if cfg.trusted_proxies.is_empty() {
+            "—"
+        } else {
+            &cfg.trusted_proxies
+        }
+    );
+    eprintln!(
+        "  SIRR_ENABLE_PUBLIC_BUCKET    {}",
+        bool_str(cfg.enable_public_bucket)
+    );
+    eprintln!();
+    eprintln!("  ── licensing ───────────────────────────────");
+    eprintln!("  SIRR_LICENSE_KEY             {}", mask(&cfg.license_key));
+    eprintln!("  tier                         {tier}");
+    eprintln!("  SIRR_VALIDATION_URL          {}", cfg.validation_url);
+    eprintln!(
+        "  SIRR_VALIDATION_CACHE_SECS   {}",
+        cfg.validation_cache_secs
+    );
+    eprintln!("  SIRR_HEARTBEAT               {}", bool_str(cfg.heartbeat));
+    eprintln!(
+        "  SIRR_INSTANCE_ID             {}",
+        cfg.instance_id.as_deref().unwrap_or("(hostname)")
+    );
+    eprintln!();
+    eprintln!("  ── cors & rate limiting ────────────────────");
+    eprintln!(
+        "  SIRR_CORS_ORIGINS            {}",
+        cfg.cors_origins.as_deref().unwrap_or("—")
+    );
+    eprintln!(
+        "  SIRR_CORS_METHODS            {}",
+        cfg.cors_methods.as_deref().unwrap_or("(all)")
+    );
+    eprintln!(
+        "  SIRR_RATE_LIMIT_PER_SECOND   {}",
+        cfg.rate_limit_per_second
+    );
+    eprintln!("  SIRR_RATE_LIMIT_BURST        {}", cfg.rate_limit_burst);
+    eprintln!();
+    eprintln!("  ── webhooks & audit ────────────────────────");
+    eprintln!(
+        "  SIRR_WEBHOOK_SECRET          {}",
+        mask(&cfg.webhook_secret)
+    );
+    eprintln!(
+        "  SIRR_WEBHOOK_ALLOWED_ORIGINS {}",
+        if cfg.webhook_allowed_origins.is_empty() {
+            "—"
+        } else {
+            &cfg.webhook_allowed_origins
+        }
+    );
+    eprintln!(
+        "  SIRR_AUDIT_RETENTION_DAYS    {}",
+        cfg.audit_retention_days
+    );
+    eprintln!(
+        "  SIRR_AUDIT_REDACT_KEYS       {}",
+        bool_str(cfg.redact_audit_keys)
+    );
     eprintln!();
 }
 
@@ -666,7 +743,7 @@ async fn add_security_headers(req: Request, next: Next) -> Response {
 }
 
 /// Prints the mandatory security notice when a key was auto-generated.
-/// Bypasses `NO_BANNER`; only `NO_SECURITY_BANNER=1` can suppress it.
+/// Bypasses `SIRR_NO_BANNER`; only `SIRR_NO_SECURITY_BANNER=1` can suppress it.
 fn print_security_notice(cfg: &ServerConfig) {
     let Some(ref key) = cfg.auto_generated_key else {
         return;
@@ -685,7 +762,7 @@ fn print_security_notice(cfg: &ServerConfig) {
     eprintln!("  !!  this server on any network.  It changes on every restart");
     eprintln!("  !!  until you persist it as SIRR_MASTER_API_KEY.");
     eprintln!("  !!");
-    eprintln!("  !!  Suppress this notice: NO_SECURITY_BANNER=1");
+    eprintln!("  !!  Suppress this notice: SIRR_NO_SECURITY_BANNER=1");
     eprintln!("  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
     eprintln!();
 }

@@ -40,8 +40,13 @@ pub fn instance_id_from_key(key_bytes: &[u8]) -> String {
 /// The first heartbeat fires immediately. Failures are logged at `warn`
 /// level and never retried — the next interval tick will try again.
 pub fn spawn_heartbeat(config: HeartbeatConfig) {
+    let tls_insecure = std::env::var("SIRR_TLS_INSECURE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
+        .danger_accept_invalid_certs(tls_insecure)
         .build()
         .expect("build heartbeat reqwest client");
 

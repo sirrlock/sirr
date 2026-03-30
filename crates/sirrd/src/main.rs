@@ -82,11 +82,11 @@ async fn main() -> Result<()> {
 // ── Command implementations ───────────────────────────────────────────────────
 
 async fn cmd_serve(host: String, port: u16, log_level: String, init: bool) -> Result<()> {
-    let no_banner = std::env::var("NO_BANNER")
+    let no_banner = std::env::var("SIRR_NO_BANNER")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    let no_security_banner = std::env::var("NO_SECURITY_BANNER")
+    let no_security_banner = std::env::var("SIRR_NO_SECURITY_BANNER")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
@@ -122,6 +122,7 @@ async fn cmd_serve(host: String, port: u16, log_level: String, init: bool) -> Re
         no_banner,
         no_security_banner,
         auto_init,
+        version: BUILD_VERSION.to_string(),
         ..Default::default()
     };
 

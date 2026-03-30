@@ -134,8 +134,13 @@ impl WebhookSender {
         per_secret_signing_key: Option<String>,
         allowed_origins: Arc<Vec<String>>,
     ) -> Self {
+        let tls_insecure = std::env::var("SIRR_TLS_INSECURE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
+            .danger_accept_invalid_certs(tls_insecure)
             .build()
             .expect("build webhook reqwest client");
 
