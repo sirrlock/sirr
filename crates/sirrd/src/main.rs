@@ -84,10 +84,10 @@ async fn cmd_serve(host: String, port: u16, log_level: String, init: bool) -> Re
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    // If SIRR_API_KEY is not set, generate a random key so the server is
+    // If SIRR_MASTER_API_KEY is not set, generate a random key so the server is
     // never left open.  The key is shown in the security notice and must be
     // persisted by the operator if they want it to survive a restart.
-    let env_api_key = std::env::var("SIRR_API_KEY").ok();
+    let env_api_key = std::env::var("SIRR_MASTER_API_KEY").ok();
     let (api_key, auto_generated_key) = match env_api_key {
         Some(k) => (Some(k), None),
         None => {

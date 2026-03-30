@@ -25,7 +25,7 @@ Single Rust binary, zero runtime dependencies, end-to-end encrypted.
 ## Authentication
 
 Two auth modes:
-- **Master key** (`SIRR_API_KEY`): full access, used for bootstrapping and public bucket writes
+- **Master key** (`SIRR_MASTER_API_KEY`): full access, used for bootstrapping and public bucket writes
 - **Principal key** (Bearer token): org-scoped, role-based permissions, time-windowed
 
 ## HTTP API — Public Bucket (backward compatible)
@@ -115,7 +115,7 @@ sirr webhooks list|add|remove [--org ORG]
 
 ## Environment Variables
 
-SIRR_API_KEY           Master key for server auth
+SIRR_MASTER_API_KEY           Master key for server auth
 SIRR_LICENSE_KEY       License key for tier limits (get at sirrlock.com/pricing)
 SIRR_PORT              HTTP port (default: 39999)
 SIRR_HOST              Bind address (default: 0.0.0.0)
@@ -158,7 +158,7 @@ Tools: get_secret, push_secret, list_secrets, delete_secret, prune_secrets,
 
 ## Security Model
 
-- Master key delivered via file or env var (SIRR_API_KEY)
+- Master key delivered via file or env var (SIRR_MASTER_API_KEY)
 - ChaCha20Poly1305 encrypts each secret value with a random per-record nonce
 - Encryption key is a random 32-byte file (sirr.key), generated on first boot
 - Metadata (TTL, read count) stored plaintext for efficient expiry scanning

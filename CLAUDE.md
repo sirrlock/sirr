@@ -52,7 +52,7 @@ cargo fmt --all                                # Formatter
 # With auto-init (creates default org + admin principal + temp keys):
 ./target/release/sirrd serve --init
 # Or via env: SIRR_AUTOINIT=true ./target/release/sirrd serve
-# Optionally protect writes: SIRR_API_KEY=my-key ./target/release/sirrd serve
+# Optionally protect writes: SIRR_MASTER_API_KEY=my-key ./target/release/sirrd serve
 
 # Use CLI client
 ./target/release/sirr push FOO=bar
@@ -84,7 +84,7 @@ key + per-record nonce --ChaCha20Poly1305--> encrypted value stored in redb
 - `delete` flag on SecretRecord: `true` (default) = burn on max_reads, `false` = seal (block reads, allow PATCH). PATCH only works on `delete=false` secrets.
 - `Store::get()` returns `GetResult` enum: `Value(String)`, `Sealed`, or `NotFound` — handler maps to 200, 410, 404.
 - Encryption key is a random 32-byte key stored as `sirr.key` (no more Argon2id derivation).
-- Auth: `SIRR_API_KEY` env var acts as master key. Org routes require either master key or principal key (via `require_auth` middleware). Public bucket reads are unauthenticated.
+- Auth: `SIRR_MASTER_API_KEY` env var acts as master key. Org routes require either master key or principal key (via `require_auth` middleware). Public bucket reads are unauthenticated.
 - Deleting an org requires no principals; deleting a principal requires no active keys (cascading deletes not allowed).
 
 ## Multi-Tenant Architecture

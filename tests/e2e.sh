@@ -17,13 +17,13 @@ check() {
 }
 
 # ── Start isolated sirrd with auto-init ───────────────────────────────────────
-# SIRR_API_KEY:    HTTP auth master key
+# SIRR_MASTER_API_KEY:    HTTP auth master key
 # SIRR_AUTOINIT=1: bootstrap default org + admin principal + 2 temp keys (30 min)
 # SIRR_LICENSE_KEY: format-valid key → Business tier (unlimited orgs + principals)
 MASTER_KEY="e2e-test-api-key"
 LICENSE_KEY="sirr_lic_0000000000000000000000000000000000000000"
 E2E_DIR=$(mktemp -d)
-SIRR_DATA_DIR="$E2E_DIR" SIRR_API_KEY="$MASTER_KEY" SIRR_AUTOINIT=1 \
+SIRR_DATA_DIR="$E2E_DIR" SIRR_MASTER_API_KEY="$MASTER_KEY" SIRR_AUTOINIT=1 \
   SIRR_LICENSE_KEY="$LICENSE_KEY" sirrd serve --port $PORT >"$E2E_DIR/sirrd.log" 2>&1 &
 SIRRD_PID=$!
 trap "kill $SIRRD_PID 2>/dev/null; rm -rf '$E2E_DIR'" EXIT
