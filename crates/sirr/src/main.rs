@@ -15,8 +15,8 @@ struct Cli {
     #[arg(long, env = "SIRR_SERVER", default_value = "sirr://localhost:39999")]
     server: String,
 
-    /// API key for write operations ($SIRR_API_KEY)
-    #[arg(long, env = "SIRR_API_KEY")]
+    /// API key for write operations ($SIRR_MASTER_API_KEY)
+    #[arg(long, env = "SIRR_MASTER_API_KEY")]
     api_key: Option<String>,
 
     #[command(subcommand)]

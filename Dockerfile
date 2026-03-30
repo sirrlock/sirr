@@ -19,8 +19,8 @@ COPY --from=builder /build/target/release/sirrd /sirrd
 # Data directory — mount a volume here for persistence.
 VOLUME ["/data"]
 
-# Key file directory — mount a read-only volume here for file-based key delivery.
-# Preferred over SIRR_MASTER_KEY env var in production (env vars are visible via
+# Encryption key file directory — mount a read-only volume here for file-based key delivery.
+# Preferred over SIRR_MASTER_ENCRYPTION_KEY env var in production (env vars are visible via
 # docker inspect and /proc).
 VOLUME ["/run/secrets"]
 

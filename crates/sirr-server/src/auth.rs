@@ -21,7 +21,7 @@ use crate::store::permissions::{PermBit, Permissions};
 /// migrated will switch to extracting `ResolvedAuth`.
 #[derive(Debug, Clone)]
 pub enum ResolvedAuth {
-    /// Authenticated via the root `SIRR_API_KEY`. Has no org/principal
+    /// Authenticated via the root `SIRR_MASTER_API_KEY`. Has no org/principal
     /// context — used for instance-wide admin operations.
     Master,
     /// Authenticated via a principal key. Carries the resolved identity
@@ -163,12 +163,12 @@ fn unauthorized() -> Response {
 ///
 /// Auth flow:
 /// 1. Extract Bearer token from Authorization header
-/// 2. Check against SIRR_API_KEY (constant-time) → `ResolvedAuth::Master`
+/// 2. Check against SIRR_MASTER_API_KEY (constant-time) → `ResolvedAuth::Master`
 /// 3. SHA-256 hash the token, look up in `find_principal_key_by_hash()`
 /// 4. Validate `valid_after` / `valid_before` window
 /// 5. Resolve principal → role → permissions
 /// 6. Insert `ResolvedAuth::Principal` as extension
-/// 7. No SIRR_API_KEY and no keys at all → open mode (Master)
+/// 7. No SIRR_MASTER_API_KEY and no keys at all → open mode (Master)
 pub async fn require_auth(
     State(state): State<AppState>,
     mut request: Request,
@@ -271,7 +271,7 @@ pub async fn require_auth(
     unauthorized()
 }
 
-/// Axum middleware that only accepts the root `SIRR_API_KEY`.
+/// Axum middleware that only accepts the root `SIRR_MASTER_API_KEY`.
 ///
 /// Produces `ResolvedAuth::Master`. Keeps open-mode behavior: if no key
 /// is configured, all requests are allowed through as Master.

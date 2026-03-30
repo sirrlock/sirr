@@ -6,11 +6,11 @@ services:
     volumes:
       # Persistent data (database + salt).
       - sirr-data:/data
-      # Master key file — read-only mount. Preferred over SIRR_MASTER_KEY env var.
+      # Encryption key file — read-only mount. Preferred over SIRR_MASTER_ENCRYPTION_KEY env var.
       # Create the key: openssl rand -hex 32 > ./master.key && chmod 400 ./master.key
       - ./master.key:/run/secrets/master.key:ro
     environment:
-      SIRR_MASTER_KEY_FILE: /run/secrets/master.key
+      SIRR_MASTER_ENCRYPTION_KEY_FILE: /run/secrets/master.key
       SIRR_DATA_DIR: /data
       SIRR_HOST: "0.0.0.0"
       SIRR_PORT: "39999"

@@ -25,10 +25,10 @@ use crate::{
     license,
     org_handlers::{
         create_key, create_org, create_org_secret, create_org_webhook, create_principal,
-        create_role, delete_key, delete_org, delete_org_secret, delete_org_webhook,
-        delete_principal, delete_role, get_me, get_org_secret, head_org_secret, list_org_secrets,
-        list_org_webhooks, list_orgs, list_principals, list_roles, org_audit_events, patch_me,
-        patch_org_secret, prune_org_secrets,
+        create_principal_key, create_role, delete_key, delete_org, delete_org_secret,
+        delete_org_webhook, delete_principal, delete_role, get_me, get_org_secret, head_org_secret,
+        list_org_secrets, list_org_webhooks, list_orgs, list_principals, list_roles,
+        org_audit_events, patch_me, patch_org_secret, prune_org_secrets,
     },
     AppState,
 };
@@ -73,12 +73,12 @@ pub struct ServerConfig {
     pub rate_limit_per_second: u64,
     /// Per-IP burst allowance (tokens). $SIRR_RATE_LIMIT_BURST.
     pub rate_limit_burst: u32,
-    /// Set when `SIRR_API_KEY` was absent and a key was auto-generated.
+    /// Set when `SIRR_MASTER_API_KEY` was absent and a key was auto-generated.
     /// The value is the raw generated key, printed in the security notice.
     pub auto_generated_key: Option<String>,
     /// Set `NO_SECURITY_BANNER=1` to suppress the mandatory security notice
     /// shown when a key is auto-generated.  Has no effect when `api_key` was
-    /// explicitly configured via `SIRR_API_KEY`.
+    /// explicitly configured via `SIRR_MASTER_API_KEY`.
     pub no_security_banner: bool,
     /// When true (default), the legacy public /secrets bucket routes are
     /// enabled. Set `ENABLE_PUBLIC_BUCKET=false` or `0` to disable them
@@ -97,7 +97,7 @@ impl Default for ServerConfig {
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(39999),
-            api_key: std::env::var("SIRR_API_KEY").ok(),
+            api_key: std::env::var("SIRR_MASTER_API_KEY").ok(),
             license_key: std::env::var("SIRR_LICENSE_KEY").ok(),
             data_dir: std::env::var("SIRR_DATA_DIR").ok().map(PathBuf::from),
             sweep_interval: Duration::from_secs(300),
@@ -162,19 +162,19 @@ pub fn read_key_file(path: &std::path::Path) -> Result<String> {
     Ok(key)
 }
 
-/// Resolve the master key from `SIRR_MASTER_KEY_FILE` (preferred) or `SIRR_MASTER_KEY`.
+/// Resolve the master encryption key from `SIRR_MASTER_ENCRYPTION_KEY_FILE` (preferred) or `SIRR_MASTER_ENCRYPTION_KEY`.
 /// File-based delivery is recommended for production — env vars are visible via
 /// `docker inspect` and `/proc`.
 pub fn resolve_master_key() -> Result<String> {
-    if let Ok(path) = std::env::var("SIRR_MASTER_KEY_FILE") {
+    if let Ok(path) = std::env::var("SIRR_MASTER_ENCRYPTION_KEY_FILE") {
         let key = read_key_file(std::path::Path::new(&path))?;
-        if std::env::var("SIRR_MASTER_KEY").is_ok() {
-            tracing::warn!("both SIRR_MASTER_KEY and SIRR_MASTER_KEY_FILE are set; using file");
+        if std::env::var("SIRR_MASTER_ENCRYPTION_KEY").is_ok() {
+            tracing::warn!("both SIRR_MASTER_ENCRYPTION_KEY and SIRR_MASTER_ENCRYPTION_KEY_FILE are set; using file");
         }
         return Ok(key);
     }
-    std::env::var("SIRR_MASTER_KEY")
-        .context("SIRR_MASTER_KEY or SIRR_MASTER_KEY_FILE environment variable is required")
+    std::env::var("SIRR_MASTER_ENCRYPTION_KEY")
+        .context("SIRR_MASTER_ENCRYPTION_KEY or SIRR_MASTER_ENCRYPTION_KEY_FILE environment variable is required")
 }
 
 /// Resolve the data directory and load the persisted salt.
@@ -382,6 +382,10 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         .route("/orgs/{org_id}/principals", post(create_principal))
         .route("/orgs/{org_id}/principals", get(list_principals))
         .route("/orgs/{org_id}/principals/{id}", delete(delete_principal))
+        .route(
+            "/orgs/{org_id}/principals/{id}/keys",
+            post(create_principal_key),
+        )
         // Roles
         .route("/orgs/{org_id}/roles", post(create_role))
         .route("/orgs/{org_id}/roles", get(list_roles))
@@ -611,10 +615,10 @@ fn print_banner(
     let version = env!("CARGO_PKG_VERSION");
     let addr = format!("http://{}:{}", cfg.host, cfg.port);
 
-    let token_source = if std::env::var("SIRR_MASTER_KEY_FILE").is_ok() {
-        "SIRR_MASTER_KEY_FILE"
+    let enc_key_source = if std::env::var("SIRR_MASTER_ENCRYPTION_KEY_FILE").is_ok() {
+        "SIRR_MASTER_ENCRYPTION_KEY_FILE"
     } else {
-        "SIRR_MASTER_KEY"
+        "SIRR_MASTER_ENCRYPTION_KEY"
     };
 
     let tier = match lic_status {
@@ -635,7 +639,7 @@ fn print_banner(
     eprintln!("  address   {addr}");
     eprintln!("  data      {}", data_dir.display());
     eprintln!("  log       {}", cfg.log_level);
-    eprintln!("  token     {token_source}");
+    eprintln!("  enc key   {enc_key_source}");
     eprintln!("  tier      {tier}");
     eprintln!();
 }
@@ -673,13 +677,13 @@ fn print_security_notice(cfg: &ServerConfig) {
     eprintln!();
     eprintln!("  !! SECURITY NOTICE !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
     eprintln!("  !!");
-    eprintln!("  !!  No SIRR_API_KEY was set.  A random key has been generated:");
+    eprintln!("  !!  No SIRR_MASTER_API_KEY was set.  A random key has been generated:");
     eprintln!("  !!");
-    eprintln!("  !!    SIRR_API_KEY={key}");
+    eprintln!("  !!    SIRR_MASTER_API_KEY={key}");
     eprintln!("  !!");
     eprintln!("  !!  Copy this key and set it in your environment before exposing");
     eprintln!("  !!  this server on any network.  It changes on every restart");
-    eprintln!("  !!  until you persist it as SIRR_API_KEY.");
+    eprintln!("  !!  until you persist it as SIRR_MASTER_API_KEY.");
     eprintln!("  !!");
     eprintln!("  !!  Suppress this notice: NO_SECURITY_BANNER=1");
     eprintln!("  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");

@@ -74,7 +74,7 @@ docker run -d \
   -p 39999:39999 \
   -v ./sirr-data:/data \
   -v ./master.key:/run/secrets/master.key:ro \
-  -e SIRR_MASTER_KEY_FILE=/run/secrets/master.key \
+  -e SIRR_MASTER_ENCRYPTION_KEY_FILE=/run/secrets/master.key \
   ghcr.io/sirrlock/sirrd
 ```
 
@@ -91,7 +91,7 @@ Or as a binary:
 
 ```bash
 ./sirrd serve
-# Optionally protect writes: SIRR_API_KEY=my-key ./sirrd serve
+# Optionally protect writes: SIRR_MASTER_API_KEY=my-key ./sirrd serve
 ```
 
 ### Push and retrieve
@@ -135,7 +135,7 @@ npm install -g @sirrlock/mcp
       "command": "sirr-mcp",
       "env": {
         "SIRR_SERVER": "http://localhost:39999",
-        "SIRR_API_KEY": "your-api-key"
+        "SIRR_MASTER_API_KEY": "your-api-key"
       }
     }
   }
@@ -157,7 +157,7 @@ Claude: [calls push_secret("STRIPE_KEY", "sk_test_...", reads=1, ttl=1800)]
 ```python
 from sirr import SirrClient
 
-sirr = SirrClient(server="http://localhost:39999", api_key=os.environ.get("SIRR_API_KEY"))
+sirr = SirrClient(server="http://localhost:39999", api_key=os.environ.get("SIRR_MASTER_API_KEY"))
 
 # Give an agent a one-use credential
 sirr.push("DB_URL", connection_string, reads=1, ttl=3600)
@@ -222,7 +222,7 @@ The bootstrap prints org ID, principal ID, and two temporary API keys (valid 30 
 ### Org management (requires master key)
 
 ```bash
-export SIRR_API_KEY=<master-key>
+export SIRR_MASTER_API_KEY=<master-key>
 
 sirr orgs create "My Team"
 sirr orgs list
@@ -234,7 +234,7 @@ sirr me create-key --name deploy-key    # using a principal key
 
 ```bash
 # With a principal API key:
-export SIRR_API_KEY=<principal-key>
+export SIRR_MASTER_API_KEY=<principal-key>
 
 sirr push DB_URL=postgres://... --org <org_id>
 sirr get DB_URL --org <org_id>
@@ -284,7 +284,7 @@ X-Sirr-Status: active          (or "sealed")
 
 ### `GET /health` → `{ "status": "ok" }`
 
-**Protected routes** (require `Authorization: Bearer <SIRR_API_KEY>` if `SIRR_API_KEY` is set):
+**Protected routes** (require `Authorization: Bearer <SIRR_MASTER_API_KEY>` if `SIRR_MASTER_API_KEY` is set):
 
 ### `POST /secrets`
 ```json
@@ -323,7 +323,7 @@ Returns metadata only — values are never included in list responses.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SIRR_API_KEY` | auto-generated | Protects all authenticated endpoints. Printed at startup if not set — copy and persist it. |
+| `SIRR_MASTER_API_KEY` | auto-generated | Protects all authenticated endpoints. Printed at startup if not set — copy and persist it. |
 | `SIRR_LICENSE_KEY` | — | Required for >100 active secrets |
 | `SIRR_PORT` | `39999` | HTTP listen port |
 | `SIRR_HOST` | `0.0.0.0` | Bind address |
@@ -339,14 +339,14 @@ Returns metadata only — values are never included in list responses.
 
 **CORS design note:** sirrd is a backend service, not a browser API. `GET /secrets/{key}` deliberately returns **no** `Access-Control-Allow-Origin` header — browsers block cross-origin reads of secret values by design, regardless of `SIRR_CORS_ORIGINS`. Management endpoints (create, list, delete, keys) do respect `SIRR_CORS_ORIGINS` so a trusted admin UI on a different origin can talk to them. If you need browser clients to read secrets, run them on the same origin as sirrd or proxy through your own backend.
 
-One of `SIRR_MASTER_KEY_FILE` or `SIRR_MASTER_KEY` is required. If both are set, the file takes precedence. File-based key delivery is recommended for production because environment variables are visible via `docker inspect` and `/proc`.
+One of `SIRR_MASTER_ENCRYPTION_KEY_FILE` or `SIRR_MASTER_ENCRYPTION_KEY` is required. If both are set, the file takes precedence. File-based key delivery is recommended for production because environment variables are visible via `docker inspect` and `/proc`.
 
 **CLI / client variables:**
 
 | Variable | Default | Description |
 |---|---|---|
 | `SIRR_SERVER` | `sirr://localhost:39999` | Server base URL (`sirr://` → http, `sirrs://` → https) |
-| `SIRR_API_KEY` | — | Same value as server's `SIRR_API_KEY` (for write ops) |
+| `SIRR_MASTER_API_KEY` | — | Same value as server's `SIRR_MASTER_API_KEY` (for write ops) |
 
 **Key rotation variables** (used by `sirr rotate`):
 
@@ -374,7 +374,7 @@ CLI / Node SDK / Python SDK / .NET SDK / MCP Server
 
 - `sirr.key` — random 32-byte encryption key, generated on first run, stored beside `sirr.db`
 - Per-record random 12-byte nonce; value field is encrypted, metadata is not
-- Reads are public (no auth). Writes optionally protected by `SIRR_API_KEY`
+- Reads are public (no auth). Writes optionally protected by `SIRR_MASTER_API_KEY`
 
 ---
 

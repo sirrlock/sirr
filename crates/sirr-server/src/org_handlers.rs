@@ -754,6 +754,90 @@ pub async fn create_key(
     }
 }
 
+/// Master-auth endpoint: create a key for a specific principal.
+/// Used by sirrlock.com for org provisioning (creating the first owner key).
+pub async fn create_principal_key(
+    State(state): State<AppState>,
+    Extension(auth): Extension<ResolvedAuth>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path((org_id, principal_id)): Path<(String, String)>,
+    Json(body): Json<CreateKeyRequest>,
+) -> Response {
+    if !matches!(auth, ResolvedAuth::Master) {
+        return forbidden();
+    }
+
+    // Verify the principal exists and belongs to this org.
+    let principals = match state.store.list_principals(&org_id) {
+        Ok(ps) => ps,
+        Err(e) => return internal_error(e),
+    };
+    if !principals.iter().any(|p| p.id == principal_id) {
+        return not_found("principal not found in this org");
+    }
+
+    if body.name.is_empty() || body.name.len() > 128 {
+        return bad_request("key name must be 1-128 characters");
+    }
+
+    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
+    let now = now_epoch();
+
+    let mut bytes = [0u8; 16];
+    rand::Rng::fill(&mut rand::thread_rng(), &mut bytes);
+    let raw_key = format!("sirr_key_{}", hex::encode(bytes));
+    let key_hash = Sha256::digest(raw_key.as_bytes()).to_vec();
+    let id = generate_id();
+
+    let valid_after = now;
+    let valid_before = if let Some(vb) = body.valid_before {
+        vb
+    } else if let Some(vfs) = body.valid_for_seconds {
+        now + vfs
+    } else {
+        now + 365 * 86400
+    };
+
+    let key_record = PrincipalKeyRecord {
+        id: id.clone(),
+        principal_id: principal_id.clone(),
+        org_id: org_id.clone(),
+        name: body.name.clone(),
+        key_hash,
+        valid_after,
+        valid_before,
+        created_at: now,
+    };
+
+    match state.store.put_principal_key(&key_record) {
+        Ok(()) => {
+            info!(key_id = %id, principal_id = %principal_id, "audit: key.create (master)");
+            let _ = state.store.record_audit(AuditEvent::new(
+                ACTION_KEY_CREATE,
+                None,
+                ip,
+                true,
+                Some(format!("key_id={id}")),
+                Some(org_id),
+                Some(principal_id),
+            ));
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "id": id,
+                    "name": body.name,
+                    "key": raw_key,
+                    "valid_after": valid_after,
+                    "valid_before": valid_before,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => internal_error(e),
+    }
+}
+
 pub async fn delete_key(
     State(state): State<AppState>,
     Extension(auth): Extension<ResolvedAuth>,

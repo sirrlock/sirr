@@ -23,7 +23,7 @@ docker rm -f sirr-e2e-test 2>/dev/null || true
 
 docker run -d --name sirr-e2e-test \
   -p "${PORT}:39999" \
-  -e SIRR_API_KEY="$DOCKER_KEY" \
+  -e SIRR_MASTER_API_KEY="$DOCKER_KEY" \
   ghcr.io/sirrlock/sirrd
 
 # Wait for health
