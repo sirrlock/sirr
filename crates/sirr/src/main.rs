@@ -8,8 +8,14 @@ use tracing_subscriber::EnvFilter;
 
 // ── CLI definition ─────────────────────────────────────────────────────────────
 
+/// Build version: CI sets SIRR_BUILD_VERSION at compile time; local builds use Cargo.toml version.
+const BUILD_VERSION: &str = match option_env!("SIRR_BUILD_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
-#[command(name = "sirr", about = "Sirr — ephemeral secret vault", version)]
+#[command(name = "sirr", about = "Sirr — ephemeral secret vault", version = BUILD_VERSION)]
 struct Cli {
     /// Sirr server URL (default: sirr://localhost:39999 or $SIRR_SERVER)
     #[arg(long, env = "SIRR_SERVER", default_value = "sirr://localhost:39999")]
