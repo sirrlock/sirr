@@ -254,7 +254,7 @@ Custom roles can be created per-org with any combination of the 15 permission bi
 
 ### Disabling the public bucket
 
-Set `ENABLE_PUBLIC_BUCKET=false` to serve only org-scoped routes.
+Set `SIRR_ENABLE_PUBLIC_BUCKET=false` to serve only org-scoped routes.
 
 ---
 
@@ -332,9 +332,9 @@ Returns metadata only — values are never included in list responses.
 | `SIRR_LOG_LEVEL` | `info` | `trace` / `debug` / `info` / `warn` / `error` |
 | `SIRR_RATE_LIMIT_PER_SECOND` | `10` | Per-IP request rate (steady-state, all routes) |
 | `SIRR_RATE_LIMIT_BURST` | `30` | Per-IP burst allowance |
-| `NO_BANNER` | `0` | Set to `1` to suppress the startup banner |
-| `NO_SECURITY_BANNER` | `0` | Set to `1` to suppress the auto-generated key notice |
-| `ENABLE_PUBLIC_BUCKET` | `true` | Set to `false` to disable legacy `/secrets` routes |
+| `SIRR_NO_BANNER` | `0` | Set to `1` to suppress the startup banner |
+| `SIRR_NO_SECURITY_BANNER` | `0` | Set to `1` to suppress the auto-generated key notice |
+| `SIRR_ENABLE_PUBLIC_BUCKET` | `true` | Set to `false` to disable legacy `/secrets` routes |
 | `SIRR_AUTOINIT` | `false` | Set to `true` to auto-create default org on first boot |
 
 **CORS design note:** sirrd is a backend service, not a browser API. `GET /secrets/{key}` deliberately returns **no** `Access-Control-Allow-Origin` header — browsers block cross-origin reads of secret values by design, regardless of `SIRR_CORS_ORIGINS`. Management endpoints (create, list, delete, keys) do respect `SIRR_CORS_ORIGINS` so a trusted admin UI on a different origin can talk to them. If you need browser clients to read secrets, run them on the same origin as sirrd or proxy through your own backend.

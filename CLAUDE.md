@@ -93,7 +93,7 @@ key + per-record nonce --ChaCha20Poly1305--> encrypted value stored in redb
 - **Org buckets** (`/orgs/{org_id}/secrets/*`): require principal auth via `require_auth` middleware
 - **Roles**: reader, writer, admin, owner (built-in) + custom per-org. Permissions are a 15-bit bitflag serialized as a letter string (e.g. `"rRlLcCpPaAmMdD"`)
 - **Keys**: unlimited named keys per principal, time-windowed (`valid_after`/`valid_before`), hard-deletable
-- **`ENABLE_PUBLIC_BUCKET`**: env var to disable public bucket (default: true)
+- **`SIRR_ENABLE_PUBLIC_BUCKET`**: env var to disable public bucket (default: true)
 - **`SIRR_AUTOINIT`** / `--init`: auto-create default org + admin principal + 2 temporary keys on first boot
 
 ## Testing
