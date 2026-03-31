@@ -20,7 +20,8 @@ use crate::{
     auth::{require_auth, require_master_key},
     handlers::{
         audit_events, create_secret, create_webhook, delete_secret, delete_webhook, get_secret,
-        head_secret, health, list_secrets, list_webhooks, patch_secret, prune_secrets, version,
+        head_secret, health, list_secrets, list_webhooks, patch_secret, prune_secrets,
+        redirect_to_secret, version,
     },
     license,
     org_handlers::{
@@ -426,7 +427,8 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         let secret_public = Router::new()
             .route("/secrets", post(create_secret))
             .route("/secrets/{key}", get(get_secret))
-            .route("/secrets/{key}", head(head_secret));
+            .route("/secrets/{key}", head(head_secret))
+            .route("/s/{key}", get(redirect_to_secret));
 
         // Protected public bucket routes (require_master_key middleware).
         let protected_public_bucket = Router::new()

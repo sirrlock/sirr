@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
@@ -97,6 +97,10 @@ const BUILD_VERSION: &str = match option_env!("SIRR_BUILD_VERSION") {
 
 pub async fn version() -> impl IntoResponse {
     Json(json!({"name": "sirrd", "version": BUILD_VERSION}))
+}
+
+pub async fn redirect_to_secret(Path(key): Path<String>) -> Redirect {
+    Redirect::temporary(&format!("/secrets/{key}"))
 }
 
 // ── Audit query ──────────────────────────────────────────────────────────────
