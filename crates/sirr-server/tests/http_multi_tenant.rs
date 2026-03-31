@@ -426,6 +426,7 @@ async fn key_binding_via_http() {
         .json(&json!({
             "key": "DEPLOY_TOKEN",
             "value": "secret-deploy-value",
+            "max_reads": 10,
             "allowed_keys": ["deploy_key"]
         }))
         .await;
