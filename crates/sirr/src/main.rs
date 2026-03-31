@@ -23,12 +23,12 @@ const BUILD_VERSION: &str = match option_env!("SIRR_BUILD_VERSION") {
     disable_version_flag = true
 )]
 struct Cli {
-    /// Server URL [default: https://sirrlock.com]
+    /// Server URL [default: https://sirr.sirrlock.com]
     #[arg(
         short = 's',
         long,
         env = "SIRR_SERVER",
-        default_value = "https://sirrlock.com"
+        default_value = "https://sirr.sirrlock.com"
     )]
     server: String,
 
