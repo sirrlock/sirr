@@ -1,0 +1,26 @@
+PackageIdentifier: sirrlock.Sirrd
+PackageVersion: 1.0.0
+PackageName: Sirrd
+Publisher: Sirrlock
+License: BUSL-1.1
+ShortDescription: Ephemeral secret vault server — burn-after-read secrets for developers
+PackageUrl: https://sirrlock.com
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/sirrlock/sirr/releases/download/v1.0.0/sirrd-windows-x64.zip
+    InstallerSha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    InstallerType: zip
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: sirrd.exe
+        PortableCommandAlias: sirrd
+  - Architecture: arm64
+    InstallerUrl: https://github.com/sirrlock/sirr/releases/download/v1.0.0/sirrd-windows-arm64.zip
+    InstallerSha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    InstallerType: zip
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: sirrd.exe
+        PortableCommandAlias: sirrd
+ManifestType: singleton
+ManifestVersion: 1.6.0
