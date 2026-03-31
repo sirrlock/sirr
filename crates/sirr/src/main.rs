@@ -615,7 +615,7 @@ async fn cmd_push(ctx: &Ctx, value: &str, ttl: Option<&str>, reads: Option<u32>)
 
     let json: Value = resp.json().await?;
     let id = json["id"].as_str().unwrap_or("?");
-    let url = format!("{}/s/{}", ctx.server, id);
+    let url = format!("{}/secrets/{}", ctx.server, id);
 
     println!("{}", serde_json::json!({"id": id, "url": url}));
     Ok(())
