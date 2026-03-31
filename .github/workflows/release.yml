@@ -274,6 +274,7 @@ jobs:
     needs: github-release
     permissions:
       contents: read
+      id-token: write
 
     steps:
       - uses: actions/checkout@v4
@@ -286,11 +287,10 @@ jobs:
       - name: Set version and publish
         working-directory: packages/npm-sirr
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           PKG_VERSION: ${{ env.VERSION }}
         run: |
           npm version "$PKG_VERSION" --no-git-tag-version
-          npm publish --access public || echo "Already published or token missing — skipping"
+          npm publish --access public --provenance || echo "Already published — skipping"
 
   update-homebrew:
     name: Update Homebrew formulas (sirrd + sirr)
