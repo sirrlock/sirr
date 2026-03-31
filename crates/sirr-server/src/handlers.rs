@@ -89,6 +89,16 @@ pub async fn health() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
 }
 
+/// Build version: CI sets SIRR_BUILD_VERSION at compile time; local builds use Cargo.toml version.
+const BUILD_VERSION: &str = match option_env!("SIRR_BUILD_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
+pub async fn version() -> impl IntoResponse {
+    Json(json!({"name": "sirrd", "version": BUILD_VERSION}))
+}
+
 // ── Audit query ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]

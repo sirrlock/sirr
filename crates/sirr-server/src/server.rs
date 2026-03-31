@@ -20,7 +20,7 @@ use crate::{
     auth::{require_auth, require_master_key},
     handlers::{
         audit_events, create_secret, create_webhook, delete_secret, delete_webhook, get_secret,
-        head_secret, health, list_secrets, list_webhooks, patch_secret, prune_secrets,
+        head_secret, health, list_secrets, list_webhooks, patch_secret, prune_secrets, version,
     },
     license,
     org_handlers::{
@@ -370,6 +370,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     // Public informational routes (no auth, CORS allowed).
     let public = Router::new()
         .route("/health", get(health))
+        .route("/version", get(version))
         .route("/robots.txt", get(robots_txt))
         .route("/security.txt", get(security_txt))
         .route("/.well-known/security.txt", get(security_txt))
