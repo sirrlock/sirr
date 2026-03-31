@@ -320,6 +320,7 @@ mod tests {
                 since: None,
                 until: None,
                 action: Some("license.validate".into()),
+                key: None,
                 limit: 100,
                 org_id: None,
             })

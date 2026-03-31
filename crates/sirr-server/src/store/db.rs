@@ -103,6 +103,13 @@ impl Store {
             .as_secs() as i64
     }
 
+    /// Check whether a public-bucket secret key exists (no read counter increment).
+    pub fn exists(&self, secret_key: &str) -> Result<bool> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SECRETS)?;
+        Ok(table.get(secret_key)?.is_some())
+    }
+
     /// Insert or overwrite a secret.
     pub fn put(
         &self,
@@ -467,6 +474,14 @@ impl Store {
         Ok(())
     }
 
+    /// Check whether an org-scoped secret key exists (no read counter increment, no decryption).
+    pub fn org_secret_exists(&self, org_id: &str, key: &str) -> Result<bool> {
+        let table_key = Self::org_secret_key(org_id, key);
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SECRETS)?;
+        Ok(table.get(table_key.as_str())?.is_some())
+    }
+
     /// Retrieve an org-scoped secret, incrementing its read counter.
     pub fn get_org_secret(&self, org_id: &str, key: &str) -> Result<GetResult> {
         let table_key = Self::org_secret_key(org_id, key);
@@ -734,6 +749,11 @@ impl Store {
             }
             if let Some(ref action) = query.action {
                 if event.action != *action {
+                    continue;
+                }
+            }
+            if let Some(ref key_filter) = query.key {
+                if event.key.as_deref() != Some(key_filter.as_str()) {
                     continue;
                 }
             }
@@ -1522,6 +1542,7 @@ mod tests {
             since: None,
             until: None,
             action: None,
+            key: None,
             limit: 100,
             org_id: None,
         };
@@ -1563,6 +1584,7 @@ mod tests {
                 since: None,
                 until: None,
                 action: Some("secret.create".into()),
+                key: None,
                 limit: 100,
                 org_id: None,
             })
@@ -1575,6 +1597,7 @@ mod tests {
                 since: None,
                 until: None,
                 action: None,
+                key: None,
                 limit: 2,
                 org_id: None,
             })
@@ -1619,6 +1642,7 @@ mod tests {
                 since: None,
                 until: None,
                 action: None,
+                key: None,
                 limit: 100,
                 org_id: None,
             })

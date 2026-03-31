@@ -217,24 +217,26 @@ fn add_named_key(
 async fn public_bucket_push_and_read() {
     let (server, _store, _dir) = build_test_app();
 
-    // POST /secrets with master key → 201
+    // POST /secrets — value-only, server generates random ID → 201
     let resp = server
         .post("/secrets")
         .authorization_bearer(MASTER_KEY)
-        .json(&json!({"key": "TOKEN", "value": "abc123"}))
+        .json(&json!({"value": "abc123", "max_reads": 3}))
         .await;
     resp.assert_status(axum::http::StatusCode::CREATED);
     let body: Value = resp.json();
-    assert_eq!(body["key"], "TOKEN");
+    let id = body["id"].as_str().expect("response should contain 'id'");
+    assert_eq!(id.len(), 64, "ID should be 256-bit hex (64 chars)");
 
-    // GET /secrets/TOKEN without auth → 200
-    let resp = server.get("/secrets/TOKEN").await;
+    // GET /secrets/{id} without auth → 200
+    let resp = server.get(&format!("/secrets/{id}")).await;
     resp.assert_status(axum::http::StatusCode::OK);
     let body: Value = resp.json();
     assert_eq!(body["value"], "abc123");
+    assert_eq!(body["id"], id);
 
-    // HEAD /secrets/TOKEN → 200 with X-Sirr headers
-    let resp = server.method(Method::HEAD, "/secrets/TOKEN").await;
+    // HEAD /secrets/{id} → 200 with X-Sirr headers
+    let resp = server.method(Method::HEAD, &format!("/secrets/{id}")).await;
     resp.assert_status(axum::http::StatusCode::OK);
     assert!(resp.headers().get("x-sirr-read-count").is_some());
     assert!(resp.headers().get("x-sirr-status").is_some());
@@ -278,6 +280,42 @@ async fn org_full_lifecycle() {
     // GET /secrets/DB_URL (public bucket) → 404 (not in public bucket)
     let resp = server.get("/secrets/DB_URL").await;
     resp.assert_status(axum::http::StatusCode::NOT_FOUND);
+}
+
+// ── Test 2b: Org duplicate key returns 409 ─────────────────────────────────
+
+#[tokio::test]
+async fn org_duplicate_key_returns_409() {
+    let (server, store, _dir) = build_test_app();
+
+    let (org_id, _principal_id, raw_key) =
+        bootstrap_org_with_key(&store, "dupes", "alice", "writer");
+
+    // First push → 201
+    let resp = server
+        .post(&format!("/orgs/{org_id}/secrets"))
+        .authorization_bearer(&raw_key)
+        .json(&json!({"key": "TOKEN", "value": "first"}))
+        .await;
+    resp.assert_status(axum::http::StatusCode::CREATED);
+
+    // Second push with same key → 409 Conflict
+    let resp = server
+        .post(&format!("/orgs/{org_id}/secrets"))
+        .authorization_bearer(&raw_key)
+        .json(&json!({"key": "TOKEN", "value": "second"}))
+        .await;
+    resp.assert_status(axum::http::StatusCode::CONFLICT);
+    let body: Value = resp.json();
+    assert_eq!(body["error"], "secret_exists");
+
+    // Original value should still be intact
+    let resp = server
+        .get(&format!("/orgs/{org_id}/secrets/TOKEN"))
+        .authorization_bearer(&raw_key)
+        .await;
+    resp.assert_status(axum::http::StatusCode::OK);
+    assert_eq!(resp.json::<Value>()["value"], "first");
 }
 
 // ── Test 3: Org isolation between orgs ──────────────────────────────────────
@@ -336,13 +374,15 @@ async fn public_and_org_secrets_coexist() {
 
     let (org_id, _pid, raw_key) = bootstrap_org_with_key(&store, "coexist", "agent", "writer");
 
-    // Push SHARED to public bucket
+    // Push to public bucket (value-only; server returns random id)
     let resp = server
         .post("/secrets")
         .authorization_bearer(MASTER_KEY)
-        .json(&json!({"key": "SHARED", "value": "public_value"}))
+        .json(&json!({"value": "public_value"}))
         .await;
     resp.assert_status(axum::http::StatusCode::CREATED);
+    let public_id = resp.json::<Value>()["id"].as_str().unwrap().to_owned();
+    assert!(!public_id.is_empty());
 
     // Push SHARED to org
     let resp = server
@@ -352,8 +392,8 @@ async fn public_and_org_secrets_coexist() {
         .await;
     resp.assert_status(axum::http::StatusCode::CREATED);
 
-    // GET public → public_value
-    let resp = server.get("/secrets/SHARED").await;
+    // GET public by id → public_value
+    let resp = server.get(&format!("/secrets/{public_id}")).await;
     resp.assert_status(axum::http::StatusCode::OK);
     assert_eq!(resp.json::<Value>()["value"], "public_value");
 
