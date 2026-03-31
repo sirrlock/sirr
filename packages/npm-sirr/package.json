@@ -1,5 +1,5 @@
 {
-  "name": "sirr",
+  "name": "@sirrlock/cli",
   "version": "0.0.0",
   "description": "Ephemeral secret sharing CLI — burn-after-read secrets for developers",
   "license": "MIT",
