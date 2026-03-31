@@ -43,7 +43,7 @@ pub fn decrypt(key: &EncryptionKey, ciphertext: &[u8], nonce_bytes: &[u8; 12]) -
     Ok(plaintext)
 }
 
-/// Generate a random 32-byte encryption key (no Argon2id derivation).
+/// Generate a random 32-byte encryption key via OsRng.
 pub fn generate_key() -> EncryptionKey {
     let mut key = [0u8; 32];
     OsRng.fill_bytes(&mut key);
