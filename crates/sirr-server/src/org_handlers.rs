@@ -19,9 +19,10 @@ use crate::{
         audit::{
             AuditEvent, ACTION_KEY_CREATE, ACTION_KEY_DELETE, ACTION_ORG_CREATE, ACTION_ORG_DELETE,
             ACTION_PRINCIPAL_CREATE, ACTION_PRINCIPAL_DELETE, ACTION_ROLE_CREATE,
-            ACTION_ROLE_DELETE, ACTION_SECRET_BURNED, ACTION_SECRET_CREATE, ACTION_SECRET_DELETE,
-            ACTION_SECRET_LIST, ACTION_SECRET_PATCH, ACTION_SECRET_PRUNE, ACTION_SECRET_READ,
-            ACTION_WEBHOOK_CREATE, ACTION_WEBHOOK_DELETE,
+            ACTION_ROLE_DELETE, ACTION_SECRET_BURNED, ACTION_SECRET_CREATE,
+            ACTION_SECRET_CREATE_REJECTED, ACTION_SECRET_DELETE, ACTION_SECRET_LIST,
+            ACTION_SECRET_PATCH, ACTION_SECRET_PRUNE, ACTION_SECRET_READ, ACTION_WEBHOOK_CREATE,
+            ACTION_WEBHOOK_DELETE,
         },
         org::{validate_metadata, OrgRecord, PrincipalKeyRecord, PrincipalRecord, RoleRecord},
         permissions::{PermBit, Permissions},
@@ -928,6 +929,28 @@ pub async fn create_org_secret(
 
     let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
 
+    // Reject if key already exists (no silent overwrites).
+    match state.store.org_secret_exists(&org_id, &body.key) {
+        Ok(true) => {
+            let _ = state.store.record_audit(AuditEvent::new(
+                ACTION_SECRET_CREATE_REJECTED,
+                Some(body.key.clone()),
+                ip.clone(),
+                false,
+                Some("key_exists".into()),
+                Some(org_id.clone()),
+                auth.principal_id().map(|s| s.to_owned()),
+            ));
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "secret_exists", "message": format!("Key '{}' already exists. Delete it first.", body.key)})),
+            )
+                .into_response();
+        }
+        Ok(false) => {} // key doesn't exist, proceed with creation
+        Err(e) => return internal_error(e),
+    }
+
     let expires_at = body.ttl_seconds.map(|ttl| now_epoch() + ttl as i64);
 
     let max_reads = body.max_reads.or(Some(1));
@@ -1412,6 +1435,7 @@ pub struct OrgAuditQueryParams {
     pub since: Option<i64>,
     pub until: Option<i64>,
     pub action: Option<String>,
+    pub key: Option<String>,
     pub limit: Option<usize>,
 }
 
@@ -1433,6 +1457,7 @@ pub async fn org_audit_events(
         since: params.since,
         until: params.until,
         action: params.action,
+        key: params.key,
         limit,
         org_id: Some(org_id),
     };

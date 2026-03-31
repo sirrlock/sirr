@@ -15,15 +15,33 @@ const BUILD_VERSION: &str = match option_env!("SIRR_BUILD_VERSION") {
 };
 
 #[derive(Parser)]
-#[command(name = "sirr", about = "Sirr — ephemeral secret vault", version = BUILD_VERSION)]
+#[command(
+    name = "sirr",
+    about = "Sirr — ephemeral secrets that know when to disappear",
+    version = BUILD_VERSION,
+    disable_version_flag = true
+)]
 struct Cli {
-    /// Sirr server URL (default: sirr://localhost:39999 or $SIRR_SERVER)
-    #[arg(long, env = "SIRR_SERVER", default_value = "sirr://localhost:39999")]
+    /// Server URL [default: https://sirrlock.com]
+    #[arg(
+        short = 's',
+        long,
+        env = "SIRR_SERVER",
+        default_value = "https://sirrlock.com"
+    )]
     server: String,
 
-    /// API key for write operations ($SIRR_MASTER_API_KEY)
-    #[arg(long, env = "SIRR_MASTER_API_KEY")]
+    /// API key for authentication
+    #[arg(short = 'k', long, env = "SIRR_API_KEY")]
     api_key: Option<String>,
+
+    /// Organization scope
+    #[arg(short = 'o', long, env = "SIRR_ORG")]
+    org: Option<String>,
+
+    /// Print version
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    version: (),
 
     #[command(subcommand)]
     command: Commands,
@@ -31,106 +49,131 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Push a secret: `KEY=value` or a `.env` file path
+    /// Push a secret to the public dead drop
+    #[command(
+        after_long_help = "Examples:\n  sirr push \"my-api-key\"\n  sirr push \"db://user:pass@host\" --ttl 1h --reads 3"
+    )]
     Push {
-        /// KEY=value pair or path to a .env file
-        #[arg(name = "TARGET")]
-        target: String,
-        /// TTL duration e.g. 1h, 30m, 7d
+        /// Secret value to push
+        #[arg(name = "VALUE")]
+        value: String,
+        /// TTL duration (e.g. 1h, 30m, 7d)
         #[arg(long)]
         ttl: Option<String>,
-        /// Maximum number of reads before self-destructing
+        /// Max reads before burn [default: server decides]
         #[arg(long)]
         reads: Option<u32>,
-        /// Keep the secret after reads are exhausted (enables PATCH)
+    },
+
+    /// Set a named secret in an org (requires --org)
+    #[command(
+        after_long_help = "Examples:\n  sirr set DB_PASS=hunter2 --org myteam\n  sirr set CERT -f ./cert.pem --org myteam\n  sirr set TOKEN=abc --org myteam --share"
+    )]
+    Set {
+        /// KEY=VALUE pair
+        #[arg(name = "TARGET")]
+        target: String,
+        /// Read value from file instead of argument
+        #[arg(short = 'f', long = "file")]
+        file: Option<String>,
+        /// TTL duration (e.g. 1h, 30m, 7d)
+        #[arg(long)]
+        ttl: Option<String>,
+        /// Max reads before burn [default: server decides]
+        #[arg(long)]
+        reads: Option<u32>,
+        /// Keep sealed after reads exhausted (enables patch)
         #[arg(long)]
         no_delete: bool,
-        /// Organization ID (if operating on org secrets)
+        /// Return shareable URL in response
         #[arg(long)]
-        org: Option<String>,
+        share: bool,
     },
-    /// Get a secret by key
+
+    /// Retrieve a secret by ID (public) or key name (org)
+    #[command(
+        after_long_help = "Examples:\n  sirr get 13e8399ee6d70824\n  sirr get DB_PASS --org myteam\n  DB_PASS=$(sirr get abc123)"
+    )]
     Get {
-        /// Secret key name
-        key: String,
-        /// Organization ID (if operating on org secrets)
-        #[arg(long)]
-        org: Option<String>,
+        /// Secret ID (public) or key name (with --org)
+        #[arg(name = "ID_OR_KEY")]
+        id_or_key: String,
     },
-    /// Pull all secrets into a .env file
-    Pull {
-        /// Path to write the .env file (default: .env)
-        #[arg(default_value = ".env")]
-        path: String,
-        /// Organization ID (if operating on org secrets)
-        #[arg(long)]
-        org: Option<String>,
+
+    /// List org secrets (metadata only, requires --org)
+    #[command(after_long_help = "Examples:\n  sirr list --org myteam")]
+    List,
+
+    /// Delete a secret
+    #[command(
+        after_long_help = "Examples:\n  sirr delete 13e8399ee6d70824\n  sirr delete DB_PASS --org myteam"
+    )]
+    Delete {
+        /// Secret ID (public) or key name (with --org)
+        #[arg(name = "ID_OR_KEY")]
+        id_or_key: String,
     },
-    /// Run a command with secrets injected as environment variables
+
+    /// Remove expired/burned secrets
+    #[command(
+        after_long_help = "Examples:\n  sirr prune --org myteam\n  sirr prune --api-key <KEY>"
+    )]
+    Prune,
+
+    /// Run a command with org secrets as env vars (requires --org)
+    #[command(
+        after_long_help = "Examples:\n  sirr run --org myteam -- node server.js\n  sirr run --org myteam -- docker compose up"
+    )]
     Run {
         /// Command and arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
-        /// Organization ID (if operating on org secrets)
-        #[arg(long)]
-        org: Option<String>,
     },
-    /// Print a shareable one-time URL for a secret
-    Share {
-        /// Secret key name
-        key: String,
-        /// Organization ID (if operating on org secrets)
-        #[arg(long)]
-        org: Option<String>,
+
+    /// Pull org secrets to a .env file (requires --org)
+    #[command(after_long_help = "Examples:\n  sirr pull .env --org myteam")]
+    Pull {
+        /// Path to write the .env file [default: .env]
+        #[arg(default_value = ".env")]
+        path: String,
     },
-    /// List all active secrets (metadata only)
-    List {
-        /// Organization ID (if operating on org secrets)
-        #[arg(long)]
-        org: Option<String>,
-    },
-    /// Delete a secret
-    Delete {
-        /// Secret key name
-        key: String,
-        /// Organization ID (if operating on org secrets)
-        #[arg(long)]
-        org: Option<String>,
-    },
-    /// Delete all expired secrets immediately
-    Prune {
-        /// Organization ID (if operating on org secrets)
-        #[arg(long)]
-        org: Option<String>,
-    },
+
     /// Manage webhooks
     #[command(subcommand)]
     Webhooks(WebhookCommand),
-    /// Query the audit log
+
+    /// View audit log
+    #[command(
+        after_long_help = "Examples:\n  sirr audit --org myteam\n  sirr audit --key DB_PASS --org myteam\n  sirr audit --action secret.read --since 1711900000"
+    )]
     Audit {
-        /// Filter by timestamp (Unix epoch seconds)
+        /// Filter by secret key or ID
         #[arg(long)]
-        since: Option<i64>,
-        /// Filter by action type (e.g. secret.create)
+        key: Option<String>,
+        /// Filter by action (e.g. secret.create, secret.read)
         #[arg(long)]
         action: Option<String>,
-        /// Maximum events to return
+        /// Filter from timestamp (unix epoch)
+        #[arg(long)]
+        since: Option<i64>,
+        /// Max events [default: 50]
         #[arg(long, default_value = "50")]
         limit: usize,
-        /// Organization ID (if operating on org audit)
-        #[arg(long)]
-        org: Option<String>,
     },
+
     /// Manage scoped API keys
     #[command(subcommand)]
     Keys(KeyCommand),
     /// Manage organizations
     #[command(subcommand)]
     Orgs(OrgCommand),
-    /// Manage principals
+    /// Manage org members
     #[command(subcommand)]
     Principals(PrincipalCommand),
-    /// View/manage my account
+
+    /// Show current identity & connection info
+    ///
+    /// Example: sirr me
     #[command(subcommand)]
     Me(MeCommand),
 }
@@ -138,11 +181,7 @@ enum Commands {
 #[derive(Subcommand)]
 enum WebhookCommand {
     /// List registered webhooks
-    List {
-        /// Organization ID (if operating on org webhooks)
-        #[arg(long)]
-        org: Option<String>,
-    },
+    List,
     /// Register a webhook URL
     Add {
         /// Webhook endpoint URL
@@ -151,18 +190,12 @@ enum WebhookCommand {
         /// Comma-separated event types (default: all)
         #[arg(long, value_delimiter = ',')]
         events: Option<Vec<String>>,
-        /// Organization ID (if operating on org webhooks)
-        #[arg(long)]
-        org: Option<String>,
     },
-    /// Remove a webhook by ID
-    Remove {
+    /// Delete a webhook by ID
+    Delete {
         /// Webhook ID
         #[arg(name = "ID")]
         id: String,
-        /// Organization ID (if operating on org webhooks)
-        #[arg(long)]
-        org: Option<String>,
     },
 }
 
@@ -208,28 +241,18 @@ enum OrgCommand {
 
 #[derive(Subcommand)]
 enum PrincipalCommand {
-    /// List principals in an organization
-    List {
-        /// Organization ID
-        #[arg(long)]
-        org: String,
-    },
-    /// Create a new principal
+    /// List org members
+    List,
+    /// Add an org member
     Create {
-        /// Organization ID
-        #[arg(long)]
-        org: String,
         /// Principal name
         name: String,
-        /// Role to assign (default: writer)
+        /// Role [default: writer]
         #[arg(long, default_value = "writer")]
         role: String,
     },
-    /// Delete a principal by ID
+    /// Remove an org member
     Delete {
-        /// Organization ID
-        #[arg(long)]
-        org: String,
         /// Principal ID
         id: String,
     },
@@ -268,10 +291,13 @@ struct Ctx {
 
 impl Ctx {
     fn new(server: String, api_key: Option<String>) -> Self {
-        let server = server
-            .trim_end_matches('/')
-            .replace("sirr://", "http://")
-            .replace("sirrs://", "https://");
+        let server = server.trim_end_matches('/').to_string();
+        // If no scheme, default to https
+        let server = if !server.starts_with("http://") && !server.starts_with("https://") {
+            format!("https://{server}")
+        } else {
+            server
+        };
         Self {
             client: Client::new(),
             server,
@@ -301,6 +327,11 @@ impl Ctx {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+fn require_org(org: &Option<String>) -> Result<&str> {
+    org.as_deref()
+        .ok_or_else(|| anyhow::anyhow!("this command requires --org or $SIRR_ORG"))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -313,58 +344,77 @@ async fn main() -> Result<()> {
     let ctx = Ctx::new(cli.server, cli.api_key);
 
     match cli.command {
-        Commands::Push {
+        Commands::Push { value, ttl, reads } => cmd_push(&ctx, &value, ttl.as_deref(), reads).await,
+
+        Commands::Set {
             target,
+            file,
             ttl,
             reads,
             no_delete,
-            org,
+            share,
         } => {
-            cmd_push(
+            let org = require_org(&cli.org)?;
+            cmd_set(
                 &ctx,
                 &target,
+                file.as_deref(),
                 ttl.as_deref(),
                 reads,
                 !no_delete,
-                org.as_deref(),
+                share,
+                org,
             )
             .await
         }
 
-        Commands::Get { key, org } => cmd_get(&ctx, &key, org.as_deref()).await,
+        Commands::Get { id_or_key } => cmd_get(&ctx, &id_or_key, cli.org.as_deref()).await,
 
-        Commands::Pull { path, org } => cmd_pull(&ctx, &path, org.as_deref()).await,
-
-        Commands::Run { command, org } => cmd_run(&ctx, &command, org.as_deref()).await,
-
-        Commands::Share { key, org } => {
-            let path = secrets_path(org.as_deref());
-            println!("{}/{}/{}", ctx.server, path, key);
-            Ok(())
+        Commands::List => {
+            let org = require_org(&cli.org)?;
+            cmd_list(&ctx, Some(org)).await
         }
 
-        Commands::List { org } => cmd_list(&ctx, org.as_deref()).await,
+        Commands::Delete { id_or_key } => cmd_delete(&ctx, &id_or_key, cli.org.as_deref()).await,
 
-        Commands::Delete { key, org } => cmd_delete(&ctx, &key, org.as_deref()).await,
+        Commands::Prune => cmd_prune(&ctx, cli.org.as_deref()).await,
 
-        Commands::Prune { org } => cmd_prune(&ctx, org.as_deref()).await,
+        Commands::Run { command } => {
+            let org = require_org(&cli.org)?;
+            cmd_run(&ctx, &command, Some(org)).await
+        }
+
+        Commands::Pull { path } => {
+            let org = require_org(&cli.org)?;
+            cmd_pull(&ctx, &path, Some(org)).await
+        }
 
         Commands::Webhooks(sub) => match sub {
-            WebhookCommand::List { org } => cmd_webhook_list(&ctx, org.as_deref()).await,
-            WebhookCommand::Add { url, events, org } => {
-                cmd_webhook_add(&ctx, &url, events, org.as_deref()).await
+            WebhookCommand::List => cmd_webhook_list(&ctx, cli.org.as_deref()).await,
+            WebhookCommand::Add { url, events } => {
+                cmd_webhook_add(&ctx, &url, events, cli.org.as_deref()).await
             }
-            WebhookCommand::Remove { id, org } => {
-                cmd_webhook_remove(&ctx, &id, org.as_deref()).await
+            WebhookCommand::Delete { id } => {
+                cmd_webhook_remove(&ctx, &id, cli.org.as_deref()).await
             }
         },
 
         Commands::Audit {
-            since,
+            key,
             action,
+            since,
             limit,
-            org,
-        } => cmd_audit(&ctx, since, action.as_deref(), limit, org.as_deref()).await,
+        } => {
+            cmd_audit(
+                &ctx,
+                since,
+                action.as_deref(),
+                key.as_deref(),
+                limit,
+                cli.org.as_deref(),
+            )
+            .await
+        }
 
         Commands::Keys(sub) => match sub {
             KeyCommand::List => cmd_key_list(&ctx).await,
@@ -382,13 +432,16 @@ async fn main() -> Result<()> {
             OrgCommand::Delete { id } => cmd_org_delete(&ctx, &id).await,
         },
 
-        Commands::Principals(sub) => match sub {
-            PrincipalCommand::List { org } => cmd_principal_list(&ctx, &org).await,
-            PrincipalCommand::Create { org, name, role } => {
-                cmd_principal_create(&ctx, &org, &name, &role).await
+        Commands::Principals(sub) => {
+            let org = require_org(&cli.org)?;
+            match sub {
+                PrincipalCommand::List => cmd_principal_list(&ctx, org).await,
+                PrincipalCommand::Create { name, role } => {
+                    cmd_principal_create(&ctx, org, &name, &role).await
+                }
+                PrincipalCommand::Delete { id } => cmd_principal_delete(&ctx, org, &id).await,
             }
-            PrincipalCommand::Delete { org, id } => cmd_principal_delete(&ctx, &org, &id).await,
-        },
+        }
 
         Commands::Me(sub) => match sub {
             MeCommand::Info => cmd_me_info(&ctx).await,
@@ -514,36 +567,76 @@ async fn fetch_value(ctx: &Ctx, key: &str, org: Option<&str>) -> Result<String> 
 
 // ── Command implementations ───────────────────────────────────────────────────
 
-async fn cmd_push(
-    ctx: &Ctx,
-    target: &str,
-    ttl: Option<&str>,
-    reads: Option<u32>,
-    delete: bool,
-    org: Option<&str>,
-) -> Result<()> {
+async fn cmd_push(ctx: &Ctx, value: &str, ttl: Option<&str>, reads: Option<u32>) -> Result<()> {
     let ttl_seconds = ttl.map(parse_duration).transpose()?;
+    let body = serde_json::json!({
+        "value": value,
+        "ttl_seconds": ttl_seconds,
+        "max_reads": reads,
+    });
 
-    if !target.contains('=') {
-        return push_env_file(ctx, target, ttl_seconds, reads, delete, org).await;
-    }
+    let resp = require_success(
+        ctx.post("secrets")
+            .json(&body)
+            .send()
+            .await
+            .context("HTTP request failed")?,
+    )
+    .await?;
 
-    let (key, value) = target
-        .split_once('=')
-        .context("expected KEY=value or a .env file path")?;
+    let json: Value = resp.json().await?;
+    let id = json["id"].as_str().unwrap_or("?");
+    let url = format!("{}/s/{}", ctx.server, id);
 
-    push_one(ctx, key, value, ttl_seconds, reads, delete, org).await?;
-    println!("✓ pushed {key}");
+    println!("{}", serde_json::json!({"id": id, "url": url}));
     Ok(())
 }
 
-async fn push_env_file(
+#[allow(clippy::too_many_arguments)]
+async fn cmd_set(
+    ctx: &Ctx,
+    target: &str,
+    file: Option<&str>,
+    ttl: Option<&str>,
+    reads: Option<u32>,
+    delete: bool,
+    share: bool,
+    org: &str,
+) -> Result<()> {
+    let ttl_seconds = ttl.map(parse_duration).transpose()?;
+
+    // Handle -f (value from file)
+    if let Some(file_path) = file {
+        if target.contains('=') {
+            anyhow::bail!("cannot use -f with KEY=VALUE syntax; use -f with just the KEY name, or omit -f for inline values");
+        }
+
+        // Check if file is a .env file (multiple key=value lines)
+        if file_path.ends_with(".env") || file_path.starts_with(".env") {
+            return set_env_file(ctx, file_path, ttl_seconds, reads, delete, org).await;
+        }
+
+        // Single key with value from file
+        let value = std::fs::read_to_string(file_path)
+            .with_context(|| format!("read file: {file_path}"))?;
+        return set_one(ctx, target, &value, ttl_seconds, reads, delete, share, org).await;
+    }
+
+    // KEY=VALUE inline
+    let (key, value) = target
+        .split_once('=')
+        .context("expected KEY=VALUE (use -f to read value from a file)")?;
+
+    set_one(ctx, key, value, ttl_seconds, reads, delete, share, org).await
+}
+
+async fn set_env_file(
     ctx: &Ctx,
     path: &str,
     ttl_seconds: Option<u64>,
     reads: Option<u32>,
     delete: bool,
-    org: Option<&str>,
+    org: &str,
 ) -> Result<()> {
     let entries =
         dotenvy::from_filename_iter(path).with_context(|| format!("read .env file: {path}"))?;
@@ -551,22 +644,23 @@ async fn push_env_file(
     let mut count = 0usize;
     for entry in entries {
         let (key, value) = entry.context("parse .env entry")?;
-        push_one(ctx, &key, &value, ttl_seconds, reads, delete, org).await?;
-        println!("✓ pushed {key}");
+        set_one(ctx, &key, &value, ttl_seconds, reads, delete, false, org).await?;
         count += 1;
     }
-    println!("{count} secret(s) pushed from {path}");
+    println!("{count} secret(s) set from {path}");
     Ok(())
 }
 
-async fn push_one(
+#[allow(clippy::too_many_arguments)]
+async fn set_one(
     ctx: &Ctx,
     key: &str,
     value: &str,
     ttl_seconds: Option<u64>,
     max_reads: Option<u32>,
     delete: bool,
-    org: Option<&str>,
+    share: bool,
+    org: &str,
 ) -> Result<()> {
     let body = serde_json::json!({
         "key": key,
@@ -576,19 +670,41 @@ async fn push_one(
         "delete": delete,
     });
 
-    require_success(
-        ctx.post(&secrets_path(org))
-            .json(&body)
-            .send()
-            .await
-            .context("HTTP request failed")?,
-    )
-    .await?;
+    let path = format!("orgs/{org}/secrets");
+    let resp = ctx
+        .post(&path)
+        .json(&body)
+        .send()
+        .await
+        .context("HTTP request failed")?;
+
+    let status = resp.status();
+    let json: Value = resp.json().await.context("parse response")?;
+
+    if status == reqwest::StatusCode::CONFLICT {
+        let msg = json["message"].as_str().unwrap_or("key already exists");
+        anyhow::bail!("✗ {msg}");
+    }
+
+    if !status.is_success() {
+        let error = json["error"].as_str().unwrap_or("unknown error");
+        anyhow::bail!("server returned {status}: {error}");
+    }
+
+    let key_name = json["key"].as_str().unwrap_or(key);
+    if share {
+        println!("{}", serde_json::json!({"key": key_name}));
+    } else {
+        println!("✓ set {key_name}");
+    }
     Ok(())
 }
 
-async fn cmd_get(ctx: &Ctx, key: &str, org: Option<&str>) -> Result<()> {
-    let path = format!("{}/{}", secrets_path(org), key);
+async fn cmd_get(ctx: &Ctx, id_or_key: &str, org: Option<&str>) -> Result<()> {
+    let path = match org {
+        Some(org_id) => format!("orgs/{org_id}/secrets/{id_or_key}"),
+        None => format!("secrets/{id_or_key}"),
+    };
     let resp = ctx.get(&path).send().await.context("HTTP request failed")?;
 
     let status = resp.status();
@@ -788,6 +904,7 @@ async fn cmd_audit(
     ctx: &Ctx,
     since: Option<i64>,
     action: Option<&str>,
+    key: Option<&str>,
     limit: usize,
     org: Option<&str>,
 ) -> Result<()> {
@@ -797,6 +914,9 @@ async fn cmd_audit(
     }
     if let Some(a) = action {
         url.push_str(&format!("&action={a}"));
+    }
+    if let Some(k) = key {
+        url.push_str(&format!("&key={k}"));
     }
 
     let resp = require_success(ctx.get(&url).send().await.context("HTTP request failed")?).await?;
@@ -809,14 +929,14 @@ async fn cmd_audit(
             for e in arr {
                 let ts = e["timestamp"].as_i64().unwrap_or(0);
                 let action = e["action"].as_str().unwrap_or("?");
-                let key = e["key"].as_str().unwrap_or("-");
+                let ekey = e["key"].as_str().unwrap_or("-");
                 let ip = e["source_ip"].as_str().unwrap_or("?");
                 let ok = if e["success"].as_bool().unwrap_or(false) {
                     "ok"
                 } else {
                     "FAIL"
                 };
-                println!("  [{ts}] {action} key={key} ip={ip} {ok}");
+                println!("  [{ts}] {action} key={ekey} ip={ip} {ok}");
             }
         }
         None => println!("(no audit events)"),
@@ -1032,25 +1152,29 @@ async fn cmd_principal_delete(ctx: &Ctx, org: &str, id: &str) -> Result<()> {
 // ── Me ────────────────────────────────────────────────────────────────────
 
 async fn cmd_me_info(ctx: &Ctx) -> Result<()> {
-    let resp = require_success(ctx.get("me").send().await.context("HTTP request failed")?).await?;
+    let resp = ctx.get("me").send().await.context("HTTP request failed")?;
 
-    let json: Value = resp.json().await?;
-    let id = json["id"].as_str().unwrap_or("?");
-    let name = json["name"].as_str().unwrap_or("?");
-    let org_id = json["org_id"].as_str().unwrap_or("?");
-    let role = json["role"].as_str().unwrap_or("?");
-    println!("  id:     {id}");
-    println!("  name:   {name}");
-    println!("  org:    {org_id}");
-    println!("  role:   {role}");
+    if resp.status().is_success() {
+        let json: Value = resp.json().await?;
+        let name = json["name"].as_str().unwrap_or("?");
+        let org_id = json["org_id"].as_str().unwrap_or("?");
+        let role = json["role"].as_str().unwrap_or("?");
+        let key_count = json["keys"].as_array().map(|a| a.len()).unwrap_or(0);
+        println!(
+            "{name} · {org_id} · {role} · {key_count} keys · {}",
+            ctx.server
+        );
 
-    if let Some(keys) = json["keys"].as_array() {
-        println!("  keys:");
-        for k in keys {
-            let kid = k["id"].as_str().unwrap_or("?");
-            let kname = k["name"].as_str().unwrap_or("?");
-            println!("    {kid}  {kname}");
+        if let Some(keys) = json["keys"].as_array() {
+            for k in keys {
+                let kid = k["id"].as_str().unwrap_or("?");
+                let kname = k["name"].as_str().unwrap_or("?");
+                println!("  {kid}  {kname}");
+            }
         }
+    } else {
+        // Anonymous — no valid auth, just show connection info
+        println!("anonymous · {}", ctx.server);
     }
     Ok(())
 }

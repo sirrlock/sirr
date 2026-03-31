@@ -22,6 +22,7 @@ pub const ACTION_PRINCIPAL_CREATE: &str = "principal.create";
 pub const ACTION_PRINCIPAL_DELETE: &str = "principal.delete";
 pub const ACTION_ROLE_CREATE: &str = "role.create";
 pub const ACTION_ROLE_DELETE: &str = "role.delete";
+pub const ACTION_SECRET_CREATE_REJECTED: &str = "secret.create_rejected";
 
 // ── AuditEvent ───────────────────────────────────────────────────────────────
 
@@ -75,6 +76,7 @@ pub struct AuditQuery {
     pub since: Option<i64>,
     pub until: Option<i64>,
     pub action: Option<String>,
+    pub key: Option<String>,
     pub limit: usize,
     pub org_id: Option<String>,
 }

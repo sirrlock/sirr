@@ -96,6 +96,7 @@ pub struct AuditQueryParams {
     pub since: Option<i64>,
     pub until: Option<i64>,
     pub action: Option<String>,
+    pub key: Option<String>,
     pub limit: Option<usize>,
 }
 
@@ -110,6 +111,7 @@ pub async fn audit_events(
         since: params.since,
         until: params.until,
         action: params.action,
+        key: params.key,
         limit,
         org_id: None,
     };
@@ -168,7 +170,6 @@ pub async fn list_secrets(
 
 #[derive(Debug, Deserialize)]
 pub struct CreateRequest {
-    pub key: String,
     pub value: String,
     pub ttl_seconds: Option<u64>,
     pub max_reads: Option<u32>,
@@ -178,7 +179,7 @@ pub struct CreateRequest {
 
 #[derive(Debug, Serialize)]
 pub struct CreateResponse {
-    pub key: String,
+    pub id: String,
 }
 
 pub async fn create_secret(
@@ -187,12 +188,9 @@ pub async fn create_secret(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<CreateRequest>,
 ) -> Response {
-    // Public bucket: no auth required — the secret key itself is the access token.
+    // Public bucket: no auth required — the returned ID is the access token.
     let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
 
-    if !validate_key_name(&body.key) {
-        return bad_key_name();
-    }
     if body.max_reads == Some(0) {
         return (
             StatusCode::BAD_REQUEST,
@@ -226,12 +224,16 @@ pub async fn create_secret(
         }
     }
 
+    // Generate a random 256-bit hex ID — the caller uses this as the access token.
+    use rand::Rng;
+    let id: String = hex::encode(rand::thread_rng().gen::<[u8; 32]>());
+
     // Licensing is now enforced at org/principal creation, not per-secret.
 
     let max_reads = body.max_reads.or(Some(1));
 
     match state.store.put(
-        &body.key,
+        &id,
         &body.value,
         body.ttl_seconds,
         max_reads,
@@ -240,14 +242,14 @@ pub async fn create_secret(
     ) {
         Ok(()) => {
             info!(
-                key = %body.key,
+                id = %id,
                 ttl_seconds = ?body.ttl_seconds,
                 max_reads = ?max_reads,
                 "audit: secret.create"
             );
             let _ = state.store.record_audit(AuditEvent::new(
                 ACTION_SECRET_CREATE,
-                Some(body.key.clone()),
+                Some(id.clone()),
                 ip,
                 true,
                 None,
@@ -255,9 +257,9 @@ pub async fn create_secret(
                 None,
             ));
             if let Some(ref sender) = state.webhook_sender {
-                sender.fire("secret.created", &body.key, json!({}));
+                sender.fire("secret.created", &id, json!({}));
             }
-            (StatusCode::CREATED, Json(CreateResponse { key: body.key })).into_response()
+            (StatusCode::CREATED, Json(CreateResponse { id })).into_response()
         }
         Err(e) => internal_error(e),
     }
@@ -292,7 +294,7 @@ pub async fn get_secret(
                     sender.fire_for_url(url, "secret.read", &key, json!({}));
                 }
             }
-            Json(json!({ "key": key, "value": value })).into_response()
+            Json(json!({ "id": key, "value": value })).into_response()
         }
         Ok(GetResult::Burned(value, webhook_url)) => {
             let _ = state.store.record_audit(AuditEvent::new(
@@ -310,7 +312,7 @@ pub async fn get_secret(
                     sender.fire_for_url(url, "secret.burned", &key, json!({}));
                 }
             }
-            Json(json!({ "key": key, "value": value })).into_response()
+            Json(json!({ "id": key, "value": value })).into_response()
         }
         Ok(GetResult::Sealed) => {
             let _ = state.store.record_audit(AuditEvent::new(
