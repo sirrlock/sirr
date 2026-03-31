@@ -26,3 +26,5 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 humantime = "2"
+clap_complete = "4"
+clap_mangen = "0.2"

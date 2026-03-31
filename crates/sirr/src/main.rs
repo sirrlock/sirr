@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use reqwest::{Client, Response};
 use serde_json::Value;
 use tracing_subscriber::EnvFilter;
@@ -176,6 +177,14 @@ enum Commands {
     /// Example: sirr me
     #[command(subcommand)]
     Me(MeCommand),
+
+    /// Generate shell completions or man page
+    #[command(hide = true)]
+    Completions {
+        /// Output target: bash, zsh, fish, or man
+        #[arg(name = "SHELL_OR_MAN", value_parser = ["bash", "zsh", "fish", "man"])]
+        target: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -452,6 +461,26 @@ async fn main() -> Result<()> {
             } => cmd_me_create_key(&ctx, &name, valid_for_seconds).await,
             MeCommand::DeleteKey { id } => cmd_me_delete_key(&ctx, &id).await,
         },
+
+        Commands::Completions { target } => {
+            cmd_completions(&target);
+            Ok(())
+        }
+    }
+}
+
+fn cmd_completions(target: &str) {
+    let mut cmd = Cli::command();
+    match target {
+        "bash" => clap_complete::generate(Shell::Bash, &mut cmd, "sirr", &mut std::io::stdout()),
+        "zsh" => clap_complete::generate(Shell::Zsh, &mut cmd, "sirr", &mut std::io::stdout()),
+        "fish" => clap_complete::generate(Shell::Fish, &mut cmd, "sirr", &mut std::io::stdout()),
+        "man" => {
+            let man = clap_mangen::Man::new(cmd);
+            man.render(&mut std::io::stdout())
+                .expect("failed to write man page");
+        }
+        _ => unreachable!("clap validates the value"),
     }
 }
 
