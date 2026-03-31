@@ -1,0 +1,28 @@
+{
+  "name": "sirr",
+  "version": "0.0.0",
+  "description": "Ephemeral secret sharing CLI — burn-after-read secrets for developers",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sirrlock/sirr"
+  },
+  "homepage": "https://sirrlock.com",
+  "keywords": ["secrets", "ephemeral", "burn-after-read", "security", "cli"],
+  "bin": {
+    "sirr": "bin/sirr"
+  },
+  "scripts": {
+    "postinstall": "node install.mjs"
+  },
+  "files": [
+    "bin/",
+    "install.mjs",
+    "README.md"
+  ],
+  "os": ["darwin", "linux", "win32"],
+  "cpu": ["x64", "arm64"],
+  "engines": {
+    "node": ">=18"
+  }
+}

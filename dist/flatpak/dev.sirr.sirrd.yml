@@ -1,0 +1,38 @@
+app-id: dev.sirr.sirrd
+runtime: org.freedesktop.Platform
+runtime-version: "23.08"
+sdk: org.freedesktop.Sdk
+command: sirrd
+
+finish-args:
+  - --share=network
+
+modules:
+  - name: sirrd
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 sirrd /app/bin/sirrd
+      - install -Dm755 sirr /app/bin/sirr
+    sources:
+      - type: archive
+        url: https://github.com/sirrlock/sirr/releases/download/v1.0.0/sirrd-linux-x64.tar.gz
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+        only-arches:
+          - x86_64
+      - type: archive
+        url: https://github.com/sirrlock/sirr/releases/download/v1.0.0/sirrd-linux-arm64.tar.gz
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+        only-arches:
+          - aarch64
+      - type: archive
+        url: https://github.com/sirrlock/sirr/releases/download/v1.0.0/sirr-linux-x64.tar.gz
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+        dest: sirr-cli
+        only-arches:
+          - x86_64
+      - type: archive
+        url: https://github.com/sirrlock/sirr/releases/download/v1.0.0/sirr-linux-arm64.tar.gz
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+        dest: sirr-cli
+        only-arches:
+          - aarch64

@@ -1,0 +1,26 @@
+PackageIdentifier: sirrlock.Sirr
+PackageVersion: 1.0.0
+PackageName: Sirr
+Publisher: Sirrlock
+License: MIT
+ShortDescription: Ephemeral secret vault CLI — burn-after-read secrets for developers
+PackageUrl: https://sirrlock.com
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/sirrlock/sirr/releases/download/v1.0.0/sirr-windows-x64.zip
+    InstallerSha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    InstallerType: zip
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: sirr.exe
+        PortableCommandAlias: sirr
+  - Architecture: arm64
+    InstallerUrl: https://github.com/sirrlock/sirr/releases/download/v1.0.0/sirr-windows-arm64.zip
+    InstallerSha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    InstallerType: zip
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: sirr.exe
+        PortableCommandAlias: sirr
+ManifestType: singleton
+ManifestVersion: 1.6.0

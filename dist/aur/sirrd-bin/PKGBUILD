@@ -1,0 +1,21 @@
+# Maintainer: Sirr <hello@sirrlock.com>
+pkgname=sirrd-bin
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Ephemeral secret vault server — burn-after-read secrets for developers"
+arch=('x86_64' 'aarch64')
+url="https://sirrlock.com"
+license=('BUSL-1.1')
+provides=('sirrd')
+conflicts=('sirrd')
+
+source_x86_64=("https://github.com/sirrlock/sirr/releases/download/v${pkgver}/sirrd-linux-x64.tar.gz")
+source_aarch64=("https://github.com/sirrlock/sirr/releases/download/v${pkgver}/sirrd-linux-arm64.tar.gz")
+
+# Updated by CI — replace with actual checksums before publishing
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+  install -Dm755 sirrd "${pkgdir}/usr/bin/sirrd"
+}
