@@ -55,8 +55,9 @@ cargo fmt --all                                # Formatter
 # Optionally protect writes: SIRR_MASTER_API_KEY=my-key ./target/release/sirrd serve
 
 # Use CLI client
-./target/release/sirr push FOO=bar
-./target/release/sirr get FOO
+./target/release/sirr push "some-secret-value"   # public dead drop → returns URL
+./target/release/sirr set FOO bar --org acme      # org named slot
+./target/release/sirr get FOO --org acme
 ```
 
 ## Architecture
@@ -75,13 +76,16 @@ key + per-record nonce --ChaCha20Poly1305--> encrypted value stored in redb
 - `crates/sirr-server/src/auth.rs` — ResolvedAuth middleware: master key + principal key lookup + role resolution
 - `crates/sirr-server/src/org_handlers.rs` — org-scoped CRUD handlers (orgs, principals, roles, keys, secrets, webhooks, audit)
 - `crates/sirrd/src/main.rs` — clap CLI: `serve` (with `--init`) + `rotate` subcommands (server-side ops only)
-- `crates/sirr/src/main.rs` — clap CLI: `push`, `get`, `pull`, `run`, `share`, `list`, `delete`, `prune`, `webhooks`, `audit`, `keys`, `orgs`, `principals`, `roles`, `me`
+- `crates/sirr/src/main.rs` — clap CLI: `push` (public dead drop), `set` (org named slot), `get`, `pull`, `run`, `list`, `delete`, `prune`, `audit` (`--key` filter), `webhooks`, `keys`, `orgs`, `principals`, `roles`, `me` (works anonymously). Global `--org` / `$SIRR_ORG` flag, `-v` for version. Default server: `https://sirrlock.com`
 
 ## Key Constraints
 
 - `AccessGuard` from redb borrows the table immutably. Always `.to_vec()` the bytes before any mutation on the same table.
 - License tiers are now org/principal-count based (Solo: 1 org / 1 principal, Solo+: 1 / 5, Team: 1 / unlimited, Business: unlimited / unlimited). Free tier = Solo.
-- `delete` flag on SecretRecord: `true` (default) = burn on max_reads, `false` = seal (block reads, allow PATCH). PATCH only works on `delete=false` secrets.
+- **Public bucket** is value-only: `POST /secrets` accepts `{value}` (no `key` field), returns `{id, url}` with a server-generated 256-bit hex ID.
+- **Org secrets** reject duplicates: `POST /orgs/{org}/secrets` returns 409 Conflict + `secret.create_rejected` audit event on duplicate key.
+- **CLI split**: `push` = public dead drop (value only, returns URL), `set` = org named slot (requires `--org` / `$SIRR_ORG`). The `share` command has been removed — `push`/`set` return URLs directly.
+- Default server is `https://sirrlock.com`. Global `--org` / `$SIRR_ORG` flag. `-v` for version. `me` works anonymously. `audit --key` filters by secret key.
 - `Store::get()` returns `GetResult` enum: `Value(String)`, `Sealed`, or `NotFound` — handler maps to 200, 410, 404.
 - Encryption key is a random 32-byte key stored as `sirr.key`. No KDF — Argon2id is unnecessary when keys are already 256-bit random from OsRng.
 - Auth: `SIRR_MASTER_API_KEY` env var acts as master key. Org routes require either master key or principal key (via `require_auth` middleware). Public bucket reads are unauthenticated.
@@ -89,8 +93,8 @@ key + per-record nonce --ChaCha20Poly1305--> encrypted value stored in redb
 
 ## Multi-Tenant Architecture
 
-- **Public bucket** (`/secrets/*`): backward compatible, no auth for reads, master key for writes
-- **Org buckets** (`/orgs/{org_id}/secrets/*`): require principal auth via `require_auth` middleware
+- **Public bucket** (`/secrets/*`): value-only dead drops with server-generated 256-bit hex IDs, no auth for reads, master key for writes
+- **Org buckets** (`/orgs/{org_id}/secrets/*`): named key slots, 409 Conflict on duplicates, require principal auth via `require_auth` middleware
 - **Roles**: reader, writer, admin, owner (built-in) + custom per-org. Permissions are a 15-bit bitflag serialized as a letter string (e.g. `"rRlLcCpPaAmMdD"`)
 - **Keys**: unlimited named keys per principal, time-windowed (`valid_after`/`valid_before`), hard-deletable
 - **`SIRR_ENABLE_PUBLIC_BUCKET`**: env var to disable public bucket (default: true)

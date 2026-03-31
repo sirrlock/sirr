@@ -27,10 +27,11 @@ With ChatGPT, Copilot, Claude, or any AI coding tool:
 **Sirr is different.** The secret is born dying.
 
 ```bash
-# Give Claude exactly one read window — 1 hour, 1 read
-sirr push PROD_DB="postgres://user:pass@host/db" --reads 1 --ttl 1h
+# Dead drop — push a one-time credential, get a URL back
+sirr push "postgres://user:pass@host/db" --reads 1 --ttl 1h
+# → https://sirrlock.com/secrets/a3f8...c9d1
 
-# Tell Claude: "analyze the schema at PROD_DB"
+# Tell Claude: "analyze the schema at this URL"
 # Claude reads it via MCP → read counter hits limit → credential deleted
 # The conversation gets retained. The credential doesn't.
 ```
@@ -94,24 +95,30 @@ Or as a binary:
 # Optionally protect writes: SIRR_MASTER_API_KEY=my-key ./sirrd serve
 ```
 
-### Push and retrieve
+### Public dead drop (push)
 
 ```bash
-# One-time credential (burns after 1 read)
-sirr push DB_URL="postgres://..." --reads 1 --ttl 1h
-sirr get DB_URL      # returns value
-sirr get DB_URL      # 404 — burned
+# Push a value, get a URL with a server-generated 256-bit hex ID
+sirr push "postgres://user:pass@host/db" --reads 1 --ttl 1h
+# → https://sirrlock.com/secrets/a3f8...c9d1
 
-# Patchable secret (keeps the key, allows value updates)
-sirr push CF_TOKEN=abc123 --reads 5 --no-delete
-sirr get CF_TOKEN    # returns value, reads remaining: 4
+sirr get a3f8...c9d1   # returns value
+sirr get a3f8...c9d1   # 404 — burned
+```
 
-# Expiring .env for your team
-sirr push .env --ttl 24h
-sirr pull .env       # on the other machine
+### Org team secrets (set)
 
-# Run a process with secrets injected as env vars
-sirr run -- node app.js
+```bash
+# Named slot in an org — requires --org or $SIRR_ORG
+sirr set DB_URL "postgres://..." --org acme --reads 5 --ttl 24h
+sirr get DB_URL --org acme         # returns value, reads remaining: 4
+sirr set DB_URL "new-value" --org acme   # 409 Conflict — duplicates rejected
+
+# Pull all org secrets into .env
+sirr pull .env --org acme
+
+# Run a process with org secrets injected as env vars
+sirr run --org acme -- node app.js
 ```
 
 ---
@@ -145,11 +152,11 @@ npm install -g @sirrlock/mcp
 Once connected:
 
 ```
-You: "I need you to analyze the schema at PROD_DB. It's in sirr, burn it after you read it."
-Claude: [reads PROD_DB via MCP] → [credential auto-deleted] → [analyzes schema]
-
 You: "Push my Stripe test key to sirr, one read only, 30 minutes"
-Claude: [calls push_secret("STRIPE_KEY", "sk_test_...", reads=1, ttl=1800)]
+Claude: [calls push_secret("sk_test_...", reads=1, ttl=1800)] → returns URL
+
+You: "Store DB_URL in the acme org"
+Claude: [calls set_secret("DB_URL", "postgres://...", org="acme")]
 ```
 
 ### Python AI Agents (LangChain, CrewAI, AutoGen)
@@ -157,10 +164,11 @@ Claude: [calls push_secret("STRIPE_KEY", "sk_test_...", reads=1, ttl=1800)]
 ```python
 from sirr import SirrClient
 
-sirr = SirrClient(server="http://localhost:39999", api_key=os.environ.get("SIRR_MASTER_API_KEY"))
+sirr = SirrClient(server="https://sirrlock.com", api_key=os.environ.get("SIRR_MASTER_API_KEY"))
 
-# Give an agent a one-use credential
-sirr.push("DB_URL", connection_string, reads=1, ttl=3600)
+# Dead drop — push a value, get back an ID
+result = sirr.push(connection_string, reads=1, ttl=3600)
+# result.id → "a3f8...c9d1", result.url → "https://sirrlock.com/secrets/a3f8...c9d1"
 
 # Agent reads it — credential is gone regardless of what the agent logs or retains
 ```
@@ -170,9 +178,9 @@ sirr.push("DB_URL", connection_string, reads=1, ttl=3600)
 ```yaml
 # GitHub Actions: deploy token that can only be used once
 - run: |
-    sirr push DEPLOY_TOKEN="${{ secrets.DEPLOY_TOKEN }}" --reads 1
-    sirr run -- ./deploy.sh
-    # DEPLOY_TOKEN is gone after deploy.sh runs
+    URL=$(sirr push "${{ secrets.DEPLOY_TOKEN }}" --reads 1)
+    DEPLOY_TOKEN=$(sirr get "$URL") ./deploy.sh
+    # Token is gone after one read
 ```
 
 ---
@@ -180,28 +188,33 @@ sirr.push("DB_URL", connection_string, reads=1, ttl=3600)
 ## Full Usage
 
 ```bash
-# Push
-sirr push KEY=VALUE [--ttl <duration>] [--reads <n>] [--no-delete]
-sirr push .env [--ttl <duration>]          # push entire .env file
+# Public dead drop — value only, returns {id, url}
+sirr push <value> [--ttl <duration>] [--reads <n>]
+
+# Org named secrets — requires --org or $SIRR_ORG
+sirr set KEY VALUE [--org <org>] [--ttl <duration>] [--reads <n>]
 
 # Retrieve
-sirr get KEY                               # stdout, burns if read limit hit
-sirr pull .env                             # pull all secrets into .env
-sirr run -- <command>                      # inject all secrets as env vars
+sirr get <id-or-key> [--org <org>]         # stdout, burns if read limit hit
+sirr pull .env [--org <org>]               # pull all secrets into .env
+sirr run [--org <org>] -- <command>        # inject all secrets as env vars
 
 # Manage
-sirr list                                  # metadata only, no values shown
-sirr delete KEY
+sirr list [--org <org>]                    # metadata only, no values shown
+sirr delete <id-or-key> [--org <org>]
 sirr prune                                 # delete all expired secrets now
-sirr share KEY                             # print reference URL
+sirr audit [--key <key>] [--org <org>]     # audit log (--key filters by secret)
+sirr me                                    # show current identity (works anonymously)
 
 # Key rotation (offline — stop the server first)
 sirr rotate                                # re-encrypts all records with new key
+
+# Global flags
+sirr -v                                    # print version
+sirr --org <org> <command>                 # or set $SIRR_ORG
 ```
 
 TTL format: `30s`, `5m`, `2h`, `7d`, `30d`
-
-`--no-delete`: Secret is sealed (reads blocked) when `max_reads` is hit, but stays in the database. Can be updated via `PATCH /secrets/:key` and unsealed.
 
 ---
 
@@ -235,10 +248,11 @@ sirr me create-key --name deploy-key    # using a principal key
 ```bash
 # With a principal API key:
 export SIRR_MASTER_API_KEY=<principal-key>
+export SIRR_ORG=<org_id>
 
-sirr push DB_URL=postgres://... --org <org_id>
-sirr get DB_URL --org <org_id>
-sirr list --org <org_id>
+sirr set DB_URL "postgres://..."           # named slot (duplicates → 409 Conflict)
+sirr get DB_URL                            # retrieve by name
+sirr list                                  # list org secrets
 ```
 
 ### Built-in roles
@@ -262,24 +276,22 @@ Set `SIRR_ENABLE_PUBLIC_BUCKET=false` to serve only org-scoped routes.
 
 **Public routes** (no auth required):
 
-### `GET /secrets/:key`
-Retrieves value. Increments read counter. Burns or seals record if read limit reached.
+### `GET /secrets/:id`
+Retrieves value by server-generated 256-bit hex ID. Increments read counter. Burns record if read limit reached.
 ```json
-{ "key": "DB_URL", "value": "postgres://..." }
+{ "id": "a3f8...c9d1", "value": "postgres://..." }
 // 404 if expired, burned, or not found
-// 410 if sealed (delete=false, reads exhausted)
 ```
 
-### `HEAD /secrets/:key`
+### `HEAD /secrets/:id`
 Returns metadata via headers. Does NOT increment read counter.
 ```
 X-Sirr-Read-Count: 3
 X-Sirr-Reads-Remaining: 7    (or "unlimited")
-X-Sirr-Delete: false
 X-Sirr-Created-At: 1700000000
 X-Sirr-Expires-At: 1700003600  (if TTL set)
-X-Sirr-Status: active          (or "sealed")
-// 200, 404 (not found), or 410 (sealed)
+X-Sirr-Status: active
+// 200 or 404 (not found)
 ```
 
 ### `GET /health` → `{ "status": "ok" }`
@@ -287,21 +299,20 @@ X-Sirr-Status: active          (or "sealed")
 **Protected routes** (require `Authorization: Bearer <SIRR_MASTER_API_KEY>` if `SIRR_MASTER_API_KEY` is set):
 
 ### `POST /secrets`
+Public dead drop. Accepts value only — no key field. Server generates a 256-bit hex ID.
 ```json
-{ "key": "DB_URL", "value": "postgres://...", "ttl_seconds": 3600, "max_reads": 1, "delete": true }
-// delete defaults to true. Set false for patchable secrets.
-// 201: { "key": "DB_URL" }
+{ "value": "postgres://...", "ttl_seconds": 3600, "max_reads": 1 }
+// 201: { "id": "a3f8...c9d1", "url": "https://sirrlock.com/secrets/a3f8...c9d1" }
 // 402: license required (>100 secrets without SIRR_LICENSE_KEY)
 ```
 
-### `PATCH /secrets/:key`
-Update value, max_reads, or TTL. Only works on `delete=false` secrets. Resets read_count to 0.
+### `POST /orgs/{org}/secrets`
+Org-scoped named secret. Rejects duplicates.
 ```json
-{ "value": "new-value", "max_reads": 10, "ttl_seconds": 3600 }
-// All fields optional. Omitted fields keep current values.
-// 200: updated metadata
-// 409: cannot patch a delete=true secret
-// 404: not found or expired
+{ "key": "DB_URL", "value": "postgres://...", "ttl_seconds": 3600, "max_reads": 5 }
+// 201: { "key": "DB_URL" }
+// 409: Conflict — duplicate key (+ secret.create_rejected audit event)
+// 402: license required
 ```
 
 ### `GET /secrets`
@@ -309,12 +320,12 @@ Returns metadata only — values are never included in list responses.
 ```json
 {
   "secrets": [
-    { "key": "DB_URL", "created_at": 1700000000, "expires_at": 1700003600, "max_reads": 1, "read_count": 0, "delete": true }
+    { "id": "a3f8...c9d1", "created_at": 1700000000, "expires_at": 1700003600, "max_reads": 1, "read_count": 0 }
   ]
 }
 ```
 
-### `DELETE /secrets/:key` → `{ "deleted": true }`
+### `DELETE /secrets/:id` → `{ "deleted": true }`
 ### `POST /prune` → `{ "pruned": 3 }`
 
 ---
@@ -345,8 +356,9 @@ One of `SIRR_MASTER_ENCRYPTION_KEY_FILE` or `SIRR_MASTER_ENCRYPTION_KEY` is requ
 
 | Variable | Default | Description |
 |---|---|---|
-| `SIRR_SERVER` | `sirr://localhost:39999` | Server base URL (`sirr://` → http, `sirrs://` → https) |
+| `SIRR_SERVER` | `https://sirrlock.com` | Server base URL |
 | `SIRR_MASTER_API_KEY` | — | Same value as server's `SIRR_MASTER_API_KEY` (for write ops) |
+| `SIRR_ORG` | — | Default org for `set`/`get`/`list` commands (avoids `--org` flag) |
 
 **Key rotation variables** (used by `sirr rotate`):
 
