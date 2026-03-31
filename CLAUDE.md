@@ -83,7 +83,7 @@ key + per-record nonce --ChaCha20Poly1305--> encrypted value stored in redb
 - License tiers are now org/principal-count based (Solo: 1 org / 1 principal, Solo+: 1 / 5, Team: 1 / unlimited, Business: unlimited / unlimited). Free tier = Solo.
 - `delete` flag on SecretRecord: `true` (default) = burn on max_reads, `false` = seal (block reads, allow PATCH). PATCH only works on `delete=false` secrets.
 - `Store::get()` returns `GetResult` enum: `Value(String)`, `Sealed`, or `NotFound` — handler maps to 200, 410, 404.
-- Encryption key is a random 32-byte key stored as `sirr.key` (no more Argon2id derivation).
+- Encryption key is a random 32-byte key stored as `sirr.key`. No KDF — Argon2id is unnecessary when keys are already 256-bit random from OsRng.
 - Auth: `SIRR_MASTER_API_KEY` env var acts as master key. Org routes require either master key or principal key (via `require_auth` middleware). Public bucket reads are unauthenticated.
 - Deleting an org requires no principals; deleting a principal requires no active keys (cascading deletes not allowed).
 

@@ -930,12 +930,14 @@ pub async fn create_org_secret(
 
     let expires_at = body.ttl_seconds.map(|ttl| now_epoch() + ttl as i64);
 
+    let max_reads = body.max_reads.or(Some(1));
+
     match state.store.put_org_secret(
         &org_id,
         &body.key,
         &body.value,
         expires_at,
-        body.max_reads,
+        max_reads,
         body.delete.unwrap_or(true),
         body.webhook_url.clone(),
         auth.principal_id(),

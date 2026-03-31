@@ -228,11 +228,13 @@ pub async fn create_secret(
 
     // Licensing is now enforced at org/principal creation, not per-secret.
 
+    let max_reads = body.max_reads.or(Some(1));
+
     match state.store.put(
         &body.key,
         &body.value,
         body.ttl_seconds,
-        body.max_reads,
+        max_reads,
         body.delete.unwrap_or(true),
         body.webhook_url.clone(),
     ) {
@@ -240,7 +242,7 @@ pub async fn create_secret(
             info!(
                 key = %body.key,
                 ttl_seconds = ?body.ttl_seconds,
-                max_reads = ?body.max_reads,
+                max_reads = ?max_reads,
                 "audit: secret.create"
             );
             let _ = state.store.record_audit(AuditEvent::new(
