@@ -7,7 +7,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.1"
+version = "1.0.0-dev"
 edition = "2021"
 authors = ["Sirr Contributors"]
 license-file = "LICENSE"
@@ -21,4 +21,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 anyhow = "1"
-sirr-server = { path = "crates/sirr-server", version = "0.1.0" }
+sirr-server = { path = "crates/sirr-server" }

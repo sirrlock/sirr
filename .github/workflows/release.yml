@@ -224,7 +224,7 @@ jobs:
           VER: ${{ env.VERSION }}
         run: |
           sed -i "s/^version = \"[^\"]*\"/version = \"${VER}\"/" Cargo.toml
-          sed -i "s/sirr-server = { path = \"[^\"]*\", version = \"[^\"]*\" }/sirr-server = { path = \"crates\/sirr-server\", version = \"${VER}\" }/" Cargo.toml
+          sed -i "s/sirr-server = { path = \"crates\/sirr-server\" }/sirr-server = { path = \"crates\/sirr-server\", version = \"${VER}\" }/" Cargo.toml
 
       - name: Check if version already published
         id: check
