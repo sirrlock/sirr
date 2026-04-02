@@ -260,6 +260,18 @@ enum PrincipalCommand {
         #[arg(long, default_value = "writer")]
         role: String,
     },
+    /// Issue an API key for a principal (master key only)
+    CreateKey {
+        /// Principal ID
+        #[arg(name = "PRINCIPAL_ID")]
+        principal_id: String,
+        /// Key name/label
+        #[arg(long, default_value = "default")]
+        name: String,
+        /// Validity duration in seconds (default: 86400 = 24h)
+        #[arg(long, default_value = "86400")]
+        valid_for_seconds: u64,
+    },
     /// Remove an org member
     Delete {
         /// Principal ID
@@ -447,6 +459,14 @@ async fn main() -> Result<()> {
                 PrincipalCommand::List => cmd_principal_list(&ctx, org).await,
                 PrincipalCommand::Create { name, role } => {
                     cmd_principal_create(&ctx, org, &name, &role).await
+                }
+                PrincipalCommand::CreateKey {
+                    principal_id,
+                    name,
+                    valid_for_seconds,
+                } => {
+                    cmd_principal_create_key(&ctx, org, &principal_id, &name, valid_for_seconds)
+                        .await
                 }
                 PrincipalCommand::Delete { id } => cmd_principal_delete(&ctx, org, &id).await,
             }
@@ -1163,6 +1183,37 @@ async fn cmd_principal_create(ctx: &Ctx, org: &str, name: &str, role: &str) -> R
     println!("  id:   {id}");
     println!("  name: {name}");
     println!("  role: {role}");
+    Ok(())
+}
+
+async fn cmd_principal_create_key(
+    ctx: &Ctx,
+    org: &str,
+    principal_id: &str,
+    name: &str,
+    valid_for_seconds: u64,
+) -> Result<()> {
+    let body = serde_json::json!({
+        "name": name,
+        "valid_for_seconds": valid_for_seconds,
+    });
+
+    let resp = require_success(
+        ctx.post(&format!("orgs/{org}/principals/{principal_id}/keys"))
+            .json(&body)
+            .send()
+            .await
+            .context("HTTP request failed")?,
+    )
+    .await?;
+
+    let json: Value = resp.json().await?;
+    let id = json["id"].as_str().unwrap_or("?");
+    let key = json["key"].as_str().unwrap_or("?");
+    println!("key created");
+    println!("  id:   {id}");
+    println!("  key:  {key}");
+    println!("  (save this key — it won't be shown again)");
     Ok(())
 }
 

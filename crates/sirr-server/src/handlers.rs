@@ -12,7 +12,6 @@ use tracing::info;
 
 use crate::{
     auth::ResolvedAuth,
-    license::LicenseStatus,
     store::{
         audit::{
             AuditEvent, ACTION_SECRET_BURNED, ACTION_SECRET_CREATE, ACTION_SECRET_DELETE,
@@ -656,15 +655,6 @@ pub async fn create_webhook(
 ) -> Response {
     // Auth is handled by require_master_key middleware.
     let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
-
-    // License gate: free tier gets 0 webhooks.
-    if state.license == LicenseStatus::Free {
-        return (
-            StatusCode::PAYMENT_REQUIRED,
-            Json(json!({"error": "webhooks require a SIRR_LICENSE_KEY"})),
-        )
-            .into_response();
-    }
 
     // Validate URL.
     if !body.url.starts_with("http://") && !body.url.starts_with("https://") {
