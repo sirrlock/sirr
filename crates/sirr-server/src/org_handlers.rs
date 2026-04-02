@@ -14,7 +14,6 @@ use tracing::info;
 
 use crate::{
     auth::ResolvedAuth,
-    license,
     store::{
         audit::{
             AuditEvent, ACTION_KEY_CREATE, ACTION_KEY_DELETE, ACTION_ORG_CREATE, ACTION_ORG_DELETE,
@@ -133,26 +132,6 @@ pub async fn create_org(
 
     if let Err(e) = validate_metadata(&body.metadata) {
         return bad_request(&e);
-    }
-
-    // License tier check: enforce max orgs.
-    let tier = license::effective_tier(&state.license);
-    if let Some(max) = tier.max_orgs() {
-        match state.store.list_orgs() {
-            Ok(orgs) if orgs.len() >= max => {
-                return (
-                    StatusCode::PAYMENT_REQUIRED,
-                    Json(json!({
-                        "error": format!(
-                            "tier limit: max {max} org(s) — upgrade at https://sirrlock.com/pricing"
-                        )
-                    })),
-                )
-                    .into_response();
-            }
-            Err(e) => return internal_error(e),
-            _ => {}
-        }
     }
 
     let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
@@ -286,26 +265,6 @@ pub async fn create_principal(
 
     if !role_exists {
         return bad_request(&format!("role \"{}\" not found", body.role));
-    }
-
-    // License tier check: enforce max principals per org.
-    let tier = license::effective_tier(&state.license);
-    if let Some(max) = tier.max_principals_per_org() {
-        match state.store.list_principals(&org_id) {
-            Ok(principals) if principals.len() >= max => {
-                return (
-                    StatusCode::PAYMENT_REQUIRED,
-                    Json(json!({
-                        "error": format!(
-                            "tier limit: max {max} principal(s) per org — upgrade at https://sirrlock.com/pricing"
-                        )
-                    })),
-                )
-                    .into_response();
-            }
-            Err(e) => return internal_error(e),
-            _ => {}
-        }
     }
 
     let ip = extract_ip(&headers, &addr, &state.trusted_proxies);

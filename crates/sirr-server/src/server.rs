@@ -11,7 +11,9 @@ use axum::{
     routing::{delete, get, head, patch, post},
     Router,
 };
-use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+use tower_governor::{
+    governor::GovernorConfigBuilder, key_extractor::KeyExtractor, GovernorError, GovernorLayer,
+};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
@@ -139,7 +141,7 @@ impl Default for ServerConfig {
             rate_limit_burst: std::env::var("SIRR_RATE_LIMIT_BURST")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(30),
+                .unwrap_or(5),
             auto_generated_key: None,
             no_security_banner: std::env::var("SIRR_NO_SECURITY_BANNER")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -199,6 +201,33 @@ pub fn resolve_data_dir(data_dir: Option<&PathBuf>) -> Result<PathBuf> {
                 None => crate::dirs::data_dir(),
             }
         }
+    }
+}
+
+// ── Rate-limit key extractor: per API key, fallback to IP ────────────────────
+
+#[derive(Debug, Clone)]
+struct ApiKeyOrIp;
+
+impl KeyExtractor for ApiKeyOrIp {
+    type Key = String;
+
+    fn extract<T>(&self, req: &axum::http::Request<T>) -> Result<Self::Key, GovernorError> {
+        // Use Bearer token as the rate-limit bucket key.
+        if let Some(auth) = req
+            .headers()
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+        {
+            return Ok(auth.to_string());
+        }
+
+        // Fallback to peer IP for unauthenticated requests.
+        req.extensions()
+            .get::<axum::extract::ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0.ip().to_string())
+            .ok_or_else(|| GovernorError::UnableToExtractKey)
     }
 }
 
@@ -349,11 +378,12 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         enable_public_bucket,
     };
 
-    // Per-IP rate limiting: configurable via SIRR_RATE_LIMIT_PER_SECOND / SIRR_RATE_LIMIT_BURST.
-    // Protects public endpoints from enumeration and write-amplification abuse.
+    // Per-key rate limiting: each API key (or IP for unauthenticated requests)
+    // gets its own bucket. Configurable via SIRR_RATE_LIMIT_PER_SECOND / SIRR_RATE_LIMIT_BURST.
     let governor_conf = GovernorConfigBuilder::default()
         .per_second(cfg.rate_limit_per_second)
         .burst_size(cfg.rate_limit_burst)
+        .key_extractor(ApiKeyOrIp)
         .finish()
         .expect("invalid rate-limit configuration");
     // Periodically evict stale IP entries to bound memory usage.
