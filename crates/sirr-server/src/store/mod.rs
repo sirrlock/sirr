@@ -6,7 +6,7 @@ pub mod model;
 pub mod visibility;
 
 pub use audit::{AuditEvent, AuditQuery};
-pub use db::Store;
+pub use db::{Store, StoreError};
 pub use keys::KeyRecord;
 pub use model::SecretRecord;
 pub use visibility::Visibility;
