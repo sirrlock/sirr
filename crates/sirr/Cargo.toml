@@ -16,15 +16,3 @@ name = "sirr"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive", "env"] }
-tokio = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-dotenvy = "0.15"
-anyhow = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-humantime = "2"
-clap_complete = "4"
-clap_mangen = "0.2"

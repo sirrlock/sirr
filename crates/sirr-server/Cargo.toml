@@ -15,8 +15,6 @@ categories = ["cryptography", "web-programming::http-server"]
 axum = "0.8"
 tokio = { workspace = true }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
-tower_governor = { version = "0.8", default-features = false, features = ["axum"] }
-ipnet = "2"
 redb = "2"
 chacha20poly1305 = "0.10"
 zeroize = { version = "1.8", features = ["derive"] }
@@ -31,13 +29,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = { workspace = true }
 thiserror = "1"
 hex = "0.4"
-hmac = "0.12"
-sha2 = "0.10"
 http = "1"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 [dev-dependencies]
 axum-test = "19"
 tokio = { workspace = true }
 tempfile = "3"
-wiremock = "0.6"
