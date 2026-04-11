@@ -30,6 +30,8 @@ anyhow = { workspace = true }
 thiserror = "1"
 hex = "0.4"
 http = "1"
+blake3 = "1"
+ulid = "1"
 
 [dev-dependencies]
 axum-test = "19"

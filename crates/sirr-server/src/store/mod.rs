@@ -3,3 +3,4 @@ pub mod db;
 pub mod model;
 
 pub use db::Store;
+pub use model::SecretRecord;
