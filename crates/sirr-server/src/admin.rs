@@ -1,0 +1,272 @@
+//! Unix domain socket admin protocol.
+//!
+//! Newline-delimited JSON: one request line → one response line → close.
+//! Authentication is purely filesystem-level: whoever can connect to the socket
+//! has been authenticated by the kernel.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::store::{AuditQuery, Store, Visibility};
+
+// ── Wire types ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+pub enum AdminRequest {
+    VisibilityGet,
+    VisibilitySet {
+        mode: String,
+    },
+    KeysCreate {
+        name: String,
+        valid_after: Option<i64>,
+        valid_before: Option<i64>,
+        webhook_url: Option<String>,
+    },
+    KeysList,
+    KeysDelete {
+        name: String,
+    },
+    KeysSecrets {
+        name: String,
+    },
+    KeysPurge {
+        name: String,
+    },
+    Audit {
+        since: Option<i64>,
+        until: Option<i64>,
+        limit: Option<usize>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AdminResponse {
+    Ok { data: Value },
+    Error { message: String },
+}
+
+impl AdminResponse {
+    fn ok(data: Value) -> Self {
+        Self::Ok { data }
+    }
+
+    fn err(msg: impl Into<String>) -> Self {
+        Self::Error {
+            message: msg.into(),
+        }
+    }
+}
+
+// ── Socket listener ───────────────────────────────────────────────────────────
+
+pub fn spawn_admin_socket(store: Arc<Store>, path: PathBuf) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Remove stale socket file if it exists.
+        let _ = std::fs::remove_file(&path);
+
+        // Create parent directory if needed.
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let listener = match tokio::net::UnixListener::bind(&path) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("failed to bind admin socket at {}: {e}", path.display());
+                return;
+            }
+        };
+
+        // Set socket permissions to 0660.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660));
+        }
+
+        tracing::info!("admin socket listening at {}", path.display());
+
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let store = store.clone();
+                    tokio::spawn(async move {
+                        handle_admin_connection(stream, store).await;
+                    });
+                }
+                Err(e) => {
+                    tracing::error!("admin socket accept error: {e}");
+                }
+            }
+        }
+    })
+}
+
+// ── Connection handler ────────────────────────────────────────────────────────
+
+async fn handle_admin_connection(stream: tokio::net::UnixStream, store: Arc<Store>) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (reader, mut writer) = stream.into_split();
+    let mut line = String::new();
+
+    if let Err(e) = BufReader::new(reader).read_line(&mut line).await {
+        tracing::warn!("admin: failed to read request: {e}");
+        return;
+    }
+
+    let resp = match serde_json::from_str::<AdminRequest>(line.trim()) {
+        Ok(req) => dispatch(req, &store),
+        Err(e) => AdminResponse::err(format!("invalid request: {e}")),
+    };
+
+    let mut out = match serde_json::to_string(&resp) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("admin: failed to serialize response: {e}");
+            return;
+        }
+    };
+    out.push('\n');
+
+    if let Err(e) = writer.write_all(out.as_bytes()).await {
+        tracing::warn!("admin: failed to write response: {e}");
+    }
+}
+
+// ── Command dispatch ──────────────────────────────────────────────────────────
+
+fn dispatch(req: AdminRequest, store: &Store) -> AdminResponse {
+    match req {
+        // ── Visibility ────────────────────────────────────────────────────────
+        AdminRequest::VisibilityGet => match store.get_visibility() {
+            Ok(v) => AdminResponse::ok(json!({"mode": v.to_string()})),
+            Err(e) => AdminResponse::err(e.to_string()),
+        },
+
+        AdminRequest::VisibilitySet { mode } => {
+            let vis: Visibility = match mode.parse() {
+                Ok(v) => v,
+                Err(e) => return AdminResponse::err(e.to_string()),
+            };
+            match store.set_visibility(vis) {
+                Ok(()) => AdminResponse::ok(json!({"mode": vis.to_string()})),
+                Err(e) => AdminResponse::err(e.to_string()),
+            }
+        }
+
+        // ── Keys ──────────────────────────────────────────────────────────────
+        AdminRequest::KeysCreate {
+            name,
+            valid_after,
+            valid_before,
+            webhook_url,
+        } => match store.create_key(&name, valid_after, valid_before, webhook_url) {
+            Ok((record, token)) => AdminResponse::ok(json!({
+                "id":         record.id,
+                "name":       record.name,
+                "token":      token,
+                "created_at": record.created_at,
+                "valid_after":  record.valid_after,
+                "valid_before": record.valid_before,
+                "webhook_url":  record.webhook_url,
+            })),
+            Err(e) => AdminResponse::err(e.to_string()),
+        },
+
+        AdminRequest::KeysList => match store.list_keys() {
+            Ok(keys) => {
+                let arr: Vec<Value> = keys
+                    .into_iter()
+                    .map(|k| {
+                        json!({
+                            "id":         k.id,
+                            "name":       k.name,
+                            "created_at": k.created_at,
+                            "valid_after":  k.valid_after,
+                            "valid_before": k.valid_before,
+                            "webhook_url":  k.webhook_url,
+                            // hash intentionally omitted
+                        })
+                    })
+                    .collect();
+                AdminResponse::ok(Value::Array(arr))
+            }
+            Err(e) => AdminResponse::err(e.to_string()),
+        },
+
+        AdminRequest::KeysDelete { name } => match store.delete_key(&name) {
+            Ok(()) => AdminResponse::ok(json!({"deleted": name})),
+            Err(e) => AdminResponse::err(e.to_string()),
+        },
+
+        AdminRequest::KeysSecrets { name } => {
+            let key = match store.find_key_by_name(&name) {
+                Ok(Some(k)) => k,
+                Ok(None) => return AdminResponse::err(format!("key not found: {name}")),
+                Err(e) => return AdminResponse::err(e.to_string()),
+            };
+            match store.secrets_owned_by(&key.id) {
+                Ok((count, histogram)) => AdminResponse::ok(json!({
+                    "key_name": name,
+                    "active_count": count,
+                    "prefix_histogram": histogram,
+                })),
+                Err(e) => AdminResponse::err(e.to_string()),
+            }
+        }
+
+        AdminRequest::KeysPurge { name } => {
+            let key = match store.find_key_by_name(&name) {
+                Ok(Some(k)) => k,
+                Ok(None) => return AdminResponse::err(format!("key not found: {name}")),
+                Err(e) => return AdminResponse::err(e.to_string()),
+            };
+            match store.purge_secrets_for_key(&key.id) {
+                Ok(count) => AdminResponse::ok(json!({"burned": count})),
+                Err(e) => AdminResponse::err(e.to_string()),
+            }
+        }
+
+        // ── Audit ─────────────────────────────────────────────────────────────
+        AdminRequest::Audit {
+            since,
+            until,
+            limit,
+        } => {
+            let query = AuditQuery {
+                since,
+                until,
+                limit: limit.unwrap_or(50),
+                ..Default::default()
+            };
+            match store.query_audit(&query) {
+                Ok(events) => {
+                    let arr: Vec<Value> = events
+                        .into_iter()
+                        .map(|ev| {
+                            json!({
+                                "id":        ev.id,
+                                "timestamp": ev.timestamp,
+                                "action":    ev.action,
+                                "key_id":    ev.key_id,
+                                "hash":      ev.hash,
+                                "source_ip": ev.source_ip,
+                                "success":   ev.success,
+                                "detail":    ev.detail,
+                            })
+                        })
+                        .collect();
+                    AdminResponse::ok(Value::Array(arr))
+                }
+                Err(e) => AdminResponse::err(e.to_string()),
+            }
+        }
+    }
+}
