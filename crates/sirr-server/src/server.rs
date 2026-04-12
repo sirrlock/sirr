@@ -93,6 +93,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         store: store.clone(),
         encryption_key: Arc::new(encryption_key),
         visibility: visibility.clone(),
+        webhook_sender: crate::webhooks::WebhookSender::new(),
     };
     let app = router(state);
 

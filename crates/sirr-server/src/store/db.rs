@@ -393,6 +393,16 @@ impl Store {
         }
     }
 
+    /// Look up a key by its ULID id (internal use for webhook lookup).
+    pub fn find_key_by_id(&self, id: &str) -> Result<Option<KeyRecord>, StoreError> {
+        let rtxn = self.db.begin_read()?;
+        let by_id = rtxn.open_table(KEYS_BY_ID)?;
+        match by_id.get(id)? {
+            Some(v) => Ok(Some(Self::decode(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
     /// List all keys in `keys_by_id`.
     pub fn list_keys(&self) -> Result<Vec<KeyRecord>, StoreError> {
         let rtxn = self.db.begin_read()?;
