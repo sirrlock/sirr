@@ -44,6 +44,9 @@ enum Commands {
         /// Defaults to http://<bind-address>.
         #[arg(long)]
         base_url: Option<String>,
+        /// Print live audit events to stderr as they happen.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Get or set visibility mode
     Visibility {
@@ -65,6 +68,10 @@ enum Commands {
         limit: usize,
         #[arg(long)]
         json: bool,
+        /// Filter by key name. Shows full (unmasked) hashes for this key's events.
+        /// Without this flag, hashes and key IDs are masked.
+        #[arg(long)]
+        key: Option<String>,
     },
 }
 
@@ -133,11 +140,13 @@ fn build_admin_request(command: &Commands) -> Option<AdminRequest> {
             since,
             until,
             limit,
+            key,
             ..
         } => Some(AdminRequest::Audit {
             since: *since,
             until: *until,
             limit: Some(*limit),
+            key_name: key.clone(),
         }),
     }
 }
@@ -188,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
             visibility,
             retention_days,
             base_url,
+            verbose,
         } => {
             let vis: Visibility = visibility
                 .parse()
@@ -202,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
                 visibility: vis,
                 retention_days,
                 base_url: resolved_base_url,
+                verbose,
             };
             sirr_server::server::run(config).await?;
         }
@@ -355,6 +366,7 @@ async fn main() -> anyhow::Result<()> {
             until,
             limit,
             json,
+            key,
         } => {
             let socket = default_socket_path();
             let resp = send_admin(
@@ -363,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
                     since,
                     until,
                     limit: Some(limit),
+                    key_name: key,
                 },
             )
             .await?;
@@ -376,11 +389,11 @@ async fn main() -> anyhow::Result<()> {
                         } else {
                             for e in events {
                                 println!(
-                                    "{} {} {} {}",
+                                    "{} {:16} {:>26} {}",
                                     e["timestamp"],
                                     e["action"].as_str().unwrap_or("-"),
                                     e["hash"].as_str().unwrap_or("-"),
-                                    e["source_ip"].as_str().unwrap_or("-"),
+                                    e["key_id"].as_str().unwrap_or("-"),
                                 );
                             }
                         }
@@ -438,6 +451,7 @@ mod tests {
             visibility: "public".to_string(),
             retention_days: 30,
             base_url: None,
+            verbose: false,
         };
         assert!(build_admin_request(&cmd).is_none());
     }
@@ -568,6 +582,7 @@ mod tests {
             until: None,
             limit: 10,
             json: false,
+            key: None,
         };
         assert_eq!(
             build_admin_request(&cmd),
@@ -575,6 +590,7 @@ mod tests {
                 since: None,
                 until: None,
                 limit: Some(10),
+                key_name: None,
             })
         );
     }
@@ -586,6 +602,7 @@ mod tests {
             until: Some(200),
             limit: 5,
             json: false,
+            key: None,
         };
         assert_eq!(
             build_admin_request(&cmd),
@@ -593,6 +610,27 @@ mod tests {
                 since: Some(100),
                 until: Some(200),
                 limit: Some(5),
+                key_name: None,
+            })
+        );
+    }
+
+    #[test]
+    fn admin_audit_with_key() {
+        let cmd = Commands::Audit {
+            since: None,
+            until: None,
+            limit: 50,
+            json: false,
+            key: Some("my-key".to_string()),
+        };
+        assert_eq!(
+            build_admin_request(&cmd),
+            Some(AdminRequest::Audit {
+                since: None,
+                until: None,
+                limit: Some(50),
+                key_name: Some("my-key".to_string()),
             })
         );
     }
