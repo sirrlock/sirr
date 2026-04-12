@@ -1,2169 +1,1367 @@
+#![allow(clippy::result_large_err)]
+
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
 
-use anyhow::{Context, Result};
 use redb::{Database, ReadableTable, TableDefinition};
-use tokio::time;
-use tracing::{debug, info, warn};
+use thiserror::Error;
 
-use super::audit::{AuditEvent, AuditQuery};
-use super::crypto::EncryptionKey;
-use super::model::{SecretMeta, SecretRecord};
+use crate::store::audit::{AuditEvent, AuditQuery};
+use crate::store::crypto::EncryptionKey;
+use crate::store::keys::KeyRecord;
+use crate::store::model::SecretRecord;
+
+// ── Table definitions ─────────────────────────────────────────────────────────
 
 const SECRETS: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");
-const AUDIT_LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("audit_log");
-const COUNTERS: TableDefinition<&str, u64> = TableDefinition::new("counters");
-const AUDIT_SEQ_KEY: &str = "audit_seq";
+const KEYS_BY_ID: TableDefinition<&str, &[u8]> = TableDefinition::new("keys_by_id");
+const KEYS_BY_HASH: TableDefinition<&[u8; 32], &str> = TableDefinition::new("keys_by_hash");
+const KEYS_BY_NAME: TableDefinition<&str, &str> = TableDefinition::new("keys_by_name");
+const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
+const CONFIG: TableDefinition<&str, &[u8]> = TableDefinition::new("config");
 
-/// Marker byte for v2 record format (with key version tracking).
-/// Legacy records (v1) start with a bincode varint for Vec length (always >= 16
-/// for ChaCha20Poly1305 ciphertext), so 0x01 is unambiguous.
-const RECORD_V2_MARKER: u8 = 0x01;
+// ── Config keys ───────────────────────────────────────────────────────────────
 
-/// Result of a secret retrieval.
-#[derive(Debug, PartialEq)]
-pub enum GetResult {
-    /// Secret found and decrypted. Read counter was incremented.
-    /// Contains (value, webhook_url).
-    Value(String, Option<String>),
-    /// Secret found, decrypted, and burned (final read with delete=true).
-    /// Contains (value, webhook_url).
-    Burned(String, Option<String>),
-    /// Secret exists but is sealed (delete=false, reads exhausted).
-    Sealed,
-    /// Secret not found or TTL-expired.
+const CFG_AUDIT_COUNTER: &str = "audit_counter";
+
+// ── Error type ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("secret not found")]
     NotFound,
+    #[error("secret is burned")]
+    Burned,
+    #[error("secret has expired")]
+    Expired,
+    #[error("wrong owner key")]
+    WrongOwner,
+    #[error("key not found")]
+    KeyNotFound,
+    #[error("database error: {0}")]
+    Db(#[from] redb::Error),
+    #[error("database open error: {0}")]
+    DatabaseError(#[from] redb::DatabaseError),
+    #[error("transaction error: {0}")]
+    Transaction(#[from] redb::TransactionError),
+    #[error("table error: {0}")]
+    Table(#[from] redb::TableError),
+    #[error("storage error: {0}")]
+    Storage(#[from] redb::StorageError),
+    #[error("commit error: {0}")]
+    Commit(#[from] redb::CommitError),
+    #[error("crypto error: {0}")]
+    Crypto(anyhow::Error),
+    #[error("encode error: {0}")]
+    Encode(#[from] bincode::error::EncodeError),
+    #[error("decode error: {0}")]
+    Decode(#[from] bincode::error::DecodeError),
 }
 
-/// Thread-safe handle to the redb store.
-#[derive(Clone)]
+// ── Store ─────────────────────────────────────────────────────────────────────
+
 pub struct Store {
-    pub(crate) db: Arc<Database>,
-    key: Arc<EncryptionKey>,
-    key_version: u8,
+    db: Database,
+    /// Mutex protecting the audit counter. In a single-process daemon this is fine.
+    audit_counter: Mutex<u64>,
 }
 
 impl Store {
-    /// Open (or create) the database at `path`, using `key` for encryption.
-    pub fn open(path: &Path, key: EncryptionKey) -> Result<Self> {
-        Self::open_versioned(path, key, 1)
-    }
+    /// Open (or create) the redb database at `path`.
+    ///
+    /// All six tables are created on first open so subsequent transactions can
+    /// rely on them existing.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let db = Database::create(path)?;
 
-    /// Open (or create) the database at `path`, using `key` with an explicit version tag.
-    /// The `key_version` is stored alongside each encrypted record to support key rotation.
-    pub fn open_versioned(path: &Path, key: EncryptionKey, key_version: u8) -> Result<Self> {
-        let db = Database::create(path).context("open redb database")?;
-
-        // Ensure all tables exist.
-        let write_txn = db.begin_write()?;
-        write_txn.open_table(SECRETS)?;
-        write_txn.open_table(AUDIT_LOG)?;
-        write_txn.open_table(COUNTERS)?;
-        write_txn.open_table(super::webhooks::WEBHOOKS)?;
-        // Legacy api_keys table: kept so existing databases don't lose the table on open.
-        const LEGACY_API_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("api_keys");
-        write_txn.open_table(LEGACY_API_KEYS)?;
-        write_txn.open_table(super::org::ORGS)?;
-        write_txn.open_table(super::org::PRINCIPALS)?;
-        write_txn.open_table(super::org::PRINCIPAL_KEYS)?;
-        write_txn.open_table(super::org::PRINCIPAL_KEY_IX)?;
-        write_txn.open_table(super::org::ROLES)?;
-        write_txn.commit()?;
-
-        // Seed built-in roles (idempotent).
+        // Ensure all tables exist by opening them in a write transaction.
+        let txn = db.begin_write()?;
         {
-            let write_txn = db.begin_write()?;
-            {
-                let mut table = write_txn.open_table(super::org::ROLES)?;
-                for role in super::org::builtin_roles() {
-                    let key = format!("builtin:{}", role.name);
-                    if table.get(key.as_str())?.is_none() {
-                        let bytes =
-                            bincode::serde::encode_to_vec(&role, bincode::config::standard())
-                                .context("encode builtin role")?;
-                        table.insert(key.as_str(), bytes.as_slice())?;
-                    }
-                }
-            }
-            write_txn.commit()?;
+            txn.open_table(SECRETS)?;
+            txn.open_table(KEYS_BY_ID)?;
+            txn.open_table(KEYS_BY_HASH)?;
+            txn.open_table(KEYS_BY_NAME)?;
+            txn.open_table(AUDIT)?;
+            txn.open_table(CONFIG)?;
         }
+        txn.commit()?;
+
+        // Read the current audit counter from the config table.
+        let counter = {
+            let rtxn = db.begin_read()?;
+            let tbl = rtxn.open_table(CONFIG)?;
+            match tbl.get(CFG_AUDIT_COUNTER)? {
+                Some(v) => {
+                    let (val, _): (u64, _) =
+                        bincode::serde::decode_from_slice(v.value(), bincode::config::standard())?;
+                    val
+                }
+                None => 0,
+            }
+        };
 
         Ok(Self {
-            db: Arc::new(db),
-            key: Arc::new(key),
-            key_version,
+            db,
+            audit_counter: Mutex::new(counter),
         })
     }
 
-    fn now() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, StoreError> {
+        Ok(bincode::serde::encode_to_vec(
+            v,
+            bincode::config::standard(),
+        )?)
     }
 
-    /// Check whether a public-bucket secret key exists (no read counter increment).
-    pub fn exists(&self, secret_key: &str) -> Result<bool> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(SECRETS)?;
-        Ok(table.get(secret_key)?.is_some())
+    fn decode<T: for<'de> serde::Deserialize<'de>>(bytes: &[u8]) -> Result<T, StoreError> {
+        let (v, _) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
+        Ok(v)
     }
 
-    /// Insert or overwrite a secret.
-    pub fn put(
-        &self,
-        secret_key: &str,
-        value: &str,
-        ttl_seconds: Option<u64>,
-        max_reads: Option<u32>,
-        delete: bool,
-        webhook_url: Option<String>,
-    ) -> Result<()> {
-        let now = Self::now();
-        // Cap ttl before casting to avoid u64→i64 wrapping (u64::MAX as i64 == -1).
-        // i64::MAX seconds is ~292 years — well beyond any practical TTL.
-        let expires_at = ttl_seconds
-            .map(|ttl| ttl.min((i64::MAX - now) as u64) as i64)
-            .map(|ttl| now + ttl);
+    // ── Secrets ───────────────────────────────────────────────────────────────
 
-        let (value_encrypted, nonce) =
-            super::crypto::encrypt(&self.key, value.as_bytes()).context("encrypt value")?;
-
-        let record = SecretRecord {
-            value_encrypted,
-            nonce,
-            created_at: now,
-            expires_at,
-            max_reads,
-            read_count: 0,
-            delete,
-            webhook_url,
-            owner_id: None,
-            org_id: None,
-            allowed_keys: None,
-        };
-
-        let bytes = encode(&record, self.key_version)?;
-        let write_txn = self.db.begin_write()?;
+    /// Insert a new `SecretRecord`. The record's `hash` is used as the key.
+    pub fn create_secret(&self, record: &SecretRecord) -> Result<(), StoreError> {
+        let txn = self.db.begin_write()?;
         {
-            let mut table = write_txn.open_table(SECRETS)?;
-            table.insert(secret_key, bytes.as_slice())?;
+            let mut tbl = txn.open_table(SECRETS)?;
+            tbl.insert(record.hash.as_str(), Self::encode(record)?.as_slice())?;
         }
-        write_txn.commit()?;
-
-        debug!(key = %secret_key, "stored secret");
+        txn.commit()?;
         Ok(())
     }
 
-    /// Retrieve a secret's value, incrementing its read counter.
-    /// Returns `GetResult::NotFound` if the key doesn't exist or has expired / burned.
-    /// Returns `GetResult::Sealed` if the secret exists but reads are exhausted (delete=false).
-    /// Returns `GetResult::Value(value)` on success.
-    pub fn get(&self, secret_key: &str) -> Result<GetResult> {
-        self.get_by_table_key(secret_key)
-    }
-
-    /// Internal helper that performs the get-and-increment logic for any table key.
-    /// Both public-bucket `get()` and org-scoped `get_org_secret()` delegate here.
-    fn get_by_table_key(&self, table_key: &str) -> Result<GetResult> {
-        let now = Self::now();
-
-        // We need a write transaction to atomically increment read_count.
-        let write_txn = self.db.begin_write()?;
-        let result = {
-            let mut table = write_txn.open_table(SECRETS)?;
-
-            // Read the raw bytes and immediately clone them so the AccessGuard
-            // (which borrows `table`) is dropped before any mutation.
-            let raw_bytes: Option<Vec<u8>> =
-                table.get(table_key)?.map(|guard| guard.value().to_vec());
-
-            match raw_bytes {
-                None => GetResult::NotFound,
-                Some(bytes) => {
-                    let (mut record, record_key_version) = decode(&bytes)?;
-
-                    if record.is_expired(now) {
-                        table.remove(table_key)?;
-                        debug!(key = %table_key, "lazy-evicted expired secret");
-                        GetResult::NotFound
-                    } else if record.is_sealed() {
-                        GetResult::Sealed
-                    } else {
-                        record.read_count += 1;
-
-                        let plaintext = super::crypto::decrypt(
-                            &self.key,
-                            &record.value_encrypted,
-                            &record.nonce,
-                        )
-                        .context("decrypt value")?;
-
-                        let value = String::from_utf8(plaintext)
-                            .context("secret value is not valid UTF-8")?;
-
-                        let webhook_url = record.webhook_url.clone();
-                        if record.is_burned() {
-                            table.remove(table_key)?;
-                            debug!(key = %table_key, "burned after final read");
-                            GetResult::Burned(value, webhook_url)
-                        } else {
-                            let updated = encode(&record, record_key_version)?;
-                            table.insert(table_key, updated.as_slice())?;
-                            GetResult::Value(value, webhook_url)
-                        }
-                    }
-                }
-            }
-        };
-        write_txn.commit()?;
-        Ok(result)
-    }
-
-    /// Delete a secret by key. Returns true if it existed.
-    pub fn delete(&self, secret_key: &str) -> Result<bool> {
-        let write_txn = self.db.begin_write()?;
-        let existed = {
-            let mut table = write_txn.open_table(SECRETS)?;
-            // Clone the guard value immediately so the borrow ends before commit.
-            let existed = table.remove(secret_key)?.is_some();
-            existed
-        };
-        write_txn.commit()?;
-        Ok(existed)
-    }
-
-    /// List metadata for all non-expired secrets.
-    pub fn list(&self) -> Result<Vec<SecretMeta>> {
-        let now = Self::now();
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(SECRETS)?;
-
-        let mut metas = Vec::new();
-        for item in table.iter()? {
-            let (k, v) = item?;
-            let (record, _kv) = decode(v.value())?;
-            if !record.is_expired(now) {
-                metas.push(SecretMeta {
-                    key: k.value().to_owned(),
-                    created_at: record.created_at,
-                    expires_at: record.expires_at,
-                    max_reads: record.max_reads,
-                    read_count: record.read_count,
-                    delete: record.delete,
-                    owner_id: record.owner_id.clone(),
-                    org_id: record.org_id.clone(),
-                });
-            }
-        }
-        Ok(metas)
-    }
-
-    /// Remove all expired secrets. Returns the names of removed keys.
-    pub fn prune(&self) -> Result<Vec<String>> {
-        let now = Self::now();
-
-        // Collect expired keys in a read pass first.
-        let expired_keys: Vec<String> = {
-            let read_txn = self.db.begin_read()?;
-            let table = read_txn.open_table(SECRETS)?;
-            let mut keys = Vec::new();
-            for item in table.iter()? {
-                let (k, v) = item?;
-                let (record, _kv) = decode(v.value())?;
-                if record.is_expired(now) || record.is_burned() {
-                    keys.push(k.value().to_owned());
-                }
-            }
-            keys
-        };
-
-        if expired_keys.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(SECRETS)?;
-            for key in &expired_keys {
-                table.remove(key.as_str())?;
-            }
-        }
-        write_txn.commit()?;
-
-        let removed = expired_keys.len();
-        if removed > 0 {
-            info!(removed, "pruned expired secrets");
-        }
-        Ok(expired_keys)
-    }
-
-    /// Retrieve metadata for a secret without incrementing read_count.
-    /// Returns (meta, is_sealed). Returns None if not found or TTL-expired.
-    pub fn head(&self, secret_key: &str) -> Result<Option<(SecretMeta, bool)>> {
-        self.head_by_table_key(secret_key, secret_key)
-    }
-
-    /// Internal helper for head logic. `table_key` is the key in SECRETS,
-    /// `display_key` is the key to use in the returned SecretMeta.
-    fn head_by_table_key(
-        &self,
-        table_key: &str,
-        display_key: &str,
-    ) -> Result<Option<(SecretMeta, bool)>> {
-        let now = Self::now();
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(SECRETS)?;
-
-        let raw_bytes: Option<Vec<u8>> = table.get(table_key)?.map(|guard| guard.value().to_vec());
-
-        match raw_bytes {
+    /// Retrieve a `SecretRecord` by hash, or `None` if it doesn't exist.
+    pub fn get_secret(&self, hash: &str) -> Result<Option<SecretRecord>, StoreError> {
+        let rtxn = self.db.begin_read()?;
+        let tbl = rtxn.open_table(SECRETS)?;
+        match tbl.get(hash)? {
+            Some(v) => Ok(Some(Self::decode(v.value())?)),
             None => Ok(None),
-            Some(bytes) => {
-                let (record, _kv) = decode(&bytes)?;
-                if record.is_expired(now) {
-                    return Ok(None);
-                }
-                let sealed = record.is_sealed();
-                Ok(Some((
-                    SecretMeta {
-                        key: display_key.to_owned(),
-                        created_at: record.created_at,
-                        expires_at: record.expires_at,
-                        max_reads: record.max_reads,
-                        read_count: record.read_count,
-                        delete: record.delete,
-                        owner_id: record.owner_id.clone(),
-                        org_id: record.org_id.clone(),
-                    },
-                    sealed,
-                )))
-            }
         }
     }
 
-    /// Update an existing secret (only if delete=false).
-    /// Resets read_count to 0. Returns updated metadata.
-    /// Returns Err if the secret has delete=true.
-    /// Returns Ok(None) if not found or TTL-expired.
-    pub fn patch(
+    /// Atomically consume one read from the secret.
+    ///
+    /// Checks TTL expiry, decrements `reads_remaining`, decrypts the value.
+    /// If this is the last read (`should_burn_after_read()`), the secret is
+    /// burned: ciphertext and nonce are zeroed, `burned` flag is set.
+    ///
+    /// Returns `(plaintext, burned)` or `Err(NotFound | Burned | Expired)`.
+    pub fn consume_read(
         &self,
-        secret_key: &str,
-        new_value: Option<&str>,
-        new_max_reads: Option<u32>,
-        new_ttl_seconds: Option<u64>,
-    ) -> Result<Option<SecretMeta>> {
-        let now = Self::now();
+        hash: &str,
+        now: i64,
+        key: &EncryptionKey,
+    ) -> Result<(Vec<u8>, bool), StoreError> {
+        let txn = self.db.begin_write()?;
+        let (plaintext, burned) = {
+            let mut tbl = txn.open_table(SECRETS)?;
 
-        let write_txn = self.db.begin_write()?;
-        let result = {
-            let mut table = write_txn.open_table(SECRETS)?;
+            // Read current record — clone bytes before dropping guard.
+            let bytes = match tbl.get(hash)? {
+                Some(v) => v.value().to_vec(),
+                None => return Err(StoreError::NotFound),
+            };
 
-            let raw_bytes: Option<Vec<u8>> =
-                table.get(secret_key)?.map(|guard| guard.value().to_vec());
+            let mut record: SecretRecord = Self::decode(&bytes)?;
 
-            match raw_bytes {
-                None => Ok(None),
-                Some(bytes) => {
-                    let (mut record, record_key_version) = decode(&bytes)?;
-
-                    if record.is_expired(now) {
-                        table.remove(secret_key)?;
-                        return Ok(None);
-                    }
-
-                    if record.delete {
-                        anyhow::bail!("cannot patch a secret with delete=true");
-                    }
-
-                    // Sealed secrets have exhausted their read limit and are immutable.
-                    // Allowing a patch would let a writer reset the counter and re-read
-                    // a secret that was supposed to have been consumed.
-                    if record.is_sealed() {
-                        anyhow::bail!("sealed: secret read limit exhausted");
-                    }
-
-                    if let Some(val) = new_value {
-                        let (encrypted, nonce) = super::crypto::encrypt(&self.key, val.as_bytes())
-                            .context("encrypt patched value")?;
-                        record.value_encrypted = encrypted;
-                        record.nonce = nonce;
-                    }
-
-                    if let Some(max) = new_max_reads {
-                        record.max_reads = Some(max);
-                    }
-
-                    if let Some(ttl) = new_ttl_seconds {
-                        record.expires_at = Some(now + ttl.min((i64::MAX - now) as u64) as i64);
-                    }
-
-                    record.read_count = 0;
-
-                    let updated = encode(&record, record_key_version)?;
-                    table.insert(secret_key, updated.as_slice())?;
-
-                    Ok(Some(SecretMeta {
-                        key: secret_key.to_owned(),
-                        created_at: record.created_at,
-                        expires_at: record.expires_at,
-                        max_reads: record.max_reads,
-                        read_count: 0,
-                        delete: record.delete,
-                        owner_id: record.owner_id.clone(),
-                        org_id: record.org_id.clone(),
-                    }))
-                }
+            if record.is_burned() {
+                return Err(StoreError::Burned);
             }
-        };
-        write_txn.commit()?;
-        result
-    }
-
-    // ── Org-scoped secret methods ───────────────────────────────────────
-
-    /// Build the compound table key for an org-scoped secret: "{org_id}:{key}".
-    fn org_secret_key(org_id: &str, key: &str) -> String {
-        format!("{org_id}:{key}")
-    }
-
-    /// Insert or overwrite an org-scoped secret.
-    #[allow(clippy::too_many_arguments)]
-    pub fn put_org_secret(
-        &self,
-        org_id: &str,
-        key: &str,
-        value: &str,
-        expires_at: Option<i64>,
-        max_reads: Option<u32>,
-        delete: bool,
-        webhook_url: Option<String>,
-        owner_id: Option<&str>,
-        allowed_keys: Option<Vec<String>>,
-    ) -> Result<()> {
-        let now = Self::now();
-
-        let (value_encrypted, nonce) =
-            super::crypto::encrypt(&self.key, value.as_bytes()).context("encrypt value")?;
-
-        let record = SecretRecord {
-            value_encrypted,
-            nonce,
-            created_at: now,
-            expires_at,
-            max_reads,
-            read_count: 0,
-            delete,
-            webhook_url,
-            owner_id: owner_id.map(|s| s.to_owned()),
-            org_id: Some(org_id.to_owned()),
-            allowed_keys,
-        };
-
-        let table_key = Self::org_secret_key(org_id, key);
-        let bytes = encode(&record, self.key_version)?;
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(SECRETS)?;
-            table.insert(table_key.as_str(), bytes.as_slice())?;
-        }
-        write_txn.commit()?;
-
-        debug!(org_id = %org_id, key = %key, "stored org-scoped secret");
-        Ok(())
-    }
-
-    /// Check whether an org-scoped secret key exists (no read counter increment, no decryption).
-    pub fn org_secret_exists(&self, org_id: &str, key: &str) -> Result<bool> {
-        let table_key = Self::org_secret_key(org_id, key);
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(SECRETS)?;
-        Ok(table.get(table_key.as_str())?.is_some())
-    }
-
-    /// Retrieve an org-scoped secret, incrementing its read counter.
-    pub fn get_org_secret(&self, org_id: &str, key: &str) -> Result<GetResult> {
-        let table_key = Self::org_secret_key(org_id, key);
-        self.get_by_table_key(&table_key)
-    }
-
-    /// Retrieve metadata for an org-scoped secret without incrementing read_count.
-    pub fn head_org_secret(&self, org_id: &str, key: &str) -> Result<Option<(SecretMeta, bool)>> {
-        let table_key = Self::org_secret_key(org_id, key);
-        self.head_by_table_key(&table_key, key)
-    }
-
-    /// Delete an org-scoped secret. Returns true if it existed.
-    pub fn delete_org_secret(&self, org_id: &str, key: &str) -> Result<bool> {
-        let table_key = Self::org_secret_key(org_id, key);
-        let write_txn = self.db.begin_write()?;
-        let existed = {
-            let mut table = write_txn.open_table(SECRETS)?;
-            let existed = table.remove(table_key.as_str())?.is_some();
-            existed
-        };
-        write_txn.commit()?;
-        Ok(existed)
-    }
-
-    /// List metadata for all non-expired secrets belonging to an org.
-    /// Optionally filter by `owner_id`.
-    pub fn list_org_secrets(
-        &self,
-        org_id: &str,
-        owner_id: Option<&str>,
-    ) -> Result<Vec<SecretMeta>> {
-        let now = Self::now();
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(SECRETS)?;
-
-        let prefix = format!("{org_id}:");
-        let mut metas = Vec::new();
-        for item in table.iter()? {
-            let (k, v) = item?;
-            let key_str = k.value();
-            if !key_str.starts_with(&prefix) {
-                continue;
-            }
-            let (record, _kv) = decode(v.value())?;
             if record.is_expired(now) {
-                continue;
+                // Tombstone it.
+                record.burned = true;
+                record.burned_at = Some(now);
+                record.value_ciphertext = vec![];
+                record.nonce = [0u8; 12];
+                tbl.insert(hash, Self::encode(&record)?.as_slice())?;
+                return Err(StoreError::Expired);
             }
-            // Filter by owner if requested.
-            if let Some(filter_owner) = owner_id {
-                if record.owner_id.as_deref() != Some(filter_owner) {
-                    continue;
+
+            // Decrypt before we potentially zero the ciphertext.
+            let plaintext =
+                crate::store::crypto::decrypt(key, &record.value_ciphertext, &record.nonce)
+                    .map_err(StoreError::Crypto)?;
+
+            let burned = record.should_burn_after_read();
+
+            if burned {
+                record.burned = true;
+                record.burned_at = Some(now);
+                record.value_ciphertext = vec![];
+                record.nonce = [0u8; 12];
+            }
+
+            // Decrement reads_remaining if finite.
+            if let Some(ref mut rem) = record.reads_remaining {
+                if *rem > 0 {
+                    *rem -= 1;
                 }
             }
-            // Strip the prefix from the display key.
-            let display_key = &key_str[prefix.len()..];
-            metas.push(SecretMeta {
-                key: display_key.to_owned(),
-                created_at: record.created_at,
-                expires_at: record.expires_at,
-                max_reads: record.max_reads,
-                read_count: record.read_count,
-                delete: record.delete,
-                owner_id: record.owner_id.clone(),
-                org_id: record.org_id.clone(),
-            });
-        }
-        Ok(metas)
+
+            tbl.insert(hash, Self::encode(&record)?.as_slice())?;
+            (plaintext, burned)
+        };
+        txn.commit()?;
+        Ok((plaintext, burned))
     }
 
-    /// Check if a principal key is allowed to access an org-scoped secret.
-    /// Returns `true` if the secret has no `allowed_keys` restriction (open access)
-    /// or if `key_name` is in the allowed list.
-    /// Returns `Err` if the secret is not found or expired.
-    pub fn check_key_binding(&self, org_id: &str, key: &str, key_name: &str) -> Result<bool> {
-        let table_key = Self::org_secret_key(org_id, key);
-        let now = Self::now();
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(SECRETS)?;
-
-        let raw_bytes: Option<Vec<u8>> = table.get(table_key.as_str())?.map(|g| g.value().to_vec());
-
-        match raw_bytes {
-            None => anyhow::bail!("secret not found"),
-            Some(bytes) => {
-                let (record, _kv) = decode(&bytes)?;
-                if record.is_expired(now) {
-                    anyhow::bail!("secret not found");
-                }
-                match &record.allowed_keys {
-                    None => Ok(true),                                // no restriction
-                    Some(allowed) if allowed.is_empty() => Ok(true), // empty = no restriction
-                    Some(allowed) => Ok(allowed.iter().any(|k| k == key_name)),
-                }
-            }
-        }
-    }
-
-    /// Update an existing org-scoped secret (only if delete=false).
-    /// Resets read_count to 0. Returns updated metadata.
-    pub fn patch_org_secret(
+    /// Re-encrypt the secret value with a fresh nonce.
+    ///
+    /// Asserts `owner_key_id` matches the stored record's owner.
+    /// `new_ttl` and `new_reads` are optional resets — `None` means frozen (keep existing value).
+    pub fn patch_secret(
         &self,
-        org_id: &str,
-        key: &str,
-        new_value: Option<&str>,
-        new_max_reads: Option<u32>,
-        new_expires_at: Option<i64>,
-    ) -> Result<Option<SecretMeta>> {
-        let table_key = Self::org_secret_key(org_id, key);
-        let now = Self::now();
+        hash: &str,
+        new_value: &[u8],
+        owner_key_id: &str,
+        new_ttl: Option<i64>,
+        new_reads: Option<u32>,
+        key: &EncryptionKey,
+    ) -> Result<SecretRecord, StoreError> {
+        let txn = self.db.begin_write()?;
+        let updated = {
+            let mut tbl = txn.open_table(SECRETS)?;
 
-        let write_txn = self.db.begin_write()?;
-        let result = {
-            let mut table = write_txn.open_table(SECRETS)?;
+            let bytes = match tbl.get(hash)? {
+                Some(v) => v.value().to_vec(),
+                None => return Err(StoreError::NotFound),
+            };
+            let mut record: SecretRecord = Self::decode(&bytes)?;
 
-            let raw_bytes: Option<Vec<u8>> = table
-                .get(table_key.as_str())?
-                .map(|guard| guard.value().to_vec());
-
-            match raw_bytes {
-                None => Ok(None),
-                Some(bytes) => {
-                    let (mut record, record_key_version) = decode(&bytes)?;
-
-                    if record.is_expired(now) {
-                        table.remove(table_key.as_str())?;
-                        return Ok(None);
-                    }
-
-                    if record.delete {
-                        anyhow::bail!("cannot patch a secret with delete=true");
-                    }
-
-                    if record.is_sealed() {
-                        anyhow::bail!("sealed: secret read limit exhausted");
-                    }
-
-                    if let Some(val) = new_value {
-                        let (encrypted, nonce) = super::crypto::encrypt(&self.key, val.as_bytes())
-                            .context("encrypt patched value")?;
-                        record.value_encrypted = encrypted;
-                        record.nonce = nonce;
-                    }
-
-                    if let Some(max) = new_max_reads {
-                        record.max_reads = Some(max);
-                    }
-
-                    if let Some(exp) = new_expires_at {
-                        record.expires_at = Some(exp);
-                    }
-
-                    record.read_count = 0;
-
-                    let updated = encode(&record, record_key_version)?;
-                    table.insert(table_key.as_str(), updated.as_slice())?;
-
-                    Ok(Some(SecretMeta {
-                        key: key.to_owned(),
-                        created_at: record.created_at,
-                        expires_at: record.expires_at,
-                        max_reads: record.max_reads,
-                        read_count: 0,
-                        delete: record.delete,
-                        owner_id: record.owner_id.clone(),
-                        org_id: record.org_id.clone(),
-                    }))
-                }
+            if record.is_burned() {
+                return Err(StoreError::Burned);
             }
+
+            // Ownership check.
+            if record.owner_key_id.as_deref() != Some(owner_key_id) {
+                return Err(StoreError::WrongOwner);
+            }
+
+            // Re-encrypt with fresh nonce.
+            let (ciphertext, nonce) =
+                crate::store::crypto::encrypt(key, new_value).map_err(StoreError::Crypto)?;
+            record.value_ciphertext = ciphertext;
+            record.nonce = nonce;
+
+            // Optional resets.
+            if let Some(ttl) = new_ttl {
+                record.ttl_expires_at = Some(ttl);
+            }
+            if let Some(reads) = new_reads {
+                record.reads_remaining = Some(reads);
+            }
+
+            tbl.insert(hash, Self::encode(&record)?.as_slice())?;
+            record
         };
-        write_txn.commit()?;
-        result
+        txn.commit()?;
+        Ok(updated)
     }
 
-    /// Prune expired/burned secrets scoped to a specific org. Returns pruned key names.
-    pub fn prune_org_secrets(&self, org_id: &str) -> Result<Vec<String>> {
-        let now = Self::now();
-        let prefix = format!("{org_id}:");
+    /// Burn the secret: set `burned=true`, zero ciphertext+nonce, record `burned_at`.
+    ///
+    /// For keyed secrets, `owner_key_id` must match; pass `None` to skip the check
+    /// (anonymous secrets can be burned by anyone).
+    pub fn burn_secret(
+        &self,
+        hash: &str,
+        owner_key_id: Option<&str>,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut tbl = txn.open_table(SECRETS)?;
 
-        let expired_keys: Vec<String> = {
-            let read_txn = self.db.begin_read()?;
-            let table = read_txn.open_table(SECRETS)?;
-            let mut keys = Vec::new();
-            for item in table.iter()? {
-                let (k, v) = item?;
-                let key_str = k.value();
-                if !key_str.starts_with(&prefix) {
-                    continue;
-                }
-                let (record, _kv) = decode(v.value())?;
-                if record.is_expired(now) || record.is_burned() {
-                    keys.push(key_str.to_owned());
+            let bytes = match tbl.get(hash)? {
+                Some(v) => v.value().to_vec(),
+                None => return Err(StoreError::NotFound),
+            };
+            let mut record: SecretRecord = Self::decode(&bytes)?;
+
+            if record.is_burned() {
+                return Err(StoreError::Burned);
+            }
+
+            // Ownership check for keyed secrets.
+            if let Some(oid) = owner_key_id {
+                if record.owner_key_id.as_deref() != Some(oid) {
+                    return Err(StoreError::WrongOwner);
                 }
             }
-            keys
-        };
 
-        if expired_keys.is_empty() {
-            return Ok(vec![]);
+            record.burned = true;
+            record.burned_at = Some(now);
+            record.value_ciphertext = vec![];
+            record.nonce = [0u8; 12];
+
+            tbl.insert(hash, Self::encode(&record)?.as_slice())?;
         }
-
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(SECRETS)?;
-            for key in &expired_keys {
-                table.remove(key.as_str())?;
-            }
-        }
-        write_txn.commit()?;
-
-        // Return display keys (without prefix).
-        let display_keys: Vec<String> = expired_keys
-            .into_iter()
-            .map(|k| k[prefix.len()..].to_owned())
-            .collect();
-
-        let removed = display_keys.len();
-        if removed > 0 {
-            info!(org_id = %org_id, removed, "pruned expired org secrets");
-        }
-        Ok(display_keys)
-    }
-
-    // ── Audit log ─────────────────────────────────────────────────────────
-
-    /// Record an audit event. Allocates a monotonic ID via the counters table.
-    pub fn record_audit(&self, mut event: AuditEvent) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut counters = write_txn.open_table(COUNTERS)?;
-            let seq = counters.get(AUDIT_SEQ_KEY)?.map(|g| g.value()).unwrap_or(0) + 1;
-            counters.insert(AUDIT_SEQ_KEY, seq)?;
-            event.id = seq;
-
-            let bytes = bincode::serde::encode_to_vec(&event, bincode::config::standard())
-                .context("bincode encode audit event")?;
-            let mut audit = write_txn.open_table(AUDIT_LOG)?;
-            audit.insert(event.id, bytes.as_slice())?;
-        }
-        write_txn.commit()?;
+        txn.commit()?;
         Ok(())
     }
 
-    /// List audit events matching the query, most recent first.
-    pub fn list_audit(&self, query: &AuditQuery) -> Result<Vec<AuditEvent>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(AUDIT_LOG)?;
+    // ── Keys ──────────────────────────────────────────────────────────────────
 
-        let mut events = Vec::new();
-        for item in table.iter()?.rev() {
-            let (_k, v) = item?;
-            let (event, _): (AuditEvent, _) =
-                bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                    .context("bincode decode audit event")?;
+    /// Create a new API key. Generates a ULID id, 32-byte random token, and
+    /// blake3-hashes the token. Stores in all three key tables.
+    ///
+    /// Returns `(KeyRecord, plaintext_token_hex)` — the plaintext is shown once.
+    pub fn create_key(
+        &self,
+        name: &str,
+        valid_after: Option<i64>,
+        valid_before: Option<i64>,
+        webhook_url: Option<String>,
+    ) -> Result<(KeyRecord, String), StoreError> {
+        use rand::rngs::OsRng;
+        use rand::RngCore;
+        use ulid::Ulid;
+
+        let id = Ulid::new().to_string();
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        // Generate 32-byte random token.
+        let mut token_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut token_bytes);
+        let token_hex = hex::encode(token_bytes);
+
+        // blake3 hash for storage.
+        let hash = *blake3::hash(&token_bytes).as_bytes();
+
+        let record = KeyRecord {
+            id: id.clone(),
+            name: name.to_string(),
+            hash,
+            created_at,
+            valid_after,
+            valid_before,
+            webhook_url,
+        };
+
+        let txn = self.db.begin_write()?;
+        {
+            let mut by_id = txn.open_table(KEYS_BY_ID)?;
+            let mut by_hash = txn.open_table(KEYS_BY_HASH)?;
+            let mut by_name = txn.open_table(KEYS_BY_NAME)?;
+
+            by_id.insert(record.id.as_str(), Self::encode(&record)?.as_slice())?;
+            by_hash.insert(&hash, record.id.as_str())?;
+            by_name.insert(record.name.as_str(), record.id.as_str())?;
+        }
+        txn.commit()?;
+
+        Ok((record, token_hex))
+    }
+
+    /// Look up a key by its bearer token (hex string).
+    ///
+    /// Hashes the token with blake3 and looks up the hash in `keys_by_hash`.
+    /// Returns `None` if not found.
+    pub fn find_key_by_token(&self, token_hex: &str) -> Result<Option<KeyRecord>, StoreError> {
+        let token_bytes = match hex::decode(token_hex) {
+            Ok(b) if b.len() == 32 => b,
+            _ => return Ok(None),
+        };
+        let hash = *blake3::hash(&token_bytes).as_bytes();
+        self.find_key_by_hash(&hash)
+    }
+
+    /// Look up a key by its blake3 hash (internal use).
+    fn find_key_by_hash(&self, hash: &[u8; 32]) -> Result<Option<KeyRecord>, StoreError> {
+        let rtxn = self.db.begin_read()?;
+        let by_hash = rtxn.open_table(KEYS_BY_HASH)?;
+        let key_id = match by_hash.get(hash)? {
+            Some(v) => v.value().to_string(),
+            None => return Ok(None),
+        };
+        drop(by_hash);
+        drop(rtxn);
+
+        let rtxn2 = self.db.begin_read()?;
+        let by_id = rtxn2.open_table(KEYS_BY_ID)?;
+        match by_id.get(key_id.as_str())? {
+            Some(v) => Ok(Some(Self::decode(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Look up a key by its ULID id (internal use for webhook lookup).
+    pub fn find_key_by_id(&self, id: &str) -> Result<Option<KeyRecord>, StoreError> {
+        let rtxn = self.db.begin_read()?;
+        let by_id = rtxn.open_table(KEYS_BY_ID)?;
+        match by_id.get(id)? {
+            Some(v) => Ok(Some(Self::decode(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all keys in `keys_by_id`.
+    pub fn list_keys(&self) -> Result<Vec<KeyRecord>, StoreError> {
+        let rtxn = self.db.begin_read()?;
+        let tbl = rtxn.open_table(KEYS_BY_ID)?;
+        let mut results = Vec::new();
+        for entry in tbl.iter()? {
+            let (_, v) = entry?;
+            results.push(Self::decode(v.value())?);
+        }
+        Ok(results)
+    }
+
+    /// Delete a key by name. Removes from all three key tables.
+    pub fn delete_key(&self, name: &str) -> Result<(), StoreError> {
+        // First resolve name → id.
+        let key_id = {
+            let rtxn = self.db.begin_read()?;
+            let by_name = rtxn.open_table(KEYS_BY_NAME)?;
+            match by_name.get(name)? {
+                Some(v) => v.value().to_string(),
+                None => return Err(StoreError::KeyNotFound),
+            }
+        };
+
+        // Resolve id → record (to get the hash).
+        let record: KeyRecord = {
+            let rtxn = self.db.begin_read()?;
+            let by_id = rtxn.open_table(KEYS_BY_ID)?;
+            match by_id.get(key_id.as_str())? {
+                Some(v) => Self::decode(v.value())?,
+                None => return Err(StoreError::KeyNotFound),
+            }
+        };
+
+        let txn = self.db.begin_write()?;
+        {
+            let mut by_id = txn.open_table(KEYS_BY_ID)?;
+            let mut by_hash = txn.open_table(KEYS_BY_HASH)?;
+            let mut by_name = txn.open_table(KEYS_BY_NAME)?;
+
+            by_id.remove(record.id.as_str())?;
+            by_hash.remove(&record.hash)?;
+            by_name.remove(name)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    // ── Key-scoped secret queries ─────────────────────────────────────────────
+
+    /// Count active (non-burned) secrets owned by `key_id` and build a prefix histogram.
+    ///
+    /// Prefix = everything before the last `_` + 32-hex-char suffix.
+    /// Returns `(count, histogram)`.
+    pub fn secrets_owned_by(
+        &self,
+        key_id: &str,
+    ) -> Result<(usize, BTreeMap<String, usize>), StoreError> {
+        let rtxn = self.db.begin_read()?;
+        let tbl = rtxn.open_table(SECRETS)?;
+        let mut count = 0usize;
+        let mut histogram: BTreeMap<String, usize> = BTreeMap::new();
+
+        for entry in tbl.iter()? {
+            let (_, v) = entry?;
+            let record: SecretRecord = Self::decode(v.value())?;
+            if record.is_burned() {
+                continue;
+            }
+            if record.owner_key_id.as_deref() != Some(key_id) {
+                continue;
+            }
+            count += 1;
+
+            // Extract prefix: everything before the last underscore.
+            let prefix = extract_prefix(&record.hash);
+            *histogram.entry(prefix).or_insert(0) += 1;
+        }
+
+        Ok((count, histogram))
+    }
+
+    /// Burn every active secret owned by `key_id`. Returns count burned.
+    pub fn purge_secrets_for_key(&self, key_id: &str) -> Result<usize, StoreError> {
+        // Collect hashes to burn first (avoid mixing read + write iterators).
+        let hashes_to_burn: Vec<String> = {
+            let rtxn = self.db.begin_read()?;
+            let tbl = rtxn.open_table(SECRETS)?;
+            let mut v = Vec::new();
+            for entry in tbl.iter()? {
+                let (k, val) = entry?;
+                let record: SecretRecord = Self::decode(val.value())?;
+                if !record.is_burned() && record.owner_key_id.as_deref() == Some(key_id) {
+                    v.push(k.value().to_string());
+                }
+            }
+            v
+        };
+
+        let count = hashes_to_burn.len();
+        let txn = self.db.begin_write()?;
+        {
+            let mut tbl = txn.open_table(SECRETS)?;
+            for hash in &hashes_to_burn {
+                // Clone bytes before dropping AccessGuard to allow subsequent insert.
+                let bytes_opt: Option<Vec<u8>> =
+                    tbl.get(hash.as_str())?.map(|g| g.value().to_vec());
+                if let Some(bytes) = bytes_opt {
+                    let mut record: SecretRecord = Self::decode(&bytes)?;
+                    record.burned = true;
+                    record.value_ciphertext = vec![];
+                    record.nonce = [0u8; 12];
+                    tbl.insert(hash.as_str(), Self::encode(&record)?.as_slice())?;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(count)
+    }
+
+    // ── Audit ─────────────────────────────────────────────────────────────────
+
+    /// Append an audit event. Assigns a monotonically increasing id.
+    pub fn record_audit(&self, mut event: AuditEvent) -> Result<u64, StoreError> {
+        let id = {
+            let mut counter = self.audit_counter.lock().unwrap();
+            *counter += 1;
+            *counter
+        };
+        event.id = id;
+
+        let txn = self.db.begin_write()?;
+        {
+            let mut audit_tbl = txn.open_table(AUDIT)?;
+            audit_tbl.insert(id, Self::encode(&event)?.as_slice())?;
+
+            // Persist the counter.
+            let mut cfg = txn.open_table(CONFIG)?;
+            cfg.insert(CFG_AUDIT_COUNTER, Self::encode(&id)?.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(id)
+    }
+
+    /// Query audit events with optional filters. Returns newest-first up to `limit`.
+    pub fn query_audit(&self, query: &AuditQuery) -> Result<Vec<AuditEvent>, StoreError> {
+        let rtxn = self.db.begin_read()?;
+        let tbl = rtxn.open_table(AUDIT)?;
+
+        let mut results: Vec<AuditEvent> = Vec::new();
+
+        // Iterate in reverse (newest first).
+        for entry in tbl.iter()?.rev() {
+            let (_, v) = entry?;
+            let event: AuditEvent = Self::decode(v.value())?;
 
             if let Some(since) = query.since {
                 if event.timestamp < since {
-                    break; // IDs are monotonic, older events follow — stop early.
+                    continue;
                 }
             }
             if let Some(until) = query.until {
-                if event.timestamp > until {
+                if event.timestamp >= until {
                     continue;
                 }
             }
             if let Some(ref action) = query.action {
-                if event.action != *action {
+                if &event.action != action {
                     continue;
                 }
             }
-            if let Some(ref key_filter) = query.key {
-                if event.key.as_deref() != Some(key_filter.as_str()) {
+            if let Some(ref key_id) = query.key_id {
+                if event.key_id.as_ref() != Some(key_id) {
                     continue;
                 }
             }
-            if let Some(ref org_id) = query.org_id {
-                if event.org_id.as_deref() != Some(org_id.as_str()) {
+            if let Some(ref hash) = query.hash {
+                if event.hash.as_ref() != Some(hash) {
                     continue;
                 }
             }
-            events.push(event);
-            if events.len() >= query.limit {
+
+            results.push(event);
+
+            if query.limit > 0 && results.len() >= query.limit {
                 break;
             }
         }
-        Ok(events)
+
+        Ok(results)
     }
 
-    /// Remove audit events older than `retention_seconds`. Returns count removed.
-    pub fn prune_audit(&self, retention_seconds: i64) -> Result<usize> {
-        let cutoff = Self::now() - retention_seconds;
+    // ── Generic config ────────────────────────────────────────────────────────
 
-        // Read pass: collect IDs to remove.
-        let ids_to_remove: Vec<u64> = {
-            let read_txn = self.db.begin_read()?;
-            let table = read_txn.open_table(AUDIT_LOG)?;
+    /// Read an arbitrary string value from the config table. Returns `None` if absent.
+    pub fn get_config_str(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let rtxn = self.db.begin_read()?;
+        let tbl = rtxn.open_table(CONFIG)?;
+        match tbl.get(key)? {
+            Some(v) => {
+                let s = String::from_utf8_lossy(v.value()).into_owned();
+                Ok(Some(s))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Write an arbitrary string value to the config table.
+    pub fn set_config_str(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut tbl = txn.open_table(CONFIG)?;
+            tbl.insert(key, value.as_bytes())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    // ── Key lookup by name ────────────────────────────────────────────────────
+
+    /// Look up a key by its operator-assigned name.
+    pub fn find_key_by_name(&self, name: &str) -> Result<Option<KeyRecord>, StoreError> {
+        let key_id = {
+            let rtxn = self.db.begin_read()?;
+            let by_name = rtxn.open_table(KEYS_BY_NAME)?;
+            match by_name.get(name)? {
+                Some(v) => v.value().to_string(),
+                None => return Ok(None),
+            }
+        };
+
+        let rtxn = self.db.begin_read()?;
+        let by_id = rtxn.open_table(KEYS_BY_ID)?;
+        match by_id.get(key_id.as_str())? {
+            Some(v) => Ok(Some(Self::decode(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    // ── Pruning ───────────────────────────────────────────────────────────────
+
+    /// Hard-delete burned secrets (and their audit events) where `burned_at` is older than
+    /// `retention_days`. Active secrets and their audit trails are never pruned.
+    ///
+    /// Returns the count of secret records deleted.
+    pub fn prune(&self, now: i64, retention_days: i64) -> Result<usize, StoreError> {
+        let cutoff = now - retention_days * 86_400;
+
+        // Collect burned secrets past the retention cutoff, plus their hashes for audit lookup.
+        let (hashes_to_delete, hash_set): (Vec<String>, std::collections::HashSet<String>) = {
+            let rtxn = self.db.begin_read()?;
+            let tbl = rtxn.open_table(SECRETS)?;
+            let mut hashes = Vec::new();
+            for entry in tbl.iter()? {
+                let (k, val) = entry?;
+                let record: SecretRecord = Self::decode(val.value())?;
+                // Only prune if burned AND burned_at is past the cutoff.
+                if record.is_burned() {
+                    let burned_at = record.burned_at.unwrap_or(record.created_at);
+                    if burned_at < cutoff {
+                        hashes.push(k.value().to_string());
+                    }
+                }
+            }
+            let set: std::collections::HashSet<String> = hashes.iter().cloned().collect();
+            (hashes, set)
+        };
+
+        let count = hashes_to_delete.len();
+        if count == 0 {
+            return Ok(0);
+        }
+
+        // Collect audit event IDs associated with the secrets being pruned.
+        let audit_ids_to_delete: Vec<u64> = {
+            let rtxn = self.db.begin_read()?;
+            let tbl = rtxn.open_table(AUDIT)?;
             let mut ids = Vec::new();
-            for item in table.iter()? {
-                let (k, v) = item?;
-                let (event, _): (AuditEvent, _) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .context("bincode decode audit for prune")?;
-                if event.timestamp < cutoff {
-                    ids.push(k.value());
-                } else {
-                    break; // IDs are monotonic — remaining are newer.
+            for entry in tbl.iter()? {
+                let (k, val) = entry?;
+                let event: AuditEvent = Self::decode(val.value())?;
+                if let Some(ref h) = event.hash {
+                    if hash_set.contains(h) {
+                        ids.push(k.value());
+                    }
                 }
             }
             ids
         };
 
-        if ids_to_remove.is_empty() {
-            return Ok(0);
-        }
-
-        let write_txn = self.db.begin_write()?;
+        // Delete secrets and their audit events in one write transaction.
+        let txn = self.db.begin_write()?;
         {
-            let mut table = write_txn.open_table(AUDIT_LOG)?;
-            for id in &ids_to_remove {
-                table.remove(*id)?;
+            let mut secrets_tbl = txn.open_table(SECRETS)?;
+            for hash in &hashes_to_delete {
+                secrets_tbl.remove(hash.as_str())?;
+            }
+
+            let mut audit_tbl = txn.open_table(AUDIT)?;
+            for id in &audit_ids_to_delete {
+                audit_tbl.remove(id)?;
             }
         }
-        write_txn.commit()?;
-
-        let removed = ids_to_remove.len();
-        if removed > 0 {
-            info!(removed, "pruned old audit events");
-        }
-        Ok(removed)
-    }
-
-    /// Spawn a background task that prunes old audit events periodically.
-    pub fn spawn_audit_sweep(self, interval: Duration, retention_seconds: i64) {
-        tokio::spawn(async move {
-            let mut ticker = time::interval(interval);
-            ticker.tick().await; // skip first immediate tick
-            loop {
-                ticker.tick().await;
-                if let Err(e) = self.prune_audit(retention_seconds) {
-                    warn!(error = %e, "audit sweep error");
-                }
-            }
-        });
-    }
-
-    /// Spawn a background Tokio task that calls `prune()` every `interval`.
-    /// If a `WebhookSender` is provided, fires `secret.expired` for each pruned key.
-    pub fn spawn_sweep(
-        self,
-        interval: Duration,
-        webhook_sender: Option<crate::webhooks::WebhookSender>,
-    ) {
-        tokio::spawn(async move {
-            let mut ticker = time::interval(interval);
-            ticker.tick().await; // skip first immediate tick
-            loop {
-                ticker.tick().await;
-                match self.prune() {
-                    Ok(pruned_keys) => {
-                        if let Some(ref sender) = webhook_sender {
-                            for key in &pruned_keys {
-                                sender.fire(
-                                    "secret.expired",
-                                    key,
-                                    serde_json::json!({"reason": "ttl_or_burned"}),
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "background sweep error");
-                    }
-                }
-            }
-        });
-    }
-
-    /// Return the highest key version found across all stored records.
-    /// Returns 1 if the database is empty (legacy default).
-    pub fn max_key_version(&self) -> Result<u8> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(SECRETS)?;
-        let mut max = 1u8;
-        for item in table.iter()? {
-            let (_k, v) = item?;
-            let (_record, kv) = decode(v.value())?;
-            max = max.max(kv);
-        }
-        Ok(max)
-    }
-
-    // ── Org CRUD ──────────────────────────────────────────────────────────
-
-    /// Insert or overwrite an org record.
-    pub fn put_org(&self, org: &super::org::OrgRecord) -> Result<()> {
-        let bytes = bincode::serde::encode_to_vec(org, bincode::config::standard())
-            .context("bincode encode org")?;
-
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(super::org::ORGS)?;
-            table.insert(org.id.as_str(), bytes.as_slice())?;
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
-
-    /// Retrieve an org by ID.
-    pub fn get_org(&self, id: &str) -> Result<Option<super::org::OrgRecord>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(super::org::ORGS)?;
-
-        let raw: Option<Vec<u8>> = table.get(id)?.map(|g| g.value().to_vec());
-        match raw {
-            None => Ok(None),
-            Some(bytes) => {
-                let (record, _): (super::org::OrgRecord, _) =
-                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-                        .context("bincode decode org")?;
-                Ok(Some(record))
-            }
-        }
-    }
-
-    /// List all orgs.
-    pub fn list_orgs(&self) -> Result<Vec<super::org::OrgRecord>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(super::org::ORGS)?;
-
-        let mut orgs = Vec::new();
-        for item in table.iter()? {
-            let (_k, v) = item?;
-            let (record, _): (super::org::OrgRecord, _) =
-                bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                    .context("bincode decode org")?;
-            orgs.push(record);
-        }
-        Ok(orgs)
-    }
-
-    /// Delete an org by ID. Returns true if it existed.
-    /// Fails if the org still has principals.
-    pub fn delete_org(&self, id: &str) -> Result<bool> {
-        let read_txn = self.db.begin_read()?;
-
-        // Check for existing principals with prefix "{org_id}:"
-        {
-            let table = read_txn.open_table(super::org::PRINCIPALS)?;
-            let prefix = format!("{id}:");
-            for item in table.iter()? {
-                let (k, _v) = item?;
-                if k.value().starts_with(&prefix) {
-                    anyhow::bail!("cannot delete org {id}: still has principals");
-                }
-            }
-        }
-        drop(read_txn);
-
-        let write_txn = self.db.begin_write()?;
-        let existed = {
-            let mut table = write_txn.open_table(super::org::ORGS)?;
-            let existed = table.remove(id)?.is_some();
-            existed
-        };
-        write_txn.commit()?;
-        Ok(existed)
-    }
-
-    // ── Principal CRUD ───────────────────────────────────────────────────
-
-    /// Insert or overwrite a principal record.
-    /// Compound key: "{org_id}:{principal_id}".
-    pub fn put_principal(&self, p: &super::org::PrincipalRecord) -> Result<()> {
-        let key = format!("{}:{}", p.org_id, p.id);
-        let bytes = bincode::serde::encode_to_vec(p, bincode::config::standard())
-            .context("bincode encode principal")?;
-
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(super::org::PRINCIPALS)?;
-            table.insert(key.as_str(), bytes.as_slice())?;
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
-
-    /// Retrieve a principal by org_id and principal_id.
-    pub fn get_principal(
-        &self,
-        org_id: &str,
-        principal_id: &str,
-    ) -> Result<Option<super::org::PrincipalRecord>> {
-        let key = format!("{org_id}:{principal_id}");
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(super::org::PRINCIPALS)?;
-
-        let raw: Option<Vec<u8>> = table.get(key.as_str())?.map(|g| g.value().to_vec());
-        match raw {
-            None => Ok(None),
-            Some(bytes) => {
-                let (record, _): (super::org::PrincipalRecord, _) =
-                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-                        .context("bincode decode principal")?;
-                Ok(Some(record))
-            }
-        }
-    }
-
-    /// List all principals for a given org.
-    pub fn list_principals(&self, org_id: &str) -> Result<Vec<super::org::PrincipalRecord>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(super::org::PRINCIPALS)?;
-
-        let prefix = format!("{org_id}:");
-        let mut principals = Vec::new();
-        for item in table.iter()? {
-            let (k, v) = item?;
-            if !k.value().starts_with(&prefix) {
-                continue;
-            }
-            let (record, _): (super::org::PrincipalRecord, _) =
-                bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                    .context("bincode decode principal")?;
-            principals.push(record);
-        }
-        Ok(principals)
-    }
-
-    /// Delete a principal by org_id and principal_id. Returns true if it existed.
-    /// Fails if the principal has active (unexpired) keys.
-    pub fn delete_principal(&self, org_id: &str, principal_id: &str) -> Result<bool> {
-        let now = Self::now();
-
-        // Check for active keys in PRINCIPAL_KEY_IX with prefix "{principal_id}:"
-        {
-            let read_txn = self.db.begin_read()?;
-            let ix_table = read_txn.open_table(super::org::PRINCIPAL_KEY_IX)?;
-            let keys_table = read_txn.open_table(super::org::PRINCIPAL_KEYS)?;
-            let prefix = format!("{principal_id}:");
-
-            for item in ix_table.iter()? {
-                let (k, v) = item?;
-                if !k.value().starts_with(&prefix) {
-                    continue;
-                }
-                // Look up the key record to check valid_before
-                let hash = v.value().to_vec();
-                if let Some(key_guard) = keys_table.get(hash.as_slice())? {
-                    let key_bytes = key_guard.value().to_vec();
-                    let (key_record, _): (super::org::PrincipalKeyRecord, _) =
-                        bincode::serde::decode_from_slice(&key_bytes, bincode::config::standard())
-                            .context("bincode decode principal key")?;
-                    if key_record.valid_before > now {
-                        anyhow::bail!("cannot delete principal {principal_id}: has active keys");
-                    }
-                }
-            }
-        }
-
-        let compound_key = format!("{org_id}:{principal_id}");
-        let write_txn = self.db.begin_write()?;
-        let existed = {
-            let mut table = write_txn.open_table(super::org::PRINCIPALS)?;
-            let existed = table.remove(compound_key.as_str())?.is_some();
-            existed
-        };
-        write_txn.commit()?;
-        Ok(existed)
-    }
-
-    // ── PrincipalKey CRUD ────────────────────────────────────────────────
-
-    /// Insert a principal key record. Writes to both PRINCIPAL_KEYS (hash->record)
-    /// and PRINCIPAL_KEY_IX ("{principal_id}:{key_id}"->hash).
-    pub fn put_principal_key(&self, key: &super::org::PrincipalKeyRecord) -> Result<()> {
-        let bytes = bincode::serde::encode_to_vec(key, bincode::config::standard())
-            .context("bincode encode principal key")?;
-        let ix_key = format!("{}:{}", key.principal_id, key.id);
-
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut keys_table = write_txn.open_table(super::org::PRINCIPAL_KEYS)?;
-            keys_table.insert(key.key_hash.as_slice(), bytes.as_slice())?;
-
-            let mut ix_table = write_txn.open_table(super::org::PRINCIPAL_KEY_IX)?;
-            ix_table.insert(ix_key.as_str(), key.key_hash.as_slice())?;
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
-
-    /// O(1) lookup of a principal key by its hash.
-    pub fn find_principal_key_by_hash(
-        &self,
-        hash: &[u8],
-    ) -> Result<Option<super::org::PrincipalKeyRecord>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(super::org::PRINCIPAL_KEYS)?;
-
-        let raw: Option<Vec<u8>> = table.get(hash)?.map(|g| g.value().to_vec());
-        match raw {
-            None => Ok(None),
-            Some(bytes) => {
-                let (record, _): (super::org::PrincipalKeyRecord, _) =
-                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-                        .context("bincode decode principal key")?;
-                Ok(Some(record))
-            }
-        }
-    }
-
-    /// List all keys for a given principal by scanning the index.
-    pub fn list_principal_keys(
-        &self,
-        principal_id: &str,
-    ) -> Result<Vec<super::org::PrincipalKeyRecord>> {
-        let read_txn = self.db.begin_read()?;
-        let ix_table = read_txn.open_table(super::org::PRINCIPAL_KEY_IX)?;
-        let keys_table = read_txn.open_table(super::org::PRINCIPAL_KEYS)?;
-
-        let prefix = format!("{principal_id}:");
-        let mut records = Vec::new();
-        for item in ix_table.iter()? {
-            let (k, v) = item?;
-            if !k.value().starts_with(&prefix) {
-                continue;
-            }
-            let hash = v.value().to_vec();
-            if let Some(guard) = keys_table.get(hash.as_slice())? {
-                let key_bytes = guard.value().to_vec();
-                let (record, _): (super::org::PrincipalKeyRecord, _) =
-                    bincode::serde::decode_from_slice(&key_bytes, bincode::config::standard())
-                        .context("bincode decode principal key")?;
-                records.push(record);
-            }
-        }
-        Ok(records)
-    }
-
-    /// Delete a principal key by principal_id and key_id.
-    /// Removes from both PRINCIPAL_KEY_IX and PRINCIPAL_KEYS tables.
-    pub fn delete_principal_key(&self, principal_id: &str, key_id: &str) -> Result<bool> {
-        let ix_key = format!("{principal_id}:{key_id}");
-
-        // Look up the hash in the index first.
-        let hash: Option<Vec<u8>> = {
-            let read_txn = self.db.begin_read()?;
-            let ix_table = read_txn.open_table(super::org::PRINCIPAL_KEY_IX)?;
-            ix_table.get(ix_key.as_str())?.map(|g| g.value().to_vec())
-        };
-
-        let hash = match hash {
-            Some(h) => h,
-            None => return Ok(false),
-        };
-
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut ix_table = write_txn.open_table(super::org::PRINCIPAL_KEY_IX)?;
-            ix_table.remove(ix_key.as_str())?;
-
-            let mut keys_table = write_txn.open_table(super::org::PRINCIPAL_KEYS)?;
-            keys_table.remove(hash.as_slice())?;
-        }
-        write_txn.commit()?;
-        Ok(true)
-    }
-
-    // ── Role CRUD ────────────────────────────────────────────────────────
-
-    /// Build the table key for a role: "builtin:{name}" or "{org_id}:{name}".
-    fn role_table_key(org_id: Option<&str>, name: &str) -> String {
-        match org_id {
-            None => format!("builtin:{name}"),
-            Some(oid) => format!("{oid}:{name}"),
-        }
-    }
-
-    /// Insert or overwrite a role record.
-    pub fn put_role(&self, role: &super::org::RoleRecord) -> Result<()> {
-        let key = Self::role_table_key(role.org_id.as_deref(), &role.name);
-        let bytes = bincode::serde::encode_to_vec(role, bincode::config::standard())
-            .context("bincode encode role")?;
-
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(super::org::ROLES)?;
-            table.insert(key.as_str(), bytes.as_slice())?;
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
-
-    /// Retrieve a role by org_id (None = built-in) and name.
-    pub fn get_role(
-        &self,
-        org_id: Option<&str>,
-        name: &str,
-    ) -> Result<Option<super::org::RoleRecord>> {
-        let key = Self::role_table_key(org_id, name);
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(super::org::ROLES)?;
-
-        let raw: Option<Vec<u8>> = table.get(key.as_str())?.map(|g| g.value().to_vec());
-        match raw {
-            None => Ok(None),
-            Some(bytes) => {
-                let (record, _): (super::org::RoleRecord, _) =
-                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-                        .context("bincode decode role")?;
-                Ok(Some(record))
-            }
-        }
-    }
-
-    /// List roles: all built-in roles + custom roles for the given org.
-    /// If org_id is None, returns only built-in roles.
-    pub fn list_roles(&self, org_id: Option<&str>) -> Result<Vec<super::org::RoleRecord>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(super::org::ROLES)?;
-
-        let builtin_prefix = "builtin:";
-        let org_prefix = org_id.map(|oid| format!("{oid}:"));
-
-        let mut roles = Vec::new();
-        for item in table.iter()? {
-            let (k, v) = item?;
-            let key_str = k.value();
-            let include = key_str.starts_with(builtin_prefix)
-                || org_prefix
-                    .as_ref()
-                    .is_some_and(|p| key_str.starts_with(p.as_str()));
-            if include {
-                let (record, _): (super::org::RoleRecord, _) =
-                    bincode::serde::decode_from_slice(v.value(), bincode::config::standard())
-                        .context("bincode decode role")?;
-                roles.push(record);
-            }
-        }
-        Ok(roles)
-    }
-
-    /// Delete a role. Fails if built-in or if any principal in the org uses this role.
-    pub fn delete_role(&self, org_id: Option<&str>, name: &str) -> Result<bool> {
-        // Cannot delete built-in roles.
-        if org_id.is_none() {
-            anyhow::bail!("cannot delete built-in role \"{name}\"");
-        }
-
-        let oid = org_id.unwrap();
-
-        // Check if any principal in this org uses this role.
-        {
-            let read_txn = self.db.begin_read()?;
-            let table = read_txn.open_table(super::org::PRINCIPALS)?;
-            let prefix = format!("{oid}:");
-            for item in table.iter()? {
-                let (k, v) = item?;
-                if !k.value().starts_with(&prefix) {
-                    continue;
-                }
-                let bytes = v.value().to_vec();
-                let (principal, _): (super::org::PrincipalRecord, _) =
-                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-                        .context("bincode decode principal")?;
-                if principal.role == name {
-                    anyhow::bail!(
-                        "cannot delete role \"{name}\": in use by principal \"{}\"",
-                        principal.id
-                    );
-                }
-            }
-        }
-
-        let key = Self::role_table_key(Some(oid), name);
-        let write_txn = self.db.begin_write()?;
-        let existed = {
-            let mut table = write_txn.open_table(super::org::ROLES)?;
-            let existed = table.remove(key.as_str())?.is_some();
-            existed
-        };
-        write_txn.commit()?;
-        Ok(existed)
-    }
-
-    /// Re-encrypt all non-expired records with `new_key`, tagging them with
-    /// `new_key_version`. The current `self.key` is used to decrypt.
-    /// Returns the number of records rotated.
-    pub fn rotate(&self, new_key: &EncryptionKey, new_key_version: u8) -> Result<usize> {
-        let now = Self::now();
-
-        // Read pass: collect all raw bytes keyed by secret name.
-        let entries: Vec<(String, Vec<u8>)> = {
-            let read_txn = self.db.begin_read()?;
-            let table = read_txn.open_table(SECRETS)?;
-            let mut out = Vec::new();
-            for item in table.iter()? {
-                let (k, v) = item?;
-                out.push((k.value().to_owned(), v.value().to_vec()));
-            }
-            out
-        };
-
-        if entries.is_empty() {
-            return Ok(0);
-        }
-
-        // Write pass: decrypt with old key, re-encrypt with new key.
-        let write_txn = self.db.begin_write()?;
-        let mut count = 0usize;
-        {
-            let mut table = write_txn.open_table(SECRETS)?;
-            for (key, raw_bytes) in &entries {
-                let (record, _old_version) = decode(raw_bytes)?;
-
-                // Skip expired records — they'll be pruned normally.
-                if record.is_expired(now) {
-                    continue;
-                }
-
-                // Decrypt with old key.
-                let plaintext =
-                    super::crypto::decrypt(&self.key, &record.value_encrypted, &record.nonce)
-                        .context("decrypt for rotation")?;
-
-                // Re-encrypt with new key.
-                let (new_encrypted, new_nonce) =
-                    super::crypto::encrypt(new_key, &plaintext).context("encrypt for rotation")?;
-
-                let new_record = SecretRecord {
-                    value_encrypted: new_encrypted,
-                    nonce: new_nonce,
-                    created_at: record.created_at,
-                    expires_at: record.expires_at,
-                    max_reads: record.max_reads,
-                    read_count: record.read_count,
-                    delete: record.delete,
-                    webhook_url: record.webhook_url.clone(),
-                    owner_id: record.owner_id.clone(),
-                    org_id: record.org_id.clone(),
-                    allowed_keys: record.allowed_keys.clone(),
-                };
-
-                let new_bytes = encode(&new_record, new_key_version)?;
-                table.insert(key.as_str(), new_bytes.as_slice())?;
-                count += 1;
-            }
-        }
-        write_txn.commit()?;
-
-        info!(rotated = count, new_key_version, "key rotation complete");
+        txn.commit()?;
         Ok(count)
     }
 }
 
-/// Encode a SecretRecord in v2 format: `[RECORD_V2_MARKER, key_version] + bincode(record)`.
-fn encode(record: &SecretRecord, key_version: u8) -> Result<Vec<u8>> {
-    let payload = bincode::serde::encode_to_vec(record, bincode::config::standard())
-        .context("bincode encode")?;
-    let mut out = Vec::with_capacity(2 + payload.len());
-    out.push(RECORD_V2_MARKER);
-    out.push(key_version);
-    out.extend_from_slice(&payload);
-    Ok(out)
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Extract the prefix from a hash string.
+/// A prefix is everything before the last `_` (if present).
+/// `"db1_abc123"` → `"db1_"`, `"abc123"` → `"(unprefixed)"`.
+fn extract_prefix(hash: &str) -> String {
+    match hash.rfind('_') {
+        Some(pos) => hash[..=pos].to_string(),
+        None => "(unprefixed)".to_string(),
+    }
 }
 
-/// Decode bytes into `(SecretRecord, key_version)`.
-/// Handles both v2 format (prefixed) and legacy v1 format (raw bincode).
-fn decode(bytes: &[u8]) -> Result<(SecretRecord, u8)> {
-    if bytes.is_empty() {
-        anyhow::bail!("empty record");
-    }
-    if bytes[0] == RECORD_V2_MARKER {
-        // v2 format: [0x01, key_version, bincode...]
-        if bytes.len() < 3 {
-            anyhow::bail!("truncated v2 record");
-        }
-        let key_version = bytes[1];
-        let (record, _) =
-            bincode::serde::decode_from_slice(&bytes[2..], bincode::config::standard())
-                .context("bincode decode v2")?;
-        Ok((record, key_version))
-    } else {
-        // Legacy v1: raw bincode, no version prefix. Assume key_version = 1.
-        let (record, _) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-            .context("bincode decode")?;
-        Ok((record, 1))
-    }
-}
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::audit::ACTION_SECRET_CREATE;
+    use crate::store::crypto::generate_key;
     use tempfile::tempdir;
 
-    fn make_store() -> (Store, tempfile::TempDir) {
-        let key = super::super::crypto::generate_key();
+    fn open_temp_store() -> (Store, tempfile::TempDir) {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-        let store = Store::open(&path, key).unwrap();
+        let store = Store::open(dir.path().join("test.db")).unwrap();
         (store, dir)
     }
 
+    fn make_secret(hash: &str, key: &EncryptionKey) -> SecretRecord {
+        let value = b"hello world";
+        let (ct, nonce) = crate::store::crypto::encrypt(key, value).unwrap();
+        SecretRecord {
+            hash: hash.to_string(),
+            value_ciphertext: ct,
+            nonce,
+            created_at: 1_000_000,
+            ttl_expires_at: None,
+            reads_remaining: None,
+            burned: false,
+            burned_at: None,
+            owner_key_id: None,
+            created_by_ip: None,
+        }
+    }
+
+    // ── Sub-task 5: Store::open ───────────────────────────────────────────────
+
     #[test]
-    fn put_get_delete() {
-        let (s, _dir) = make_store();
-        s.put("MY_KEY", "my-value", None, None, true, None).unwrap();
-        assert_eq!(
-            s.get("MY_KEY").unwrap(),
-            GetResult::Value("my-value".into(), None)
-        );
-        assert!(s.delete("MY_KEY").unwrap());
-        assert_eq!(s.get("MY_KEY").unwrap(), GetResult::NotFound);
+    fn open_creates_store() {
+        let (_store, _dir) = open_temp_store();
+        // If we get here without panicking, the store opened successfully.
+    }
+
+    // ── Sub-task 6 + 7: create_secret / get_secret ───────────────────────────
+
+    #[test]
+    fn create_and_get_secret() {
+        let (store, _dir) = open_temp_store();
+        let key = generate_key();
+        let record = make_secret("abc123", &key);
+
+        store.create_secret(&record).unwrap();
+        let got = store.get_secret("abc123").unwrap().unwrap();
+        assert_eq!(got.hash, "abc123");
+        assert_eq!(got.value_ciphertext, record.value_ciphertext);
     }
 
     #[test]
-    fn read_limit_burn() {
-        let (s, _dir) = make_store();
-        s.put("BURN", "secret", None, Some(1), true, None).unwrap();
-        assert_eq!(
-            s.get("BURN").unwrap(),
-            GetResult::Burned("secret".into(), None)
-        );
-        // Second read should return NotFound — record was burned.
-        assert_eq!(s.get("BURN").unwrap(), GetResult::NotFound);
+    fn get_secret_not_found_returns_none() {
+        let (store, _dir) = open_temp_store();
+        let result = store.get_secret("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    // ── Sub-task 8: consume_read ──────────────────────────────────────────────
+
+    #[test]
+    fn consume_read_returns_plaintext() {
+        let (store, _dir) = open_temp_store();
+        let key = generate_key();
+        let record = make_secret("hash1", &key);
+        store.create_secret(&record).unwrap();
+
+        let (pt, burned) = store.consume_read("hash1", 999_999, &key).unwrap();
+        assert_eq!(pt, b"hello world");
+        assert!(!burned, "unlimited reads should not burn");
     }
 
     #[test]
-    fn ttl_expiry() {
-        let (s, _dir) = make_store();
-        // TTL = 0 means already expired.
-        s.put("EXPIRED", "value", Some(0), None, true, None)
+    fn consume_read_burns_on_last_read() {
+        let (store, _dir) = open_temp_store();
+        let key = generate_key();
+        let value = b"one-shot";
+        let (ct, nonce) = crate::store::crypto::encrypt(&key, value).unwrap();
+        let record = SecretRecord {
+            hash: "oneshot".to_string(),
+            value_ciphertext: ct,
+            nonce,
+            created_at: 1_000_000,
+            ttl_expires_at: None,
+            reads_remaining: Some(1),
+            burned: false,
+            burned_at: None,
+            owner_key_id: None,
+            created_by_ip: None,
+        };
+        store.create_secret(&record).unwrap();
+
+        let (pt, burned) = store.consume_read("oneshot", 999_999, &key).unwrap();
+        assert_eq!(pt, b"one-shot");
+        assert!(burned, "reads_remaining=1 should burn on read");
+
+        // Subsequent read must fail.
+        let err = store.consume_read("oneshot", 999_999, &key).unwrap_err();
+        assert!(matches!(err, StoreError::Burned));
+    }
+
+    #[test]
+    fn consume_read_expired_returns_error() {
+        let (store, _dir) = open_temp_store();
+        let key = generate_key();
+        let mut record = make_secret("expired_secret", &key);
+        record.ttl_expires_at = Some(1_000_000); // expires at t=1M
+
+        store.create_secret(&record).unwrap();
+
+        // now = 2M, past TTL.
+        let err = store
+            .consume_read("expired_secret", 2_000_000, &key)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Expired));
+    }
+
+    #[test]
+    fn consume_read_not_found_returns_error() {
+        let (store, _dir) = open_temp_store();
+        let key = generate_key();
+        let err = store.consume_read("nope", 1_000_000, &key).unwrap_err();
+        assert!(matches!(err, StoreError::NotFound));
+    }
+
+    // ── Sub-task 9: patch_secret ──────────────────────────────────────────────
+
+    #[test]
+    fn patch_secret_frozen_keeps_ttl_and_reads() {
+        let (store, _dir) = open_temp_store();
+        let key = generate_key();
+        let (ct, nonce) = crate::store::crypto::encrypt(&key, b"original").unwrap();
+        let record = SecretRecord {
+            hash: "patch_me".to_string(),
+            value_ciphertext: ct,
+            nonce,
+            created_at: 1_000_000,
+            ttl_expires_at: Some(9_999_999),
+            reads_remaining: Some(5),
+            burned: false,
+            burned_at: None,
+            owner_key_id: Some("key-001".to_string()),
+            created_by_ip: None,
+        };
+        store.create_secret(&record).unwrap();
+
+        // Patch with no reset.
+        let updated = store
+            .patch_secret("patch_me", b"updated value", "key-001", None, None, &key)
             .unwrap();
-        assert_eq!(s.get("EXPIRED").unwrap(), GetResult::NotFound);
+
+        assert_eq!(
+            updated.ttl_expires_at,
+            Some(9_999_999),
+            "TTL should be frozen"
+        );
+        assert_eq!(updated.reads_remaining, Some(5), "reads should be frozen");
+
+        // Verify decryption works.
+        let (pt, _) = store.consume_read("patch_me", 500_000, &key).unwrap();
+        assert_eq!(pt, b"updated value");
     }
 
     #[test]
-    fn list_excludes_expired() {
-        let (s, _dir) = make_store();
-        s.put("LIVE", "v", Some(3600), None, true, None).unwrap();
-        s.put("DEAD", "v", Some(0), None, true, None).unwrap();
-        let metas = s.list().unwrap();
-        assert!(metas.iter().any(|m| m.key == "LIVE"));
-        assert!(!metas.iter().any(|m| m.key == "DEAD"));
+    fn patch_secret_reset_ttl_and_reads() {
+        let (store, _dir) = open_temp_store();
+        let key = generate_key();
+        let (ct, nonce) = crate::store::crypto::encrypt(&key, b"original").unwrap();
+        let record = SecretRecord {
+            hash: "patch_reset".to_string(),
+            value_ciphertext: ct,
+            nonce,
+            created_at: 1_000_000,
+            ttl_expires_at: Some(2_000_000),
+            reads_remaining: Some(2),
+            burned: false,
+            burned_at: None,
+            owner_key_id: Some("key-002".to_string()),
+            created_by_ip: None,
+        };
+        store.create_secret(&record).unwrap();
+
+        let updated = store
+            .patch_secret(
+                "patch_reset",
+                b"new value",
+                "key-002",
+                Some(5_000_000),
+                Some(10),
+                &key,
+            )
+            .unwrap();
+
+        assert_eq!(updated.ttl_expires_at, Some(5_000_000));
+        assert_eq!(updated.reads_remaining, Some(10));
     }
 
     #[test]
-    fn head_returns_meta_without_incrementing() {
-        let (s, _dir) = make_store();
-        s.put("H", "val", None, Some(5), true, None).unwrap();
-        let (meta, sealed) = s.head("H").unwrap().unwrap();
-        assert_eq!(meta.read_count, 0);
-        assert_eq!(meta.max_reads, Some(5));
-        assert!(!sealed);
-        let (meta2, _) = s.head("H").unwrap().unwrap();
-        assert_eq!(meta2.read_count, 0);
+    fn patch_secret_wrong_owner_returns_error() {
+        let (store, _dir) = open_temp_store();
+        let key = generate_key();
+        let (ct, nonce) = crate::store::crypto::encrypt(&key, b"val").unwrap();
+        let record = SecretRecord {
+            hash: "owned".to_string(),
+            value_ciphertext: ct,
+            nonce,
+            created_at: 1_000_000,
+            ttl_expires_at: None,
+            reads_remaining: None,
+            burned: false,
+            burned_at: None,
+            owner_key_id: Some("alice".to_string()),
+            created_by_ip: None,
+        };
+        store.create_secret(&record).unwrap();
+
+        let err = store
+            .patch_secret("owned", b"hax", "bob", None, None, &key)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::WrongOwner));
+    }
+
+    // ── Sub-task 10: burn_secret ──────────────────────────────────────────────
+
+    #[test]
+    fn burn_secret_tombstones_record() {
+        let (store, _dir) = open_temp_store();
+        let key = generate_key();
+        let record = make_secret("burn_me", &key);
+        store.create_secret(&record).unwrap();
+
+        store.burn_secret("burn_me", None, 1_000_001).unwrap();
+
+        // Tombstone should still exist with burned_at set.
+        let got = store.get_secret("burn_me").unwrap().unwrap();
+        assert!(got.is_burned());
+        assert!(got.value_ciphertext.is_empty());
+        assert_eq!(got.nonce, [0u8; 12]);
+        assert_eq!(got.burned_at, Some(1_000_001));
     }
 
     #[test]
-    fn head_returns_none_for_expired() {
-        let (s, _dir) = make_store();
-        s.put("HE", "val", Some(0), None, true, None).unwrap();
-        assert!(s.head("HE").unwrap().is_none());
+    fn burn_secret_subsequent_consume_returns_burned() {
+        let (store, _dir) = open_temp_store();
+        let key = generate_key();
+        let record = make_secret("burn_then_read", &key);
+        store.create_secret(&record).unwrap();
+        store
+            .burn_secret("burn_then_read", None, 1_000_001)
+            .unwrap();
+
+        let err = store
+            .consume_read("burn_then_read", 1_000_000, &key)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Burned));
     }
 
-    #[test]
-    fn head_returns_sealed_status() {
-        let (s, _dir) = make_store();
-        s.put("HS", "val", None, Some(1), false, None).unwrap();
-        s.get("HS").unwrap(); // read once, hits limit
-        let (meta, sealed) = s.head("HS").unwrap().unwrap();
-        assert!(sealed);
-        assert_eq!(meta.read_count, 1);
-    }
+    // ── Sub-task 11: create_key ───────────────────────────────────────────────
 
     #[test]
-    fn patch_updates_value_and_resets_count() {
-        let (s, _dir) = make_store();
-        s.put("P", "old", None, Some(5), false, None).unwrap();
-        s.get("P").unwrap(); // read_count = 1
-        let meta = s.patch("P", Some("new"), None, None).unwrap().unwrap();
-        assert_eq!(meta.read_count, 0); // reset
-        assert_eq!(s.get("P").unwrap(), GetResult::Value("new".into(), None));
+    fn create_key_and_lookup_by_name_and_token() {
+        let (store, _dir) = open_temp_store();
+
+        let (record, token) = store.create_key("alice", None, None, None).unwrap();
+        assert_eq!(record.name, "alice");
+
+        // Lookup by token.
+        let found = store.find_key_by_token(&token).unwrap().unwrap();
+        assert_eq!(found.id, record.id);
+
+        // Lookup by name indirectly through list.
+        let keys = store.list_keys().unwrap();
+        assert!(keys.iter().any(|k| k.name == "alice"));
     }
 
-    #[test]
-    fn patch_rejects_delete_true_secret() {
-        let (s, _dir) = make_store();
-        s.put("PD", "val", None, None, true, None).unwrap();
-        let err = s.patch("PD", Some("new"), None, None);
-        assert!(err.is_err()); // should error for delete=true
-    }
+    // ── Sub-task 12: find_key_by_token ───────────────────────────────────────
 
     #[test]
-    fn patch_rejects_sealed_secret() {
-        let (s, _dir) = make_store();
-        s.put("PS", "val", None, Some(1), false, None).unwrap();
-        s.get("PS").unwrap(); // exhaust the one allowed read — now sealed
-        assert_eq!(s.get("PS").unwrap(), GetResult::Sealed);
-        // Patching a sealed secret must fail — read limit is a security boundary.
-        let err = s.patch("PS", None, Some(5), None);
-        assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("sealed"));
-    }
+    fn wrong_token_returns_none() {
+        let (store, _dir) = open_temp_store();
+        store.create_key("alice", None, None, None).unwrap();
 
-    #[test]
-    fn patch_works_on_unexhausted_secret() {
-        let (s, _dir) = make_store();
-        s.put("PU", "val", None, Some(3), false, None).unwrap();
-        s.get("PU").unwrap(); // one of three reads used — not sealed
-        s.patch("PU", Some("new"), None, None).unwrap();
-        assert_eq!(s.get("PU").unwrap(), GetResult::Value("new".into(), None));
-    }
-
-    #[test]
-    fn patch_not_found() {
-        let (s, _dir) = make_store();
-        let result = s.patch("NOPE", Some("val"), None, None).unwrap();
+        // A valid-length hex token but not matching any key.
+        let fake = hex::encode([42u8; 32]);
+        let result = store.find_key_by_token(&fake).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
-    fn get_sealed_returns_sealed_variant() {
-        let (s, _dir) = make_store();
-        s.put("GS", "val", None, Some(1), false, None).unwrap();
-        assert!(matches!(s.get("GS").unwrap(), GetResult::Value(..)));
-        assert!(matches!(s.get("GS").unwrap(), GetResult::Sealed));
+    fn malformed_token_returns_none() {
+        let (store, _dir) = open_temp_store();
+        let result = store.find_key_by_token("not-valid-hex").unwrap();
+        assert!(result.is_none());
     }
 
-    // ── Audit tests ──────────────────────────────────────────────────────
+    // ── Sub-task 13: list_keys ────────────────────────────────────────────────
 
     #[test]
-    fn record_and_list_audit() {
-        let (s, _dir) = make_store();
+    fn list_keys_returns_all() {
+        let (store, _dir) = open_temp_store();
+        store.create_key("alice", None, None, None).unwrap();
+        store.create_key("bob", None, None, None).unwrap();
+        store.create_key("carol", None, None, None).unwrap();
 
-        s.record_audit(AuditEvent::new(
-            "secret.create",
-            Some("KEY1".into()),
-            "127.0.0.1".into(),
-            true,
-            None,
-            None,
-            None,
-        ))
-        .unwrap();
-        s.record_audit(AuditEvent::new(
-            "secret.read",
-            Some("KEY1".into()),
-            "10.0.0.1".into(),
-            true,
-            None,
-            None,
-            None,
-        ))
-        .unwrap();
+        let keys = store.list_keys().unwrap();
+        assert_eq!(keys.len(), 3);
+    }
 
-        let query = AuditQuery {
-            since: None,
-            until: None,
-            action: None,
-            key: None,
-            limit: 100,
-            org_id: None,
-        };
-        let events = s.list_audit(&query).unwrap();
-        assert_eq!(events.len(), 2);
-        // Most recent first.
-        assert_eq!(events[0].action, "secret.read");
-        assert_eq!(events[0].id, 2);
-        assert_eq!(events[1].action, "secret.create");
-        assert_eq!(events[1].id, 1);
+    // ── Sub-task 14: delete_key ───────────────────────────────────────────────
+
+    #[test]
+    fn delete_key_removes_from_all_tables() {
+        let (store, _dir) = open_temp_store();
+        let (_, token) = store.create_key("alice", None, None, None).unwrap();
+
+        store.delete_key("alice").unwrap();
+
+        // By name: list should be empty.
+        let keys = store.list_keys().unwrap();
+        assert!(keys.is_empty());
+
+        // By token: should be None.
+        let result = store.find_key_by_token(&token).unwrap();
+        assert!(result.is_none());
     }
 
     #[test]
-    fn audit_query_filters() {
-        let (s, _dir) = make_store();
+    fn delete_key_not_found_returns_error() {
+        let (store, _dir) = open_temp_store();
+        let err = store.delete_key("nobody").unwrap_err();
+        assert!(matches!(err, StoreError::KeyNotFound));
+    }
 
-        // Insert 5 events.
-        for i in 0..5 {
-            let action = if i % 2 == 0 {
-                "secret.create"
-            } else {
-                "secret.read"
+    // ── Sub-task 15: secrets_owned_by ────────────────────────────────────────
+
+    #[test]
+    fn secrets_owned_by_count_and_histogram() {
+        let (store, _dir) = open_temp_store();
+        let key = generate_key();
+
+        // 3 secrets for key A with prefix "db1_".
+        for i in 0..3 {
+            let (ct, nonce) = crate::store::crypto::encrypt(&key, b"val").unwrap();
+            let record = SecretRecord {
+                hash: format!("db1_{:032x}", i),
+                value_ciphertext: ct,
+                nonce,
+                created_at: 1_000_000,
+                ttl_expires_at: None,
+                reads_remaining: None,
+                burned: false,
+                burned_at: None,
+                owner_key_id: Some("key-A".to_string()),
+                created_by_ip: None,
             };
-            s.record_audit(AuditEvent::new(
-                action,
-                Some(format!("K{i}")),
-                "127.0.0.1".into(),
+            store.create_secret(&record).unwrap();
+        }
+
+        // 2 secrets for key A unprefixed.
+        for i in 3..5 {
+            let (ct, nonce) = crate::store::crypto::encrypt(&key, b"val").unwrap();
+            let record = SecretRecord {
+                hash: format!("nopfx{:032x}", i),
+                value_ciphertext: ct,
+                nonce,
+                created_at: 1_000_000,
+                ttl_expires_at: None,
+                reads_remaining: None,
+                burned: false,
+                burned_at: None,
+                owner_key_id: Some("key-A".to_string()),
+                created_by_ip: None,
+            };
+            store.create_secret(&record).unwrap();
+        }
+
+        // 2 secrets for key B.
+        for i in 0..2 {
+            let (ct, nonce) = crate::store::crypto::encrypt(&key, b"val").unwrap();
+            let record = SecretRecord {
+                hash: format!("prod_{:032x}", i),
+                value_ciphertext: ct,
+                nonce,
+                created_at: 1_000_000,
+                ttl_expires_at: None,
+                reads_remaining: None,
+                burned: false,
+                burned_at: None,
+                owner_key_id: Some("key-B".to_string()),
+                created_by_ip: None,
+            };
+            store.create_secret(&record).unwrap();
+        }
+
+        let (count, hist) = store.secrets_owned_by("key-A").unwrap();
+        assert_eq!(count, 5);
+        assert_eq!(hist.get("db1_").copied().unwrap_or(0), 3);
+        assert_eq!(hist.get("(unprefixed)").copied().unwrap_or(0), 2);
+
+        let (count_b, _) = store.secrets_owned_by("key-B").unwrap();
+        assert_eq!(count_b, 2);
+    }
+
+    // ── Sub-task 16: purge_secrets_for_key ───────────────────────────────────
+
+    #[test]
+    fn purge_secrets_for_key_burns_all() {
+        let (store, _dir) = open_temp_store();
+        let key = generate_key();
+
+        for i in 0..5 {
+            let (ct, nonce) = crate::store::crypto::encrypt(&key, b"val").unwrap();
+            let record = SecretRecord {
+                hash: format!("purge_{i}"),
+                value_ciphertext: ct,
+                nonce,
+                created_at: 1_000_000,
+                ttl_expires_at: None,
+                reads_remaining: None,
+                burned: false,
+                burned_at: None,
+                owner_key_id: Some("victim-key".to_string()),
+                created_by_ip: None,
+            };
+            store.create_secret(&record).unwrap();
+        }
+
+        let burned = store.purge_secrets_for_key("victim-key").unwrap();
+        assert_eq!(burned, 5);
+
+        // All 5 should be tombstones.
+        for i in 0..5 {
+            let r = store.get_secret(&format!("purge_{i}")).unwrap().unwrap();
+            assert!(r.is_burned());
+        }
+    }
+
+    // ── Sub-task 18: record_audit / query_audit ───────────────────────────────
+
+    #[test]
+    fn audit_insert_and_query_newest_first() {
+        let (store, _dir) = open_temp_store();
+
+        for i in 0..3 {
+            let mut ev = AuditEvent::new(
+                ACTION_SECRET_CREATE,
+                None,
+                Some(format!("hash_{i}")),
+                "127.0.0.1".to_string(),
                 true,
                 None,
+            );
+            ev.timestamp = 1_000_000 + i as i64;
+            store.record_audit(ev).unwrap();
+        }
+
+        let query = AuditQuery {
+            limit: 2,
+            ..Default::default()
+        };
+        let results = store.query_audit(&query).unwrap();
+        assert_eq!(results.len(), 2);
+        // Newest first: id 3, then id 2.
+        assert_eq!(results[0].id, 3);
+        assert_eq!(results[1].id, 2);
+    }
+
+    #[test]
+    fn audit_query_filter_by_action() {
+        let (store, _dir) = open_temp_store();
+
+        store
+            .record_audit(AuditEvent::new(
+                ACTION_SECRET_CREATE,
                 None,
+                None,
+                "1.1.1.1".to_string(),
+                true,
                 None,
             ))
             .unwrap();
-        }
-
-        // Filter by action.
-        let events = s
-            .list_audit(&AuditQuery {
-                since: None,
-                until: None,
-                action: Some("secret.create".into()),
-                key: None,
-                limit: 100,
-                org_id: None,
-            })
+        store
+            .record_audit(AuditEvent::new(
+                crate::store::audit::ACTION_SECRET_READ,
+                None,
+                None,
+                "1.1.1.1".to_string(),
+                true,
+                None,
+            ))
             .unwrap();
-        assert_eq!(events.len(), 3); // indices 0, 2, 4
 
-        // Limit.
-        let events = s
-            .list_audit(&AuditQuery {
-                since: None,
-                until: None,
-                action: None,
-                key: None,
-                limit: 2,
-                org_id: None,
-            })
-            .unwrap();
-        assert_eq!(events.len(), 2);
+        let query = AuditQuery {
+            action: Some(ACTION_SECRET_CREATE.to_string()),
+            limit: 10,
+            ..Default::default()
+        };
+        let results = store.query_audit(&query).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].action, ACTION_SECRET_CREATE);
     }
 
-    #[test]
-    fn audit_prune_removes_old_entries() {
-        let (s, _dir) = make_store();
+    // ── Sub-tasks 19/20: unified prune ───────────────────────────────────────
 
-        // Insert an event with a manually backdated timestamp.
-        let mut old_event = AuditEvent::new(
-            "secret.create",
-            Some("OLD".into()),
-            "127.0.0.1".into(),
+    #[test]
+    fn prune_removes_old_burned_secrets_and_their_audit_events() {
+        let (store, _dir) = open_temp_store();
+        let enc_key = generate_key();
+
+        // Create a secret burned at t=0 (epoch — well past any retention window).
+        let record = SecretRecord {
+            hash: "old_burn".to_string(),
+            value_ciphertext: vec![],
+            nonce: [0u8; 12],
+            created_at: 0,
+            ttl_expires_at: None,
+            reads_remaining: None,
+            burned: true,
+            burned_at: Some(0), // burned at epoch
+            owner_key_id: None,
+            created_by_ip: None,
+        };
+        store.create_secret(&record).unwrap();
+
+        // Record an audit event for this hash.
+        let ev = AuditEvent::new(
+            ACTION_SECRET_CREATE,
+            None,
+            Some("old_burn".to_string()),
+            "1.1.1.1".to_string(),
             true,
-            None,
-            None,
             None,
         );
-        old_event.timestamp = 1000; // far in the past
+        store.record_audit(ev).unwrap();
 
-        s.record_audit(old_event).unwrap();
-        s.record_audit(AuditEvent::new(
-            "secret.read",
-            Some("NEW".into()),
-            "127.0.0.1".into(),
+        // now = 30 days + 1 second past epoch. Retention = 30 days.
+        // cutoff = now - 30*86400 = 1; burned_at=0 < 1, so it should be pruned.
+        let now = 30 * 86_400 + 1;
+        let pruned = store.prune(now, 30).unwrap();
+        assert_eq!(pruned, 1);
+
+        // Secret should be gone.
+        assert!(store.get_secret("old_burn").unwrap().is_none());
+
+        // Audit event should also be gone.
+        let query = AuditQuery {
+            hash: Some("old_burn".to_string()),
+            limit: 100,
+            ..Default::default()
+        };
+        assert!(store.query_audit(&query).unwrap().is_empty());
+
+        let _ = enc_key; // suppress unused warning
+    }
+
+    #[test]
+    fn prune_keeps_recent_burned_secrets() {
+        let (store, _dir) = open_temp_store();
+
+        // Burned secret but burned_at is recent.
+        let record = SecretRecord {
+            hash: "recent_burn".to_string(),
+            value_ciphertext: vec![],
+            nonce: [0u8; 12],
+            created_at: 1_000_000,
+            ttl_expires_at: None,
+            reads_remaining: None,
+            burned: true,
+            burned_at: Some(1_000_000), // burned recently
+            owner_key_id: None,
+            created_by_ip: None,
+        };
+        store.create_secret(&record).unwrap();
+
+        // now is only 1 day past burned_at; retention = 30 days.
+        let now = 1_000_000 + 86_400;
+        let pruned = store.prune(now, 30).unwrap();
+        assert_eq!(pruned, 0);
+
+        // Secret should still be there.
+        assert!(store.get_secret("recent_burn").unwrap().is_some());
+    }
+
+    #[test]
+    fn prune_does_not_touch_active_secrets() {
+        let (store, _dir) = open_temp_store();
+        let enc_key = generate_key();
+        let record = make_secret("active_secret", &enc_key);
+        store.create_secret(&record).unwrap();
+
+        // Even with a very old now, active secrets are never pruned.
+        let pruned = store.prune(999_999_999, 30).unwrap();
+        assert_eq!(pruned, 0);
+
+        assert!(store.get_secret("active_secret").unwrap().is_some());
+    }
+
+    #[test]
+    fn prune_audit_events_for_active_secrets_are_kept() {
+        let (store, _dir) = open_temp_store();
+        let enc_key = generate_key();
+        let record = make_secret("alive", &enc_key);
+        store.create_secret(&record).unwrap();
+
+        let ev = AuditEvent::new(
+            ACTION_SECRET_CREATE,
+            None,
+            Some("alive".to_string()),
+            "1.1.1.1".to_string(),
             true,
             None,
-            None,
-            None,
-        ))
-        .unwrap();
-
-        // Prune with a short retention (anything older than 1 day from now).
-        let removed = s.prune_audit(86400).unwrap();
-        assert_eq!(removed, 1);
-
-        let events = s
-            .list_audit(&AuditQuery {
-                since: None,
-                until: None,
-                action: None,
-                key: None,
-                limit: 100,
-                org_id: None,
-            })
-            .unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].action, "secret.read");
-    }
-
-    #[test]
-    fn new_tables_created_on_open() {
-        let (store, _dir) = make_store();
-        let read_txn = store.db.begin_read().unwrap();
-        read_txn.open_table(super::super::org::ORGS).unwrap();
-        read_txn.open_table(super::super::org::PRINCIPALS).unwrap();
-        read_txn
-            .open_table(super::super::org::PRINCIPAL_KEYS)
-            .unwrap();
-        read_txn
-            .open_table(super::super::org::PRINCIPAL_KEY_IX)
-            .unwrap();
-        read_txn.open_table(super::super::org::ROLES).unwrap();
-    }
-
-    // ── Org CRUD tests ──────────────────────────────────────────────────
-
-    #[test]
-    fn org_crud() {
-        use std::collections::HashMap;
-        let (s, _dir) = make_store();
-
-        let org = super::super::org::OrgRecord {
-            id: "org_1".into(),
-            name: "Acme".into(),
-            metadata: HashMap::from([("env".into(), "prod".into())]),
-            created_at: 1700000000,
-        };
-        s.put_org(&org).unwrap();
-
-        // get
-        let fetched = s.get_org("org_1").unwrap().unwrap();
-        assert_eq!(fetched.id, "org_1");
-        assert_eq!(fetched.name, "Acme");
-
-        // list
-        let orgs = s.list_orgs().unwrap();
-        assert_eq!(orgs.len(), 1);
-        assert_eq!(orgs[0].id, "org_1");
-
-        // delete
-        assert!(s.delete_org("org_1").unwrap());
-
-        // verify gone
-        assert!(s.get_org("org_1").unwrap().is_none());
-        assert!(s.list_orgs().unwrap().is_empty());
-
-        // delete non-existent returns false
-        assert!(!s.delete_org("org_1").unwrap());
-    }
-
-    #[test]
-    fn delete_org_blocked_by_principals() {
-        use std::collections::HashMap;
-        let (s, _dir) = make_store();
-
-        let org = super::super::org::OrgRecord {
-            id: "org_2".into(),
-            name: "Test".into(),
-            metadata: HashMap::new(),
-            created_at: 1700000000,
-        };
-        s.put_org(&org).unwrap();
-
-        let principal = super::super::org::PrincipalRecord {
-            id: "p_1".into(),
-            org_id: "org_2".into(),
-            name: "alice".into(),
-            role: "admin".into(),
-            metadata: HashMap::new(),
-            created_at: 1700000000,
-        };
-        s.put_principal(&principal).unwrap();
-
-        let err = s.delete_org("org_2");
-        assert!(err.is_err());
-        assert!(err
-            .unwrap_err()
-            .to_string()
-            .contains("still has principals"));
-    }
-
-    // ── Principal CRUD tests ────────────────────────────────────────────
-
-    #[test]
-    fn principal_crud() {
-        use std::collections::HashMap;
-        let (s, _dir) = make_store();
-
-        let p = super::super::org::PrincipalRecord {
-            id: "p_1".into(),
-            org_id: "org_1".into(),
-            name: "alice".into(),
-            role: "admin".into(),
-            metadata: HashMap::new(),
-            created_at: 1700000000,
-        };
-        s.put_principal(&p).unwrap();
-
-        // get
-        let fetched = s.get_principal("org_1", "p_1").unwrap().unwrap();
-        assert_eq!(fetched.id, "p_1");
-        assert_eq!(fetched.org_id, "org_1");
-        assert_eq!(fetched.name, "alice");
-
-        // list
-        let principals = s.list_principals("org_1").unwrap();
-        assert_eq!(principals.len(), 1);
-
-        // list for different org returns empty
-        assert!(s.list_principals("org_other").unwrap().is_empty());
-
-        // delete
-        assert!(s.delete_principal("org_1", "p_1").unwrap());
-
-        // verify gone
-        assert!(s.get_principal("org_1", "p_1").unwrap().is_none());
-    }
-
-    #[test]
-    fn delete_principal_blocked_by_active_keys() {
-        use std::collections::HashMap;
-        let (s, _dir) = make_store();
-
-        let p = super::super::org::PrincipalRecord {
-            id: "p_2".into(),
-            org_id: "org_1".into(),
-            name: "bob".into(),
-            role: "writer".into(),
-            metadata: HashMap::new(),
-            created_at: 1700000000,
-        };
-        s.put_principal(&p).unwrap();
-
-        // Create an unexpired key (valid_before far in the future)
-        let key = super::super::org::PrincipalKeyRecord {
-            id: "pk_1".into(),
-            principal_id: "p_2".into(),
-            org_id: "org_1".into(),
-            name: "default".into(),
-            key_hash: vec![0xAA; 32],
-            valid_after: 1700000000,
-            valid_before: 9999999999,
-            created_at: 1700000000,
-        };
-        // Manually insert the key into both tables so delete_principal can find it
-        {
-            let bytes = bincode::serde::encode_to_vec(&key, bincode::config::standard()).unwrap();
-            let ix_key = format!("{}:{}", key.principal_id, key.id);
-            let write_txn = s.db.begin_write().unwrap();
-            {
-                let mut keys_table = write_txn
-                    .open_table(super::super::org::PRINCIPAL_KEYS)
-                    .unwrap();
-                keys_table
-                    .insert(key.key_hash.as_slice(), bytes.as_slice())
-                    .unwrap();
-                let mut ix_table = write_txn
-                    .open_table(super::super::org::PRINCIPAL_KEY_IX)
-                    .unwrap();
-                ix_table
-                    .insert(ix_key.as_str(), key.key_hash.as_slice())
-                    .unwrap();
-            }
-            write_txn.commit().unwrap();
-        }
-
-        let err = s.delete_principal("org_1", "p_2");
-        assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("has active keys"));
-    }
-
-    // ── PrincipalKey CRUD tests ─────────────────────────────────────────
-
-    #[test]
-    fn principal_key_crud() {
-        let (s, _dir) = make_store();
-
-        let key_hash = vec![0xBB; 32];
-        let key = super::super::org::PrincipalKeyRecord {
-            id: "pk_1".into(),
-            principal_id: "p_1".into(),
-            org_id: "org_1".into(),
-            name: "my-key".into(),
-            key_hash: key_hash.clone(),
-            valid_after: 1700000000,
-            valid_before: 1800000000,
-            created_at: 1700000000,
-        };
-        s.put_principal_key(&key).unwrap();
-
-        // find by hash
-        let found = s.find_principal_key_by_hash(&key_hash).unwrap().unwrap();
-        assert_eq!(found.id, "pk_1");
-        assert_eq!(found.principal_id, "p_1");
-
-        // list
-        let keys = s.list_principal_keys("p_1").unwrap();
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0].id, "pk_1");
-
-        // list for different principal returns empty
-        assert!(s.list_principal_keys("p_other").unwrap().is_empty());
-
-        // delete
-        assert!(s.delete_principal_key("p_1", "pk_1").unwrap());
-
-        // verify gone from both tables
-        assert!(s.find_principal_key_by_hash(&key_hash).unwrap().is_none());
-        assert!(s.list_principal_keys("p_1").unwrap().is_empty());
-
-        // delete non-existent returns false
-        assert!(!s.delete_principal_key("p_1", "pk_1").unwrap());
-    }
-
-    // ── Role CRUD tests ─────────────────────────────────────────────────
-
-    #[test]
-    fn builtin_roles_seeded_on_open() {
-        let (store, _dir) = make_store();
-        let read_txn = store.db.begin_read().unwrap();
-        let table = read_txn.open_table(super::super::org::ROLES).unwrap();
-        for name in &["reader", "writer", "admin", "owner"] {
-            let key = format!("builtin:{name}");
-            assert!(
-                table.get(key.as_str()).unwrap().is_some(),
-                "builtin role {name} not found"
-            );
-        }
-    }
-
-    #[test]
-    fn custom_role_crud() {
-        let (s, _dir) = make_store();
-
-        let role = super::super::org::RoleRecord {
-            name: "deployer".into(),
-            org_id: Some("org_1".into()),
-            permissions: super::super::permissions::Permissions::parse("rlc").unwrap(),
-            built_in: false,
-            created_at: 1700000000,
-        };
-        s.put_role(&role).unwrap();
-
-        // get
-        let fetched = s.get_role(Some("org_1"), "deployer").unwrap().unwrap();
-        assert_eq!(fetched.name, "deployer");
-        assert!(!fetched.built_in);
-
-        // list should include built-ins + custom
-        let roles = s.list_roles(Some("org_1")).unwrap();
-        let names: Vec<&str> = roles.iter().map(|r| r.name.as_str()).collect();
-        assert!(names.contains(&"reader"));
-        assert!(names.contains(&"writer"));
-        assert!(names.contains(&"admin"));
-        assert!(names.contains(&"owner"));
-        assert!(names.contains(&"deployer"));
-
-        // list with None only returns built-ins
-        let builtin_only = s.list_roles(None).unwrap();
-        assert_eq!(builtin_only.len(), 4);
-        assert!(builtin_only.iter().all(|r| r.built_in));
-
-        // delete custom role
-        assert!(s.delete_role(Some("org_1"), "deployer").unwrap());
-        assert!(s.get_role(Some("org_1"), "deployer").unwrap().is_none());
-    }
-
-    #[test]
-    fn cannot_delete_builtin_role() {
-        let (s, _dir) = make_store();
-        let err = s.delete_role(None, "admin");
-        assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("built-in"));
-    }
-
-    // ── Org-scoped secret tests ────────────────────────────────────────
-
-    #[test]
-    fn org_scoped_secret_put_and_get() {
-        let (s, _dir) = make_store();
-
-        // Same key name in two different orgs
-        s.put_org_secret(
-            "org_a",
-            "DB_PASS",
-            "alpha-pass",
-            None,
-            None,
-            true,
-            None,
-            Some("p1"),
-            None,
-        )
-        .unwrap();
-        s.put_org_secret(
-            "org_b",
-            "DB_PASS",
-            "beta-pass",
-            None,
-            None,
-            true,
-            None,
-            Some("p2"),
-            None,
-        )
-        .unwrap();
-
-        // Each org gets its own value
-        assert_eq!(
-            s.get_org_secret("org_a", "DB_PASS").unwrap(),
-            GetResult::Value("alpha-pass".into(), None)
         );
-        assert_eq!(
-            s.get_org_secret("org_b", "DB_PASS").unwrap(),
-            GetResult::Value("beta-pass".into(), None)
-        );
+        store.record_audit(ev).unwrap();
 
-        // Public bucket doesn't see org-scoped secrets
-        assert_eq!(s.get("DB_PASS").unwrap(), GetResult::NotFound);
+        // Run prune with a very long now — active secrets not pruned.
+        let pruned = store.prune(999_999_999, 30).unwrap();
+        assert_eq!(pruned, 0);
 
-        // Delete from one org doesn't affect the other
-        assert!(s.delete_org_secret("org_a", "DB_PASS").unwrap());
-        assert_eq!(
-            s.get_org_secret("org_a", "DB_PASS").unwrap(),
-            GetResult::NotFound
-        );
-        assert_eq!(
-            s.get_org_secret("org_b", "DB_PASS").unwrap(),
-            GetResult::Value("beta-pass".into(), None)
-        );
-    }
-
-    #[test]
-    fn org_scoped_list_my_vs_org() {
-        let (s, _dir) = make_store();
-
-        s.put_org_secret(
-            "org_1",
-            "S1",
-            "v1",
-            None,
-            None,
-            true,
-            None,
-            Some("alice"),
-            None,
-        )
-        .unwrap();
-        s.put_org_secret(
-            "org_1",
-            "S2",
-            "v2",
-            None,
-            None,
-            true,
-            None,
-            Some("bob"),
-            None,
-        )
-        .unwrap();
-        s.put_org_secret(
-            "org_1",
-            "S3",
-            "v3",
-            None,
-            None,
-            true,
-            None,
-            Some("alice"),
-            None,
-        )
-        .unwrap();
-
-        // List all for org
-        let all = s.list_org_secrets("org_1", None).unwrap();
-        assert_eq!(all.len(), 3);
-
-        // List only alice's
-        let alice_secrets = s.list_org_secrets("org_1", Some("alice")).unwrap();
-        assert_eq!(alice_secrets.len(), 2);
-        assert!(alice_secrets
-            .iter()
-            .all(|m| m.owner_id.as_deref() == Some("alice")));
-
-        // List only bob's
-        let bob_secrets = s.list_org_secrets("org_1", Some("bob")).unwrap();
-        assert_eq!(bob_secrets.len(), 1);
-        assert_eq!(bob_secrets[0].key, "S2");
-    }
-
-    #[test]
-    fn key_binding_check() {
-        let (s, _dir) = make_store();
-
-        // Secret with allowed_keys restriction
-        s.put_org_secret(
-            "org_1",
-            "RESTRICTED",
-            "val",
-            None,
-            None,
-            true,
-            None,
-            Some("alice"),
-            Some(vec!["deploy-key".into(), "ci-key".into()]),
-        )
-        .unwrap();
-
-        // Secret with no restriction
-        s.put_org_secret(
-            "org_1",
-            "OPEN",
-            "val",
-            None,
-            None,
-            true,
-            None,
-            Some("alice"),
-            None,
-        )
-        .unwrap();
-
-        // Allowed key passes
-        assert!(s
-            .check_key_binding("org_1", "RESTRICTED", "deploy-key")
-            .unwrap());
-        assert!(s
-            .check_key_binding("org_1", "RESTRICTED", "ci-key")
-            .unwrap());
-
-        // Disallowed key fails
-        assert!(!s
-            .check_key_binding("org_1", "RESTRICTED", "random-key")
-            .unwrap());
-
-        // Open secret allows any key
-        assert!(s
-            .check_key_binding("org_1", "OPEN", "any-key-name")
-            .unwrap());
-
-        // Non-existent secret returns error
-        assert!(s.check_key_binding("org_1", "NOPE", "key").is_err());
-    }
-
-    #[test]
-    fn org_scoped_head_and_patch() {
-        let (s, _dir) = make_store();
-
-        s.put_org_secret(
-            "org_1",
-            "PATCHME",
-            "old",
-            None,
-            Some(5),
-            false,
-            None,
-            Some("alice"),
-            None,
-        )
-        .unwrap();
-
-        // head
-        let (meta, sealed) = s.head_org_secret("org_1", "PATCHME").unwrap().unwrap();
-        assert_eq!(meta.key, "PATCHME");
-        assert_eq!(meta.read_count, 0);
-        assert!(!sealed);
-
-        // read once
-        s.get_org_secret("org_1", "PATCHME").unwrap();
-
-        // patch
-        let meta = s
-            .patch_org_secret("org_1", "PATCHME", Some("new"), None, None)
-            .unwrap()
-            .unwrap();
-        assert_eq!(meta.read_count, 0);
-
-        // verify new value
-        assert_eq!(
-            s.get_org_secret("org_1", "PATCHME").unwrap(),
-            GetResult::Value("new".into(), None)
-        );
-    }
-
-    #[test]
-    fn cannot_delete_role_in_use() {
-        use std::collections::HashMap;
-        let (s, _dir) = make_store();
-
-        // Create custom role
-        let role = super::super::org::RoleRecord {
-            name: "tester".into(),
-            org_id: Some("org_1".into()),
-            permissions: super::super::permissions::Permissions::parse("rl").unwrap(),
-            built_in: false,
-            created_at: 1700000000,
+        let query = AuditQuery {
+            hash: Some("alive".to_string()),
+            limit: 100,
+            ..Default::default()
         };
-        s.put_role(&role).unwrap();
+        assert_eq!(store.query_audit(&query).unwrap().len(), 1);
+    }
 
-        // Create a principal that uses this role
-        let p = super::super::org::PrincipalRecord {
-            id: "p_1".into(),
-            org_id: "org_1".into(),
-            name: "carol".into(),
-            role: "tester".into(),
-            metadata: HashMap::new(),
-            created_at: 1700000000,
-        };
-        s.put_principal(&p).unwrap();
+    // ── extract_prefix helper ─────────────────────────────────────────────────
 
-        let err = s.delete_role(Some("org_1"), "tester");
-        assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("in use"));
+    #[test]
+    fn extract_prefix_with_underscore() {
+        assert_eq!(extract_prefix("db1_abc"), "db1_");
+        assert_eq!(extract_prefix("prod_secret_abc"), "prod_secret_");
+    }
+
+    #[test]
+    fn extract_prefix_without_underscore() {
+        assert_eq!(extract_prefix("abcdef1234"), "(unprefixed)");
     }
 }

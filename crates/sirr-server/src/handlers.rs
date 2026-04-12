@@ -1,785 +1,738 @@
-use std::net::SocketAddr;
+//! HTTP handlers for the Sirr secret API.
+//!
+//! Five endpoints over one resource:
+//!   POST   /secret              — create
+//!   GET    /secret/{hash}       — read value (consumes a read)
+//!   HEAD   /secret/{hash}       — metadata only (does NOT consume a read)
+//!   GET    /secret/{hash}/audit — audit trail (owner only)
+//!   PATCH  /secret/{hash}       — update value (owner only)
+//!   DELETE /secret/{hash}       — burn
+
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::{ConnectInfo, Path, Query, State},
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Redirect, Response},
-    Extension, Json,
+    extract::{Path, State},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
 };
+use rand::rngs::OsRng;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::info;
 
-use crate::{
-    auth::ResolvedAuth,
-    store::{
-        audit::{
-            AuditEvent, ACTION_SECRET_BURNED, ACTION_SECRET_CREATE, ACTION_SECRET_DELETE,
-            ACTION_SECRET_LIST, ACTION_SECRET_PATCH, ACTION_SECRET_PRUNE, ACTION_SECRET_READ,
-            ACTION_WEBHOOK_CREATE, ACTION_WEBHOOK_DELETE,
-        },
-        AuditQuery, GetResult,
-    },
-    webhooks::{self, MAX_WEBHOOKS},
-    AppState,
+use crate::authz::{authorize, Action, AuthDecision, Caller};
+use crate::store::audit::{
+    AuditEvent, AuditQuery, ACTION_SECRET_BURN, ACTION_SECRET_CREATE, ACTION_SECRET_PATCH,
+    ACTION_SECRET_READ,
 };
+use crate::store::crypto::EncryptionKey;
+use crate::store::{SecretRecord, Store, Visibility};
+use crate::webhooks::{WebhookEvent, WebhookSender};
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// ── AppState ──────────────────────────────────────────────────────────────────
 
-/// Maximum allowed TTL: 10 years in seconds.
-/// Prevents u64 → i64 overflow in the expiry timestamp calculation.
-const MAX_TTL_SECS: u64 = 315_360_000;
+#[derive(Clone)]
+pub struct AppState {
+    pub store: Arc<Store>,
+    pub encryption_key: Arc<EncryptionKey>,
+    pub visibility: Arc<tokio::sync::RwLock<Visibility>>,
+    pub webhook_sender: WebhookSender,
+}
 
-// ── Input validation ─────────────────────────────────────────────────────────
+// ── Router ────────────────────────────────────────────────────────────────────
 
-/// Validates a secret key name.
+pub fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/secret", post(create_secret))
+        .route(
+            "/secret/{hash}",
+            get(read_secret)
+                .head(inspect_secret)
+                .patch(patch_secret)
+                .delete(burn_secret),
+        )
+        .route("/secret/{hash}/audit", get(audit_secret))
+        .with_state(state)
+}
+
+// ── Time helper ───────────────────────────────────────────────────────────────
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+// ── Bearer token extraction ───────────────────────────────────────────────────
+
+/// Extract a `Caller` from the HTTP request headers.
 ///
-/// Allowed: ASCII alphanumerics, `-`, `_`, `.`, 1–256 characters.
-/// Rejects slashes, control characters, and other special characters to keep
-/// audit logs clean and prevent confusion in URL routing or future tooling.
-fn validate_key_name(key: &str) -> bool {
-    !key.is_empty()
-        && key.len() <= 256
-        && key
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
-}
-
-fn bad_key_name() -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({"error": "key must be 1–256 characters: alphanumeric, -, _, . only"})),
-    )
-        .into_response()
-}
-
-// ── IP extraction ────────────────────────────────────────────────────────────
-
-/// Returns the best-effort client IP for audit logging.
-///
-/// Proxy headers (`X-Forwarded-For`, `X-Real-IP`) are only trusted when the
-/// socket peer matches one of the configured trusted-proxy CIDRs.  An empty
-/// `trusted_proxies` slice means proxy headers are never trusted, so any
-/// client-supplied value is ignored and the real socket IP is used instead.
-fn extract_ip(headers: &HeaderMap, addr: &SocketAddr, trusted_proxies: &[ipnet::IpNet]) -> String {
-    let peer = addr.ip();
-    if !trusted_proxies.is_empty() && trusted_proxies.iter().any(|net| net.contains(&peer)) {
-        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            if let Some(first) = xff.split(',').next() {
-                let trimmed = first.trim();
-                if !trimmed.is_empty() {
-                    return trimmed.to_owned();
-                }
-            }
-        }
-        if let Some(real_ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-            let trimmed = real_ip.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_owned();
-            }
-        }
-    }
-    peer.to_string()
-}
-
-// ── Health ────────────────────────────────────────────────────────────────────
-
-pub async fn health() -> impl IntoResponse {
-    Json(json!({"status": "ok"}))
-}
-
-/// Build version: CI sets SIRR_BUILD_VERSION at compile time; local builds use Cargo.toml version.
-const BUILD_VERSION: &str = match option_env!("SIRR_BUILD_VERSION") {
-    Some(v) => v,
-    None => env!("CARGO_PKG_VERSION"),
-};
-
-pub async fn version() -> impl IntoResponse {
-    Json(json!({"name": "sirrd", "version": BUILD_VERSION}))
-}
-
-pub async fn redirect_to_secret(Path(key): Path<String>) -> Redirect {
-    Redirect::temporary(&format!("/secrets/{key}"))
-}
-
-// ── Audit query ──────────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-pub struct AuditQueryParams {
-    pub since: Option<i64>,
-    pub until: Option<i64>,
-    pub action: Option<String>,
-    pub key: Option<String>,
-    pub limit: Option<usize>,
-}
-
-pub async fn audit_events(
-    State(state): State<AppState>,
-    Extension(_auth): Extension<ResolvedAuth>,
-    Query(params): Query<AuditQueryParams>,
-) -> Response {
-    // Auth is handled by require_master_key middleware.
-    let limit = params.limit.unwrap_or(100).min(1000);
-    let query = AuditQuery {
-        since: params.since,
-        until: params.until,
-        action: params.action,
-        key: params.key,
-        limit,
-        org_id: None,
+/// Looks for `Authorization: Bearer <token>`. Any other scheme or a
+/// malformed header silently falls back to `Caller::Anonymous` (not 400).
+fn extract_caller(headers: &HeaderMap, store: &Store) -> Caller {
+    let token = match extract_bearer_token(headers) {
+        Some(t) => t,
+        None => return Caller::Anonymous,
     };
-    match state.store.list_audit(&query) {
-        Ok(events) => {
-            if state.redact_audit_keys {
-                use sha2::{Digest, Sha256};
-                let redacted: Vec<_> = events
-                    .into_iter()
-                    .map(|mut e| {
-                        if let Some(ref k) = e.key {
-                            let hash = Sha256::digest(k.as_bytes());
-                            e.key = Some(format!("sha256:{}", &hex::encode(hash)[..8]));
-                        }
-                        e
-                    })
-                    .collect();
-                Json(json!({ "events": redacted })).into_response()
+
+    match store.find_key_by_token(&token) {
+        Ok(Some(key)) => {
+            // Only honour the key if it is within its validity window.
+            if key.is_active(now_secs()) {
+                Caller::Keyed(key)
             } else {
-                Json(json!({ "events": events })).into_response()
+                Caller::Anonymous
             }
         }
-        Err(e) => internal_error(e),
+        _ => Caller::Anonymous,
     }
 }
 
-// ── List ──────────────────────────────────────────────────────────────────────
+/// Pull the bearer token string out of the Authorization header, if present
+/// and correctly formed. Returns `None` for any other scheme or malformed input.
+fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(axum::http::header::AUTHORIZATION)?;
+    let s = value.to_str().ok()?;
+    let token = s.strip_prefix("Bearer ")?;
+    if token.is_empty() {
+        return None;
+    }
+    Some(token.to_string())
+}
 
-pub async fn list_secrets(
-    State(state): State<AppState>,
-    Extension(_auth): Extension<ResolvedAuth>,
-    headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-) -> Response {
-    // Auth is handled by require_master_key middleware.
-    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
-    match state.store.list() {
-        Ok(metas) => {
-            info!(count = metas.len(), "audit: secret.list");
-            let _ = state.store.record_audit(AuditEvent::new(
-                ACTION_SECRET_LIST,
-                None,
-                ip,
-                true,
-                Some(format!("count={}", metas.len())),
-                None,
-                None,
-            ));
-            Json(json!({ "secrets": metas })).into_response()
+// ── Error response helpers ────────────────────────────────────────────────────
+
+fn decision_to_response(decision: &AuthDecision) -> Response {
+    match decision {
+        AuthDecision::Allow => unreachable!("Allow should not be converted to an error response"),
+        AuthDecision::Unauthorized => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "authentication required"})),
+        )
+            .into_response(),
+        AuthDecision::BadRequest(msg) => {
+            (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response()
         }
-        Err(e) => internal_error(e),
+        AuthDecision::MethodNotAllowed => (
+            StatusCode::METHOD_NOT_ALLOWED,
+            Json(json!({"error": "method not allowed"})),
+        )
+            .into_response(),
+        AuthDecision::NotFound => {
+            (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+        }
+        AuthDecision::Gone => {
+            (StatusCode::GONE, Json(json!({"error": "secret is gone"}))).into_response()
+        }
+        AuthDecision::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "server is in lockdown mode (visibility=none)"})),
+        )
+            .into_response(),
     }
 }
 
-// ── Create ────────────────────────────────────────────────────────────────────
+// ── Webhook helper ────────────────────────────────────────────────────────────
+
+/// If `owner_key_id` is `Some` and the key has a `webhook_url`, fire a
+/// fire-and-forget webhook event. Anonymous secrets never trigger webhooks.
+fn maybe_fire_webhook(
+    state: &AppState,
+    owner_key_id: Option<&str>,
+    event_type: &str,
+    hash: &str,
+    at: i64,
+) {
+    let Some(key_id) = owner_key_id else { return };
+    let key = match state.store.find_key_by_id(key_id) {
+        Ok(Some(k)) => k,
+        _ => return,
+    };
+    let Some(url) = key.webhook_url else { return };
+    state.webhook_sender.fire(
+        url,
+        WebhookEvent {
+            event_type: event_type.to_string(),
+            hash: hash.to_string(),
+            at,
+            ip: String::new(),
+        },
+    );
+}
+
+// ── POST /secret ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 pub struct CreateRequest {
     pub value: String,
     pub ttl_seconds: Option<u64>,
-    pub max_reads: Option<u32>,
-    pub delete: Option<bool>,
-    pub webhook_url: Option<String>,
+    pub reads: Option<u32>,
+    /// Optional short prefix prepended to the random hash. Must match [a-z0-9_-]{1,16}.
+    pub prefix: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CreateResponse {
-    pub id: String,
+    pub hash: String,
+    pub url: String,
+    pub expires_at: Option<i64>,
+    pub reads_remaining: Option<u32>,
+    pub owned: bool,
 }
 
 pub async fn create_secret(
     State(state): State<AppState>,
     headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<CreateRequest>,
 ) -> Response {
-    // Public bucket: no auth required — the returned ID is the access token.
-    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
+    let caller = extract_caller(&headers, &state.store);
 
-    if body.max_reads == Some(0) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "max_reads must be ≥ 1; omit to allow unlimited reads"})),
-        )
-            .into_response();
+    let visibility = *state.visibility.read().await;
+
+    let now = now_secs();
+    let decision = authorize(Action::Create, None, &caller, visibility, now);
+    if decision != AuthDecision::Allow {
+        return decision_to_response(&decision);
     }
-    if body.value.len() > 1_048_576 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "value exceeds 1 MiB limit"})),
-        )
-            .into_response();
-    }
-    if let Some(ttl) = body.ttl_seconds {
-        if ttl > MAX_TTL_SECS {
+
+    // Validate prefix if supplied.
+    if let Some(ref prefix) = body.prefix {
+        if !is_valid_prefix(prefix) {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("ttl_seconds exceeds maximum of {MAX_TTL_SECS} (10 years)")})),
-            )
-                .into_response();
-        }
-    }
-    if let Some(ref wurl) = body.webhook_url {
-        if let Err(reason) = webhooks::validate_webhook_url(wurl, &state.webhook_allowed_origins) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("webhook_url: {reason}")})),
+                Json(json!({"error": "prefix must match [a-z0-9_-]{1,16}"})),
             )
                 .into_response();
         }
     }
 
-    // Generate a random 256-bit hex ID — the caller uses this as the access token.
-    use rand::Rng;
-    let id: String = hex::encode(rand::thread_rng().gen::<[u8; 32]>());
+    // Generate hash: optional_prefix + 64 hex chars (32 random bytes).
+    let mut random_bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut random_bytes);
+    let hash = format!(
+        "{}{}",
+        body.prefix.as_deref().unwrap_or(""),
+        hex::encode(random_bytes)
+    );
 
-    // Licensing is now enforced at org/principal creation, not per-secret.
+    // Encrypt the value.
+    let (ciphertext, nonce) =
+        match crate::store::crypto::encrypt(&state.encryption_key, body.value.as_bytes()) {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::error!("encryption failed: {e}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
 
-    let max_reads = body.max_reads.or(Some(1));
+    let ttl_expires_at = body.ttl_seconds.map(|secs| now + secs as i64);
+    let owner_key_id: Option<String> = match &caller {
+        Caller::Keyed(key) => Some(key.id.clone()),
+        Caller::Anonymous => None,
+    };
+    let owned = owner_key_id.is_some();
 
-    match state.store.put(
-        &id,
-        &body.value,
-        body.ttl_seconds,
-        max_reads,
-        body.delete.unwrap_or(true),
-        body.webhook_url.clone(),
-    ) {
-        Ok(()) => {
-            info!(
-                id = %id,
-                ttl_seconds = ?body.ttl_seconds,
-                max_reads = ?max_reads,
-                "audit: secret.create"
+    let record = SecretRecord {
+        hash: hash.clone(),
+        value_ciphertext: ciphertext,
+        nonce,
+        created_at: now,
+        ttl_expires_at,
+        reads_remaining: body.reads,
+        burned: false,
+        burned_at: None,
+        owner_key_id: owner_key_id.clone(),
+        created_by_ip: None, // IP extraction added in Phase 4 with ConnectInfo
+    };
+
+    if let Err(e) = state.store.create_secret(&record) {
+        tracing::error!("failed to create secret: {e}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    // Record audit event.
+    let key_id = match &caller {
+        Caller::Keyed(k) => Some(k.id.clone()),
+        Caller::Anonymous => None,
+    };
+    let event = AuditEvent::new(
+        ACTION_SECRET_CREATE,
+        key_id,
+        Some(hash.clone()),
+        String::new(),
+        true,
+        None,
+    );
+    let _ = state.store.record_audit(event);
+
+    // Fire webhook if the owner key has one configured.
+    maybe_fire_webhook(
+        &state,
+        owner_key_id.as_deref(),
+        "secret.created",
+        &hash,
+        now,
+    );
+
+    let url = format!("http://localhost:7843/secret/{hash}");
+    (
+        StatusCode::CREATED,
+        Json(CreateResponse {
+            hash,
+            url,
+            expires_at: ttl_expires_at,
+            reads_remaining: body.reads,
+            owned,
+        }),
+    )
+        .into_response()
+}
+
+// ── GET /secret/{hash} ────────────────────────────────────────────────────────
+
+pub async fn read_secret(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let visibility = *state.visibility.read().await;
+
+    if !visibility.allows_any_request() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+
+    let now = now_secs();
+
+    // Peek at the record first to capture owner_key_id for webhook firing.
+    let owner_key_id_for_webhook = state
+        .store
+        .get_secret(&hash)
+        .ok()
+        .flatten()
+        .and_then(|s| s.owner_key_id);
+
+    match state.store.consume_read(&hash, now, &state.encryption_key) {
+        Ok((plaintext, _burned)) => {
+            // Record audit event for the successful read.
+            let event = AuditEvent::new(
+                ACTION_SECRET_READ,
+                None,
+                Some(hash.clone()),
+                String::new(),
+                true,
+                None,
             );
-            let _ = state.store.record_audit(AuditEvent::new(
-                ACTION_SECRET_CREATE,
-                Some(id.clone()),
-                ip,
-                true,
-                None,
-                None,
-                None,
-            ));
-            if let Some(ref sender) = state.webhook_sender {
-                sender.fire("secret.created", &id, json!({}));
+            let _ = state.store.record_audit(event);
+
+            // Fire webhook if owner key has one.
+            maybe_fire_webhook(
+                &state,
+                owner_key_id_for_webhook.as_deref(),
+                "secret.read",
+                &hash,
+                now,
+            );
+
+            // Decide response format based on Accept header.
+            let wants_json = headers
+                .get(axum::http::header::ACCEPT)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.contains("application/json"))
+                .unwrap_or(false);
+
+            if wants_json {
+                let value_str = String::from_utf8_lossy(&plaintext).into_owned();
+                Json(json!({"value": value_str})).into_response()
+            } else {
+                let value_str = String::from_utf8_lossy(&plaintext).into_owned();
+                (
+                    StatusCode::OK,
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "text/plain; charset=utf-8",
+                    )],
+                    value_str,
+                )
+                    .into_response()
             }
-            (StatusCode::CREATED, Json(CreateResponse { id })).into_response()
         }
-        Err(e) => internal_error(e),
+        Err(crate::store::StoreError::NotFound)
+        | Err(crate::store::StoreError::Burned)
+        | Err(crate::store::StoreError::Expired) => StatusCode::GONE.into_response(),
+        Err(e) => {
+            tracing::error!("consume_read failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
-// ── Get ───────────────────────────────────────────────────────────────────────
+// ── HEAD /secret/{hash} ───────────────────────────────────────────────────────
 
-pub async fn get_secret(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Path(key): Path<String>,
-) -> Response {
-    if !validate_key_name(&key) {
-        return bad_key_name();
+/// Metadata inspection. Does NOT consume a read.
+pub async fn inspect_secret(State(state): State<AppState>, Path(hash): Path<String>) -> Response {
+    let visibility = *state.visibility.read().await;
+
+    if !visibility.allows_any_request() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
-    match state.store.get(&key) {
-        Ok(GetResult::Value(value, webhook_url)) => {
-            let _ = state.store.record_audit(AuditEvent::new(
-                ACTION_SECRET_READ,
-                Some(key.clone()),
-                ip,
-                true,
-                None,
-                None,
-                None,
-            ));
-            if let Some(ref sender) = state.webhook_sender {
-                sender.fire("secret.read", &key, json!({}));
-                if let Some(ref url) = webhook_url {
-                    sender.fire_for_url(url, "secret.read", &key, json!({}));
+
+    let now = now_secs();
+
+    let secret = match state.store.get_secret(&hash) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("get_secret failed: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    match secret {
+        None => StatusCode::GONE.into_response(),
+        Some(s) if s.burned || s.is_expired(now) => StatusCode::GONE.into_response(),
+        Some(s) => {
+            let mut response_headers = HeaderMap::new();
+
+            // X-Sirr-Created
+            let created_str = unix_to_rfc3339(s.created_at);
+            if let Ok(v) = HeaderValue::from_str(&created_str) {
+                response_headers.insert(HeaderName::from_static("x-sirr-created"), v);
+            }
+
+            // X-Sirr-TTL-Expires (if set)
+            if let Some(exp) = s.ttl_expires_at {
+                let exp_str = unix_to_rfc3339(exp);
+                if let Ok(v) = HeaderValue::from_str(&exp_str) {
+                    response_headers.insert(HeaderName::from_static("x-sirr-ttl-expires"), v);
                 }
             }
-            Json(json!({ "id": key, "value": value })).into_response()
-        }
-        Ok(GetResult::Burned(value, webhook_url)) => {
-            let _ = state.store.record_audit(AuditEvent::new(
-                ACTION_SECRET_BURNED,
-                Some(key.clone()),
-                ip,
-                true,
-                None,
-                None,
-                None,
-            ));
-            if let Some(ref sender) = state.webhook_sender {
-                sender.fire("secret.burned", &key, json!({}));
-                if let Some(ref url) = webhook_url {
-                    sender.fire_for_url(url, "secret.burned", &key, json!({}));
+
+            // X-Sirr-Reads-Remaining (if set)
+            // Note: spec also calls this X-Sirr-Read-Count but we use reads_remaining.
+            // Using reads_remaining as-is (YAGNI — no separate read_count field).
+            if let Some(rem) = s.reads_remaining {
+                if let Ok(v) = HeaderValue::from_str(&rem.to_string()) {
+                    response_headers.insert(HeaderName::from_static("x-sirr-reads-remaining"), v);
+                    // X-Sirr-Read-Count mirrors reads_remaining for now.
+                    if let Ok(v2) = HeaderValue::from_str(&rem.to_string()) {
+                        response_headers.insert(HeaderName::from_static("x-sirr-read-count"), v2);
+                    }
                 }
             }
-            Json(json!({ "id": key, "value": value })).into_response()
+
+            // X-Sirr-Owned
+            let owned_str = if s.owner_key_id.is_some() {
+                "true"
+            } else {
+                "false"
+            };
+            if let Ok(v) = HeaderValue::from_str(owned_str) {
+                response_headers.insert(HeaderName::from_static("x-sirr-owned"), v);
+            }
+
+            (StatusCode::OK, response_headers).into_response()
         }
-        Ok(GetResult::Sealed) => {
-            let _ = state.store.record_audit(AuditEvent::new(
-                ACTION_SECRET_READ,
-                Some(key.clone()),
-                ip,
-                false,
-                Some("sealed".into()),
-                None,
-                None,
-            ));
-            (
-                StatusCode::GONE,
-                Json(json!({"error": "secret is sealed — reads exhausted"})),
-            )
-                .into_response()
-        }
-        Ok(GetResult::NotFound) => {
-            let _ = state.store.record_audit(AuditEvent::new(
-                ACTION_SECRET_READ,
-                Some(key.clone()),
-                ip,
-                false,
-                Some("not found or expired".into()),
-                None,
-                None,
-            ));
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "not found or expired"})),
-            )
-                .into_response()
-        }
-        Err(e) => internal_error(e),
     }
 }
 
-// ── Head ──────────────────────────────────────────────────────────────────────
+// ── GET /secret/{hash}/audit ──────────────────────────────────────────────────
 
-pub async fn head_secret(
+#[derive(Debug, Serialize)]
+pub struct AuditEventResponse {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub at: i64,
+    pub ip: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuditResponse {
+    pub hash: String,
+    pub created_at: i64,
+    pub events: Vec<AuditEventResponse>,
+}
+
+pub async fn audit_secret(
     State(state): State<AppState>,
+    Path(hash): Path<String>,
     headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Path(key): Path<String>,
 ) -> Response {
-    if !validate_key_name(&key) {
-        return bad_key_name();
+    let caller = extract_caller(&headers, &state.store);
+
+    let visibility = *state.visibility.read().await;
+
+    if !visibility.allows_any_request() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
-    match state.store.head(&key) {
-        Ok(Some((meta, sealed))) => {
-            let detail = if sealed { "head;sealed" } else { "head" };
-            let _ = state.store.record_audit(AuditEvent::new(
-                ACTION_SECRET_READ,
-                Some(key.clone()),
-                ip,
-                true,
-                Some(detail.into()),
-                None,
-                None,
-            ));
 
-            let status = if sealed {
-                StatusCode::GONE
-            } else {
-                StatusCode::OK
-            };
+    let now = now_secs();
 
-            let reads_remaining = match meta.max_reads {
-                Some(max) => (max.saturating_sub(meta.read_count)).to_string(),
-                None => "unlimited".to_string(),
-            };
-
-            let mut builder = Response::builder()
-                .status(status)
-                .header("X-Sirr-Read-Count", meta.read_count.to_string())
-                .header("X-Sirr-Reads-Remaining", reads_remaining)
-                .header("X-Sirr-Delete", meta.delete.to_string())
-                .header("X-Sirr-Created-At", meta.created_at.to_string());
-
-            if let Some(exp) = meta.expires_at {
-                builder = builder.header("X-Sirr-Expires-At", exp.to_string());
-            }
-
-            if sealed {
-                builder = builder.header("X-Sirr-Status", "sealed");
-            } else {
-                builder = builder.header("X-Sirr-Status", "active");
-            }
-
-            builder.body(axum::body::Body::empty()).unwrap()
+    let secret = match state.store.get_secret(&hash) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("get_secret failed: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        Ok(None) => {
-            let _ = state.store.record_audit(AuditEvent::new(
-                ACTION_SECRET_READ,
-                Some(key.clone()),
-                ip,
-                false,
-                Some("head;not found or expired".into()),
-                None,
-                None,
-            ));
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "not found or expired"})),
-            )
-                .into_response()
-        }
-        Err(e) => internal_error(e),
+    };
+
+    let decision = authorize(Action::Audit, secret.as_ref(), &caller, visibility, now);
+    if decision != AuthDecision::Allow {
+        return decision_to_response(&decision);
     }
+
+    // secret is Some and caller is owner (guaranteed by authorize returning Allow).
+    let secret = secret.unwrap();
+
+    let query = AuditQuery {
+        hash: Some(hash.clone()),
+        limit: 0, // unlimited
+        ..Default::default()
+    };
+
+    let events = match state.store.query_audit(&query) {
+        Ok(evs) => evs,
+        Err(e) => {
+            tracing::error!("query_audit failed: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let event_responses: Vec<AuditEventResponse> = events
+        .into_iter()
+        .map(|ev| AuditEventResponse {
+            event_type: ev.action,
+            at: ev.timestamp,
+            ip: ev.source_ip,
+        })
+        .collect();
+
+    Json(AuditResponse {
+        hash,
+        created_at: secret.created_at,
+        events: event_responses,
+    })
+    .into_response()
 }
 
-// ── Patch ─────────────────────────────────────────────────────────────────────
+// ── PATCH /secret/{hash} ──────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 pub struct PatchRequest {
-    pub value: Option<String>,
-    pub max_reads: Option<u32>,
+    pub value: String,
     pub ttl_seconds: Option<u64>,
+    pub reads: Option<u32>,
 }
 
 pub async fn patch_secret(
     State(state): State<AppState>,
-    Extension(_auth): Extension<ResolvedAuth>,
+    Path(hash): Path<String>,
     headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Path(key): Path<String>,
     Json(body): Json<PatchRequest>,
 ) -> Response {
-    // Auth is handled by require_master_key middleware.
-    if !validate_key_name(&key) {
-        return bad_key_name();
-    }
-    if body.max_reads == Some(0) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "max_reads must be ≥ 1; omit to allow unlimited reads"})),
-        )
-            .into_response();
-    }
-    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
+    let caller = extract_caller(&headers, &state.store);
 
-    if let Some(ref v) = body.value {
-        if v.len() > 1_048_576 {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "value exceeds 1 MiB limit"})),
-            )
-                .into_response();
-        }
-    }
-    if let Some(ttl) = body.ttl_seconds {
-        if ttl > MAX_TTL_SECS {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("ttl_seconds exceeds maximum of {MAX_TTL_SECS} (10 years)")})),
-            )
-                .into_response();
-        }
+    let visibility = *state.visibility.read().await;
+
+    if !visibility.allows_any_request() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
 
-    match state.store.patch(
-        &key,
-        body.value.as_deref(),
-        body.max_reads,
-        body.ttl_seconds,
-    ) {
-        Ok(Some(meta)) => {
-            let _ = state.store.record_audit(AuditEvent::new(
-                ACTION_SECRET_PATCH,
-                Some(key.clone()),
-                ip,
-                true,
-                None,
-                None,
-                None,
-            ));
-            Json(meta).into_response()
-        }
-        Ok(None) => {
-            let _ = state.store.record_audit(AuditEvent::new(
-                ACTION_SECRET_PATCH,
-                Some(key.clone()),
-                ip,
-                false,
-                Some("not found or expired".into()),
-                None,
-                None,
-            ));
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "not found or expired"})),
-            )
-                .into_response()
-        }
+    let now = now_secs();
+
+    let secret = match state.store.get_secret(&hash) {
+        Ok(s) => s,
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("cannot patch") {
-                let _ = state.store.record_audit(AuditEvent::new(
-                    ACTION_SECRET_PATCH,
-                    Some(key.clone()),
-                    ip,
-                    false,
-                    Some("conflict: delete=true".into()),
-                    None,
-                    None,
-                ));
-                (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response()
-            } else if msg.starts_with("sealed:") {
-                let _ = state.store.record_audit(AuditEvent::new(
-                    ACTION_SECRET_PATCH,
-                    Some(key.clone()),
-                    ip,
-                    false,
-                    Some("gone: secret read limit exhausted".into()),
-                    None,
-                    None,
-                ));
-                (
-                    StatusCode::GONE,
-                    Json(json!({"error": "secret read limit exhausted"})),
-                )
-                    .into_response()
-            } else {
-                internal_error(e)
-            }
+            tracing::error!("get_secret failed: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-    }
-}
-
-// ── Delete ────────────────────────────────────────────────────────────────────
-
-pub async fn delete_secret(
-    State(state): State<AppState>,
-    Extension(_auth): Extension<ResolvedAuth>,
-    headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Path(key): Path<String>,
-) -> Response {
-    // Auth is handled by require_master_key middleware.
-    if !validate_key_name(&key) {
-        return bad_key_name();
-    }
-    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
-    match state.store.delete(&key) {
-        Ok(true) => {
-            info!(key = %key, "audit: secret.delete");
-            let _ = state.store.record_audit(AuditEvent::new(
-                ACTION_SECRET_DELETE,
-                Some(key.clone()),
-                ip,
-                true,
-                None,
-                None,
-                None,
-            ));
-            if let Some(ref sender) = state.webhook_sender {
-                sender.fire("secret.deleted", &key, json!({}));
-            }
-            Json(json!({"deleted": true})).into_response()
-        }
-        Ok(false) => {
-            info!(key = %key, "audit: secret.delete.not_found");
-            let _ = state.store.record_audit(AuditEvent::new(
-                ACTION_SECRET_DELETE,
-                Some(key.clone()),
-                ip,
-                false,
-                Some("not found".into()),
-                None,
-                None,
-            ));
-            (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
-        }
-        Err(e) => internal_error(e),
-    }
-}
-
-// ── Prune ─────────────────────────────────────────────────────────────────────
-
-pub async fn prune_secrets(
-    State(state): State<AppState>,
-    Extension(_auth): Extension<ResolvedAuth>,
-    headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-) -> Response {
-    // Auth is handled by require_master_key middleware.
-    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
-    match state.store.prune() {
-        Ok(pruned_keys) => {
-            let n = pruned_keys.len();
-            info!(pruned = n, "audit: secret.prune");
-            let _ = state.store.record_audit(AuditEvent::new(
-                ACTION_SECRET_PRUNE,
-                None,
-                ip,
-                true,
-                Some(format!("pruned={n}")),
-                None,
-                None,
-            ));
-            if let Some(ref sender) = state.webhook_sender {
-                for key in &pruned_keys {
-                    sender.fire("secret.expired", key, json!({"reason": "manual_prune"}));
-                }
-            }
-            Json(json!({"pruned": n})).into_response()
-        }
-        Err(e) => internal_error(e),
-    }
-}
-
-// ── Webhooks ─────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-pub struct CreateWebhookRequest {
-    pub url: String,
-    pub events: Option<Vec<String>>,
-}
-
-pub async fn create_webhook(
-    State(state): State<AppState>,
-    Extension(_auth): Extension<ResolvedAuth>,
-    headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Json(body): Json<CreateWebhookRequest>,
-) -> Response {
-    // Auth is handled by require_master_key middleware.
-    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
-
-    // Validate URL.
-    if !body.url.starts_with("http://") && !body.url.starts_with("https://") {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "webhook URL must start with http:// or https://"})),
-        )
-            .into_response();
-    }
-
-    // Check count limit.
-    match state.store.count_webhooks() {
-        Ok(count) if count >= MAX_WEBHOOKS => {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({"error": format!("maximum of {MAX_WEBHOOKS} webhooks reached")})),
-            )
-                .into_response();
-        }
-        Err(e) => return internal_error(e),
-        _ => {}
-    }
-
-    let events = body.events.unwrap_or_else(|| vec!["*".to_string()]);
-    let id = webhooks::generate_webhook_id();
-    let secret = webhooks::generate_signing_secret();
-
-    let reg = webhooks::WebhookRegistration {
-        id: id.clone(),
-        url: body.url.clone(),
-        secret: secret.clone(),
-        events,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64,
-        org_id: None,
     };
 
-    match state.store.put_webhook(&reg) {
-        Ok(()) => {
-            let _ = state.store.record_audit(AuditEvent::new(
-                ACTION_WEBHOOK_CREATE,
-                None,
-                ip,
+    let decision = authorize(Action::Patch, secret.as_ref(), &caller, visibility, now);
+    if decision != AuthDecision::Allow {
+        return decision_to_response(&decision);
+    }
+
+    // caller is Keyed and is owner (guaranteed by authorize returning Allow).
+    let owner_key_id = match &caller {
+        Caller::Keyed(k) => k.id.clone(),
+        Caller::Anonymous => unreachable!("authorize returned Allow for anonymous patch"),
+    };
+
+    // Optional resets: ttl_seconds translates to an absolute timestamp.
+    let new_ttl = body.ttl_seconds.map(|secs| now + secs as i64);
+    let new_reads = body.reads;
+
+    match state.store.patch_secret(
+        &hash,
+        body.value.as_bytes(),
+        &owner_key_id,
+        new_ttl,
+        new_reads,
+        &state.encryption_key,
+    ) {
+        Ok(updated) => {
+            // Record audit event.
+            let event = AuditEvent::new(
+                ACTION_SECRET_PATCH,
+                Some(owner_key_id.clone()),
+                Some(hash.clone()),
+                String::new(),
                 true,
-                Some(format!("id={id}")),
                 None,
-                None,
-            ));
+            );
+            let _ = state.store.record_audit(event);
+
+            // Fire webhook if the owner key has one configured.
+            maybe_fire_webhook(&state, Some(&owner_key_id), "secret.patched", &hash, now);
+
+            let owned = updated.owner_key_id.is_some();
+            let url = format!("http://localhost:7843/secret/{}", updated.hash);
             (
-                StatusCode::CREATED,
-                Json(json!({"id": id, "secret": secret})),
+                StatusCode::OK,
+                Json(CreateResponse {
+                    hash: updated.hash,
+                    url,
+                    expires_at: updated.ttl_expires_at,
+                    reads_remaining: updated.reads_remaining,
+                    owned,
+                }),
             )
                 .into_response()
         }
-        Err(e) => internal_error(e),
-    }
-}
-
-pub async fn list_webhooks(
-    State(state): State<AppState>,
-    Extension(_auth): Extension<ResolvedAuth>,
-) -> Response {
-    // Auth is handled by require_master_key middleware.
-    match state.store.list_webhooks() {
-        Ok(regs) => {
-            // Redact signing secrets in the response.
-            let redacted: Vec<_> = regs
-                .iter()
-                .map(|r| {
-                    json!({
-                        "id": r.id,
-                        "url": r.url,
-                        "events": r.events,
-                        "created_at": r.created_at,
-                    })
-                })
-                .collect();
-            Json(json!({"webhooks": redacted})).into_response()
+        Err(crate::store::StoreError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(crate::store::StoreError::Burned) | Err(crate::store::StoreError::Expired) => {
+            StatusCode::GONE.into_response()
         }
-        Err(e) => internal_error(e),
+        Err(crate::store::StoreError::WrongOwner) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!("patch_secret failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
-pub async fn delete_webhook(
+// ── DELETE /secret/{hash} ─────────────────────────────────────────────────────
+
+pub async fn burn_secret(
     State(state): State<AppState>,
-    Extension(_auth): Extension<ResolvedAuth>,
+    Path(hash): Path<String>,
     headers: HeaderMap,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Path(id): Path<String>,
 ) -> Response {
-    // Auth is handled by require_master_key middleware.
-    let ip = extract_ip(&headers, &addr, &state.trusted_proxies);
-    match state.store.delete_webhook(&id) {
-        Ok(true) => {
-            let _ = state.store.record_audit(AuditEvent::new(
-                ACTION_WEBHOOK_DELETE,
-                None,
-                ip,
-                true,
-                Some(format!("id={id}")),
-                None,
-                None,
-            ));
-            Json(json!({"deleted": true})).into_response()
+    let caller = extract_caller(&headers, &state.store);
+
+    let visibility = *state.visibility.read().await;
+
+    if !visibility.allows_any_request() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+
+    let now = now_secs();
+
+    let secret = match state.store.get_secret(&hash) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("get_secret failed: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "webhook not found"})),
-        )
-            .into_response(),
-        Err(e) => internal_error(e),
+    };
+
+    let decision = authorize(Action::Burn, secret.as_ref(), &caller, visibility, now);
+    if decision != AuthDecision::Allow {
+        return decision_to_response(&decision);
+    }
+
+    // Determine the owner_key_id to pass to burn_secret (None for anonymous).
+    let owner_key_id_opt = match &caller {
+        Caller::Keyed(k) => Some(k.id.clone()),
+        Caller::Anonymous => None, // anonymous secret — anyone can burn
+    };
+
+    match state
+        .store
+        .burn_secret(&hash, owner_key_id_opt.as_deref(), now)
+    {
+        Ok(()) => {
+            let event = AuditEvent::new(
+                ACTION_SECRET_BURN,
+                owner_key_id_opt.clone(),
+                Some(hash.clone()),
+                String::new(),
+                true,
+                None,
+            );
+            let _ = state.store.record_audit(event);
+
+            // Fire webhook if owner key has one configured.
+            maybe_fire_webhook(
+                &state,
+                owner_key_id_opt.as_deref(),
+                "secret.burned",
+                &hash,
+                now,
+            );
+
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(crate::store::StoreError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(crate::store::StoreError::Burned) => StatusCode::GONE.into_response(),
+        Err(crate::store::StoreError::WrongOwner) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!("burn_secret failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
-
-// ── API Keys ──────────────────────────────────────────────────────────────────
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn internal_error(e: anyhow::Error) -> Response {
-    tracing::error!(error = %e, "internal error");
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": "internal server error"})),
-    )
-        .into_response()
+/// Validate a prefix: [a-z0-9_-]{1,16}.
+fn is_valid_prefix(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && prefix.len() <= 16
+        && prefix
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
+}
+
+/// Format a unix timestamp as RFC 3339 (UTC). Falls back to epoch on overflow.
+fn unix_to_rfc3339(unix_secs: i64) -> String {
+    use std::time::{Duration, UNIX_EPOCH};
+    let d = Duration::from_secs(unix_secs.max(0) as u64);
+    let sys = UNIX_EPOCH + d;
+    // Format manually: YYYY-MM-DDTHH:MM:SSZ using SystemTime arithmetic.
+    // We use a simple approach: convert to seconds and format using time math.
+    let total_secs = sys.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    seconds_to_rfc3339(total_secs)
+}
+
+fn seconds_to_rfc3339(secs: u64) -> String {
+    // Compute date/time components from unix epoch.
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+
+    // Gregorian calendar computation.
+    let (year, month, day) = days_to_date(days);
+
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+fn days_to_date(days: u64) -> (u64, u64, u64) {
+    // Days since 1970-01-01 to proleptic Gregorian date.
+    // Uses the algorithm from https://howardhinnant.github.io/date_algorithms.html
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z % 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }

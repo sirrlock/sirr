@@ -1,272 +1,294 @@
 #!/usr/bin/env bash
-# sirr/tests/e2e.sh — full multi-tenant E2E integration scenario
-# Starts its own isolated sirrd on port 39998, runs all checks, then cleans up.
-# NO license key — tests the real free-tier experience a user gets.
-# Usage: bash tests/e2e.sh
+# sirr/tests/e2e.sh — end-to-end smoke test against real binaries
+# Starts sirrd, exercises sirr CLI + curl, then cleans up.
+# Usage: cargo build --release && bash tests/e2e.sh
 set -euo pipefail
 
 PORT=39998
-BASE=http://localhost:$PORT
+BASE=http://127.0.0.1:$PORT
 PASS=0; FAIL=0
 
 check() {
   if [ "$1" = "$2" ]; then
-    echo "✅ $3"; ((PASS++)) || true
+    echo "  ✅ $3"; ((PASS++)) || true
   else
-    echo "❌ $3 (expected '$2', got '$1')"; ((FAIL++)) || true
+    echo "  ❌ $3 (expected '$2', got '$1')"; ((FAIL++)) || true
   fi
 }
 
-json() { python3 -c "import sys,json; print(json.load(sys.stdin)$1)"; }
+check_contains() {
+  if echo "$1" | grep -qF "$2"; then
+    echo "  ✅ $3"; ((PASS++)) || true
+  else
+    echo "  ❌ $3 (expected to contain '$2', got '$1')"; ((FAIL++)) || true
+  fi
+}
+
 status() { curl -s -o /dev/null -w "%{http_code}" "$@"; }
 
-# ── Start isolated sirrd — NO auto-init, NO license key ───────────────────────
-# This is the real first-run experience: empty server, master key only.
-MASTER_KEY="e2e-test-api-key"
-E2E_DIR=$(mktemp -d)
-SIRR_DATA_DIR="$E2E_DIR" SIRR_MASTER_API_KEY="$MASTER_KEY" \
-  SIRR_RATE_LIMIT_PER_SECOND=1000 SIRR_RATE_LIMIT_BURST=1000 \
-  sirrd serve --port $PORT >"$E2E_DIR/sirrd.log" 2>&1 &
-SIRRD_PID=$!
-trap "kill $SIRRD_PID 2>/dev/null; rm -rf '$E2E_DIR'" EXIT
+# ── Setup ────────────────────────────────────────────────────────────────────
 
+E2E_DIR=$(mktemp -d)
+SOCKET="$E2E_DIR/sirrd.sock"
+SIRRD=./target/release/sirrd
+SIRR=./target/release/sirr
+
+if [ ! -f "$SIRRD" ] || [ ! -f "$SIRR" ]; then
+  echo "Build first: cargo build --release"
+  exit 1
+fi
+
+cleanup() {
+  kill "$SIRRD_PID" 2>/dev/null || true
+  rm -rf "$E2E_DIR"
+}
+trap cleanup EXIT
+
+# Start sirrd in public mode (default)
+"$SIRRD" serve \
+  --bind "127.0.0.1:$PORT" \
+  --data-dir "$E2E_DIR" \
+  --admin-socket "$SOCKET" \
+  >"$E2E_DIR/sirrd.log" 2>&1 &
+SIRRD_PID=$!
+
+# Wait for server — no /health endpoint, so try a POST and accept any HTTP response
 for i in $(seq 1 30); do
-  if curl -sf "$BASE/health" >/dev/null 2>&1; then break; fi
-  sleep 0.3
+  if curl -sf -o /dev/null -w "" "http://127.0.0.1:$PORT/secret" -X POST -H "Content-Type: application/json" -d '{"value":"ping"}' 2>/dev/null; then break; fi
+  # Also accept non-2xx as "server is up"
+  if [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/secret" -X POST -H 'Content-Type: application/json' -d '{"value":"ping"}' 2>/dev/null)" != "000" ]; then break; fi
+  sleep 0.2
 done
 
-# ── 1: Health ─────────────────────────────────────────────────────────────────
-HEALTH=$(curl -s "$BASE/health" | json "['status']")
-check "$HEALTH" "ok" "server health"
-
-# ── 2: Create org (master key, no license) ────────────────────────────────────
-ORG_RESP=$(curl -s -X POST "$BASE/orgs" \
-  -H "Authorization: Bearer $MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"acme"}')
-ORG_ID=$(echo "$ORG_RESP" | json "['id']")
-check "$(echo "$ORG_RESP" | json "['name']")" "acme" "create org: acme"
-
-# ── 3: Create second org (no license limits) ─────────────────────────────────
-ORG2_RESP=$(curl -s -X POST "$BASE/orgs" \
-  -H "Authorization: Bearer $MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"globex"}')
-ORG2_ID=$(echo "$ORG2_RESP" | json "['id']")
-check "$(echo "$ORG2_RESP" | json "['name']")" "globex" "create second org: globex"
-
-# ── 4: Create principal (owner) ───────────────────────────────────────────────
-OWNER_RESP=$(curl -s -X POST "$BASE/orgs/$ORG_ID/principals" \
-  -H "Authorization: Bearer $MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"alice","role":"owner"}')
-OWNER_ID=$(echo "$OWNER_RESP" | json "['id']")
-check "$(echo "$OWNER_RESP" | json "['role']")" "owner" "create principal: alice (owner)"
-
-# ── 5: Create second principal (no license limits) ────────────────────────────
-WRITER_RESP=$(curl -s -X POST "$BASE/orgs/$ORG_ID/principals" \
-  -H "Authorization: Bearer $MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"bob","role":"writer"}')
-WRITER_ID=$(echo "$WRITER_RESP" | json "['id']")
-check "$(echo "$WRITER_RESP" | json "['role']")" "writer" "create second principal: no tier limit"
-
-# ── 6: Master issues key for principal ────────────────────────────────────────
-KEY_RESP=$(curl -s -X POST "$BASE/orgs/$ORG_ID/principals/$OWNER_ID/keys" \
-  -H "Authorization: Bearer $MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"alice-key","valid_for_seconds":3600}')
-ALICE_KEY=$(echo "$KEY_RESP" | json "['key']")
-[ -n "$ALICE_KEY" ] && { echo "✅ master issues key for alice"; ((PASS++)) || true; } \
-                     || { echo "❌ key creation failed: $KEY_RESP"; ((FAIL++)) || true; }
-
-WRITER_KEY_RESP=$(curl -s -X POST "$BASE/orgs/$ORG_ID/principals/$WRITER_ID/keys" \
-  -H "Authorization: Bearer $MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"bob-key","valid_for_seconds":3600}')
-BOB_KEY=$(echo "$WRITER_KEY_RESP" | json "['key']")
-[ -n "$BOB_KEY" ] && { echo "✅ master issues key for bob"; ((PASS++)) || true; } \
-                   || { echo "❌ key creation failed: $WRITER_KEY_RESP"; ((FAIL++)) || true; }
-
-# ── 7: Principal can authenticate with issued key ─────────────────────────────
-ME_RESP=$(curl -s "$BASE/me" -H "Authorization: Bearer $ALICE_KEY")
-check "$(echo "$ME_RESP" | json "['name']")" "alice" "alice authenticates with her key"
-
-ME_RESP2=$(curl -s "$BASE/me" -H "Authorization: Bearer $BOB_KEY")
-check "$(echo "$ME_RESP2" | json "['name']")" "bob" "bob authenticates with his key"
-
-# ── 8: Owner can create org secret ────────────────────────────────────────────
-curl -sf -X POST "$BASE/orgs/$ORG_ID/secrets" \
-  -H "Authorization: Bearer $ALICE_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"key":"DB_URL","value":"postgres://localhost/myapp","ttl_seconds":3600,"max_reads":100}' >/dev/null
-check "$(curl -s "$BASE/orgs/$ORG_ID/secrets/DB_URL" \
-  -H "Authorization: Bearer $ALICE_KEY" | json "['value']")" \
-  "postgres://localhost/myapp" "owner can set and read org secret"
-
-# ── 9: Writer can create but reader cannot ────────────────────────────────────
-READER_RESP=$(curl -s -X POST "$BASE/orgs/$ORG_ID/principals" \
-  -H "Authorization: Bearer $MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"carol","role":"reader"}')
-READER_ID=$(echo "$READER_RESP" | json "['id']")
-READER_KEY_RESP=$(curl -s -X POST "$BASE/orgs/$ORG_ID/principals/$READER_ID/keys" \
-  -H "Authorization: Bearer $MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"carol-key","valid_for_seconds":3600}')
-CAROL_KEY=$(echo "$READER_KEY_RESP" | json "['key']")
-
-# reader has ReadMy (r) not ReadOrg (R) — can only read secrets they own
-READER_STATUS=$(status "$BASE/orgs/$ORG_ID/secrets/DB_URL" \
-  -H "Authorization: Bearer $CAROL_KEY")
-# 403 (permission denied) or 404 (secret not visible) are both correct
-if [ "$READER_STATUS" = "403" ] || [ "$READER_STATUS" = "404" ]; then
-  echo "✅ reader cannot read other's secret (ReadMy only) → $READER_STATUS"; ((PASS++)) || true
-else
-  echo "❌ reader cannot read other's secret (expected 403/404, got $READER_STATUS)"; ((FAIL++)) || true
+# Verify server is actually responding
+READY_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/secret" -X POST -H "Content-Type: application/json" -d '{"value":"ready-check"}' 2>/dev/null)
+if [ "$READY_STATUS" = "000" ]; then
+  echo "sirrd failed to start. Log:"
+  cat "$E2E_DIR/sirrd.log"
+  exit 1
 fi
 
-check "$(status -X POST "$BASE/orgs/$ORG_ID/secrets" \
-  -H "Authorization: Bearer $CAROL_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"key":"NOPE","value":"denied"}')" \
-  "403" "reader cannot create org secret"
-
-# ── 10: Writer can create secrets ─────────────────────────────────────────────
-curl -sf -X POST "$BASE/orgs/$ORG_ID/secrets" \
-  -H "Authorization: Bearer $BOB_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"key":"WRITER_SECRET","value":"bob-wrote-this","ttl_seconds":3600,"max_reads":100}' >/dev/null
-check "$(curl -s "$BASE/orgs/$ORG_ID/secrets/WRITER_SECRET" \
-  -H "Authorization: Bearer $BOB_KEY" | json "['value']")" \
-  "bob-wrote-this" "writer can set and read org secret"
+echo "sirrd running (pid $SIRRD_PID, port $PORT)"
+echo ""
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECOND COMPANY: Globex — full parallel setup with same secret key names
-# Proves two orgs on the same server don't interfere with each other.
+# PUBLIC MODE (default)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── 11: Globex principals + keys ─────────────────────────────────────────────
-G_OWNER_RESP=$(curl -s -X POST "$BASE/orgs/$ORG2_ID/principals" \
-  -H "Authorization: Bearer $MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"hank","role":"owner"}')
-G_OWNER_ID=$(echo "$G_OWNER_RESP" | json "['id']")
-check "$(echo "$G_OWNER_RESP" | json "['name']")" "hank" "globex: create hank (owner)"
+echo "── Public mode ──"
 
-G_WRITER_RESP=$(curl -s -X POST "$BASE/orgs/$ORG2_ID/principals" \
-  -H "Authorization: Bearer $MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"marge","role":"writer"}')
-G_WRITER_ID=$(echo "$G_WRITER_RESP" | json "['id']")
-check "$(echo "$G_WRITER_RESP" | json "['name']")" "marge" "globex: create marge (writer)"
+# Push a secret (anonymous, no token)
+PUSH_OUT=$(SIRR_SERVER="$BASE" "$SIRR" push "hello-public" --reads 3 2>&1)
+HASH=$(echo "$PUSH_OUT" | grep -oE '[a-f0-9]{64}')
+[ -n "$HASH" ] && { echo "  ✅ push returns hash"; ((PASS++)) || true; } \
+               || { echo "  ❌ push failed: $PUSH_OUT"; ((FAIL++)) || true; }
 
-G_OWNER_KEY_RESP=$(curl -s -X POST "$BASE/orgs/$ORG2_ID/principals/$G_OWNER_ID/keys" \
-  -H "Authorization: Bearer $MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"hank-key","valid_for_seconds":3600}')
-HANK_KEY=$(echo "$G_OWNER_KEY_RESP" | json "['key']")
-[ -n "$HANK_KEY" ] && { echo "✅ globex: master issues key for hank"; ((PASS++)) || true; } \
-                    || { echo "❌ globex: key creation failed: $G_OWNER_KEY_RESP"; ((FAIL++)) || true; }
+# Read it back
+GET_OUT=$(SIRR_SERVER="$BASE" "$SIRR" get "$HASH" 2>&1)
+check "$GET_OUT" "hello-public" "get returns value"
 
-G_WRITER_KEY_RESP=$(curl -s -X POST "$BASE/orgs/$ORG2_ID/principals/$G_WRITER_ID/keys" \
-  -H "Authorization: Bearer $MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"marge-key","valid_for_seconds":3600}')
-MARGE_KEY=$(echo "$G_WRITER_KEY_RESP" | json "['key']")
-[ -n "$MARGE_KEY" ] && { echo "✅ globex: master issues key for marge"; ((PASS++)) || true; } \
-                     || { echo "❌ globex: key creation failed: $G_WRITER_KEY_RESP"; ((FAIL++)) || true; }
+# Inspect (HEAD) — does NOT consume a read
+INSPECT_OUT=$(SIRR_SERVER="$BASE" "$SIRR" inspect "$HASH" 2>&1)
+check_contains "$INSPECT_OUT" "reads-remaining" "inspect shows metadata"
 
-# ── 12: Globex owner sets DB_URL — same key name as acme ─────────────────────
-curl -sf -X POST "$BASE/orgs/$ORG2_ID/secrets" \
-  -H "Authorization: Bearer $HANK_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"key":"DB_URL","value":"postgres://globex-db:5432/globex","ttl_seconds":3600,"max_reads":100}' >/dev/null
-check "$(curl -s "$BASE/orgs/$ORG2_ID/secrets/DB_URL" \
-  -H "Authorization: Bearer $HANK_KEY" | json "['value']")" \
-  "postgres://globex-db:5432/globex" "globex: DB_URL has globex value"
+# Read again (should still work — inspect didn't consume)
+GET_OUT2=$(SIRR_SERVER="$BASE" "$SIRR" get "$HASH" 2>&1)
+check "$GET_OUT2" "hello-public" "get after inspect still works"
 
-# ── 13: Acme's DB_URL is still acme's value (not overwritten) ────────────────
-check "$(curl -s "$BASE/orgs/$ORG_ID/secrets/DB_URL" \
-  -H "Authorization: Bearer $ALICE_KEY" | json "['value']")" \
-  "postgres://localhost/myapp" "acme: DB_URL still has acme value"
+# Burn it
+BURN_OUT=$(SIRR_SERVER="$BASE" "$SIRR" burn "$HASH" 2>&1)
+check_contains "$BURN_OUT" "burned" "burn succeeds"
 
-# ── 14: Cross-org isolation — principals can't reach other org ────────────────
-check "$(status "$BASE/orgs/$ORG_ID/secrets/DB_URL" \
-  -H "Authorization: Bearer $HANK_KEY")" \
-  "403" "hank (globex) cannot read acme secrets"
+# Read after burn → gone
+BURN_GET=$(SIRR_SERVER="$BASE" "$SIRR" get "$HASH" 2>&1 || true)
+check_contains "$BURN_GET" "gone" "get after burn is gone"
 
-check "$(status "$BASE/orgs/$ORG2_ID/secrets/DB_URL" \
-  -H "Authorization: Bearer $ALICE_KEY")" \
-  "403" "alice (acme) cannot read globex secrets"
+# Burn-after-read: push with --reads 1
+PUSH2_OUT=$(SIRR_SERVER="$BASE" "$SIRR" push "one-shot" --reads 1 2>&1)
+HASH2=$(echo "$PUSH2_OUT" | grep -oE '[a-f0-9]{64}')
+READ1=$(SIRR_SERVER="$BASE" "$SIRR" get "$HASH2" 2>&1)
+check "$READ1" "one-shot" "burn-after-read: first read"
+READ2_STATUS=$(status "$BASE/secret/$HASH2")
+check "$READ2_STATUS" "410" "burn-after-read: second read → 410"
 
-check "$(status -X POST "$BASE/orgs/$ORG_ID/secrets" \
-  -H "Authorization: Bearer $MARGE_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"key":"HACK","value":"nope"}')" \
-  "403" "marge (globex) cannot write to acme"
+# Push with prefix
+PUSH3_OUT=$(SIRR_SERVER="$BASE" "$SIRR" push "prefixed" --prefix "db1_" 2>&1)
+HASH3=$(echo "$PUSH3_OUT" | grep -oE 'db1_[a-f0-9]{64}')
+[ -n "$HASH3" ] && { echo "  ✅ prefix appears in hash"; ((PASS++)) || true; } \
+               || { echo "  ❌ prefix missing: $PUSH3_OUT"; ((FAIL++)) || true; }
 
-check "$(status -X POST "$BASE/orgs/$ORG2_ID/secrets" \
-  -H "Authorization: Bearer $BOB_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"key":"HACK","value":"nope"}')" \
-  "403" "bob (acme) cannot write to globex"
-
-# ── 15: Globex writer can work in her own org ─────────────────────────────────
-MARGE_SET_RESP=$(curl -s -X POST "$BASE/orgs/$ORG2_ID/secrets" \
-  -H "Authorization: Bearer $MARGE_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"key":"API_KEY","value":"globex-api-key-123","ttl_seconds":3600,"max_reads":100}')
-check "$(echo "$MARGE_SET_RESP" | json "['key']")" "API_KEY" "marge can create secret in globex"
-MARGE_READ_RAW=$(curl -s -w "\n%{http_code}" "$BASE/orgs/$ORG2_ID/secrets/API_KEY" \
-  -H "Authorization: Bearer $MARGE_KEY")
-MARGE_READ_STATUS=$(echo "$MARGE_READ_RAW" | tail -1)
-MARGE_READ_BODY=$(echo "$MARGE_READ_RAW" | head -1)
-if [ "$MARGE_READ_STATUS" = "200" ]; then
-  check "$(echo "$MARGE_READ_BODY" | json "['value']")" "globex-api-key-123" "marge can read her secret in globex"
-else
-  echo "❌ marge can read her secret in globex (HTTP $MARGE_READ_STATUS: $MARGE_READ_BODY)"; ((FAIL++)) || true
-fi
+echo ""
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SHARED TESTS (public bucket, burn-after-read, self-service keys)
+# SWITCH TO PRIVATE MODE
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── 16: Public bucket (no auth) ──────────────────────────────────────────────
-PUSH_RESP=$(curl -s -X POST "$BASE/secrets" \
-  -H "Authorization: Bearer $MASTER_KEY" \
+echo "── Private mode ──"
+
+# Switch visibility
+SIRR_ADMIN_SOCKET="$SOCKET" "$SIRRD" visibility set private >/dev/null 2>&1
+VIS_OUT=$(SIRR_ADMIN_SOCKET="$SOCKET" "$SIRRD" visibility get 2>&1)
+check_contains "$VIS_OUT" "private" "visibility set to private"
+
+# Anonymous push should fail
+ANON_PUSH_STATUS=$(status -X POST "$BASE/secret" \
   -H "Content-Type: application/json" \
-  -d '{"value":"hello-public","ttl_seconds":3600}')
-PUBLIC_ID=$(echo "$PUSH_RESP" | json "['id']")
-check "$(curl -s "$BASE/secrets/$PUBLIC_ID" | json "['value']")" \
-  "hello-public" "public dead drop: push and read"
+  -d '{"value":"should-fail"}')
+check "$ANON_PUSH_STATUS" "401" "anon push rejected in private mode"
 
-# ── 17: Burn-after-read ──────────────────────────────────────────────────────
-curl -sf -X POST "$BASE/orgs/$ORG_ID/secrets" \
-  -H "Authorization: Bearer $ALICE_KEY" \
+# Create a key
+KEY_OUT=$(SIRR_ADMIN_SOCKET="$SOCKET" "$SIRRD" keys create alice 2>&1)
+TOKEN=$(echo "$KEY_OUT" | grep -oE '[a-f0-9]{64}')
+[ -n "$TOKEN" ] && { echo "  ✅ keys create returns token"; ((PASS++)) || true; } \
+               || { echo "  ❌ keys create failed: $KEY_OUT"; ((FAIL++)) || true; }
+
+# List keys
+LIST_OUT=$(SIRR_ADMIN_SOCKET="$SOCKET" "$SIRRD" keys list 2>&1)
+check_contains "$LIST_OUT" "alice" "keys list shows alice"
+
+# Keyed push
+PUSH4_OUT=$(SIRR_SERVER="$BASE" SIRR_TOKEN="$TOKEN" "$SIRR" push "private-secret" --reads 5 2>&1)
+HASH4=$(echo "$PUSH4_OUT" | grep -oE '[a-f0-9]{64}')
+[ -n "$HASH4" ] && { echo "  ✅ keyed push succeeds"; ((PASS++)) || true; } \
+               || { echo "  ❌ keyed push failed: $PUSH4_OUT"; ((FAIL++)) || true; }
+
+# Anonymous read still works (reads are universal)
+ANON_READ=$(curl -s "$BASE/secret/$HASH4")
+check_contains "$ANON_READ" "private-secret" "anon read works in private mode"
+
+# Patch (owner only)
+PATCH_OUT=$(SIRR_SERVER="$BASE" SIRR_TOKEN="$TOKEN" "$SIRR" patch "$HASH4" "patched-value" 2>&1)
+check_contains "$PATCH_OUT" "$HASH4" "owner can patch"
+
+# Read patched value
+PATCHED_READ=$(SIRR_SERVER="$BASE" "$SIRR" get "$HASH4" 2>&1)
+check "$PATCHED_READ" "patched-value" "patched value reads back"
+
+# Audit (owner only)
+AUDIT_OUT=$(SIRR_SERVER="$BASE" SIRR_TOKEN="$TOKEN" "$SIRR" audit "$HASH4" 2>&1)
+check_contains "$AUDIT_OUT" "secret.create" "audit shows create event"
+check_contains "$AUDIT_OUT" "secret.read" "audit shows read event"
+check_contains "$AUDIT_OUT" "secret.patch" "audit shows patch event"
+
+# Audit without token → 401
+AUDIT_ANON_STATUS=$(status "$BASE/secret/$HASH4/audit")
+check "$AUDIT_ANON_STATUS" "401" "anon audit rejected"
+
+# Create second key — wrong key can't patch/burn
+KEY2_OUT=$(SIRR_ADMIN_SOCKET="$SOCKET" "$SIRRD" keys create bob 2>&1)
+TOKEN2=$(echo "$KEY2_OUT" | grep -oE '[a-f0-9]{64}')
+
+WRONG_PATCH_STATUS=$(status -X PATCH "$BASE/secret/$HASH4" \
+  -H "Authorization: Bearer $TOKEN2" \
   -H "Content-Type: application/json" \
-  -d '{"key":"BURN_E2E","value":"burnme","ttl_seconds":3600,"max_reads":1}' >/dev/null
+  -d '{"value":"hacked"}')
+check "$WRONG_PATCH_STATUS" "404" "wrong key patch → 404 (not 403)"
 
-BURN1=$(curl -s "$BASE/orgs/$ORG_ID/secrets/BURN_E2E" \
-  -H "Authorization: Bearer $ALICE_KEY" | json "['value']")
-BURN2=$(status "$BASE/orgs/$ORG_ID/secrets/BURN_E2E" \
-  -H "Authorization: Bearer $ALICE_KEY")
-check "$BURN1" "burnme" "burn-after-read: first read returns value"
-check "$BURN2" "404" "burn-after-read: second read → 404 (burned)"
+WRONG_BURN_STATUS=$(status -X DELETE "$BASE/secret/$HASH4" \
+  -H "Authorization: Bearer $TOKEN2")
+check "$WRONG_BURN_STATUS" "404" "wrong key burn → 404 (not 403)"
 
-# ── 18: Self-service key creation ─────────────────────────────────────────────
-SELF_KEY_RESP=$(curl -s -X POST "$BASE/me/keys" \
-  -H "Authorization: Bearer $ALICE_KEY" \
+# Owner burns
+BURN2_OUT=$(SIRR_SERVER="$BASE" SIRR_TOKEN="$TOKEN" "$SIRR" burn "$HASH4" 2>&1)
+check_contains "$BURN2_OUT" "burned" "owner burns own secret"
+
+# Admin: keys secrets
+SECRETS_OUT=$(SIRR_ADMIN_SOCKET="$SOCKET" "$SIRRD" keys secrets alice 2>&1)
+check_contains "$SECRETS_OUT" "count" "keys secrets shows stats"
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BOTH MODE
+# ══════════════════════════════════════════════════════════════════════════════
+
+echo "── Both mode ──"
+
+SIRR_ADMIN_SOCKET="$SOCKET" "$SIRRD" visibility set both >/dev/null 2>&1
+
+# Anonymous push works
+PUSH5_OUT=$(SIRR_SERVER="$BASE" "$SIRR" push "anon-in-both" 2>&1)
+HASH5=$(echo "$PUSH5_OUT" | grep -oE '[a-f0-9]{64}')
+[ -n "$HASH5" ] && { echo "  ✅ anon push in both mode"; ((PASS++)) || true; } \
+               || { echo "  ❌ anon push failed: $PUSH5_OUT"; ((FAIL++)) || true; }
+
+# Keyed push also works
+PUSH6_OUT=$(SIRR_SERVER="$BASE" SIRR_TOKEN="$TOKEN" "$SIRR" push "keyed-in-both" 2>&1)
+HASH6=$(echo "$PUSH6_OUT" | grep -oE '[a-f0-9]{64}')
+[ -n "$HASH6" ] && { echo "  ✅ keyed push in both mode"; ((PASS++)) || true; } \
+               || { echo "  ❌ keyed push failed: $PUSH6_OUT"; ((FAIL++)) || true; }
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NONE MODE (lockdown)
+# ══════════════════════════════════════════════════════════════════════════════
+
+echo "── None mode (lockdown) ──"
+
+SIRR_ADMIN_SOCKET="$SOCKET" "$SIRRD" visibility set none >/dev/null 2>&1
+
+LOCK_READ=$(status "$BASE/secret/$HASH5")
+check "$LOCK_READ" "503" "read → 503 in none mode"
+
+LOCK_PUSH=$(status -X POST "$BASE/secret" \
   -H "Content-Type: application/json" \
-  -d '{"name":"alice-self-key","valid_for_seconds":3600}')
-ALICE_KEY2=$(echo "$SELF_KEY_RESP" | json "['key']")
-[ -n "$ALICE_KEY2" ] && { echo "✅ alice creates her own key (self-service)"; ((PASS++)) || true; } \
-                      || { echo "❌ self-service key failed: $SELF_KEY_RESP"; ((FAIL++)) || true; }
+  -d '{"value":"nope"}')
+check "$LOCK_PUSH" "503" "push → 503 in none mode"
 
-ME_SELF=$(curl -s "$BASE/me" -H "Authorization: Bearer $ALICE_KEY2")
-check "$(echo "$ME_SELF" | json "['name']")" "alice" "self-service key authenticates as alice"
+# Recover
+SIRR_ADMIN_SOCKET="$SOCKET" "$SIRRD" visibility set public >/dev/null 2>&1
+RECOVER_READ=$(SIRR_SERVER="$BASE" "$SIRR" get "$HASH5" 2>&1)
+check "$RECOVER_READ" "anon-in-both" "read works after recovery from none"
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WEBHOOK (quick check — just verify no crash)
+# ══════════════════════════════════════════════════════════════════════════════
+
+echo "── Webhook (smoke) ──"
+
+# Create a key with a webhook URL (pointed at nothing — we just check it doesn't crash sirrd)
+SIRR_ADMIN_SOCKET="$SOCKET" "$SIRRD" visibility set private >/dev/null 2>&1
+WH_KEY_OUT=$(SIRR_ADMIN_SOCKET="$SOCKET" "$SIRRD" keys create webhook-test \
+  --webhook "http://127.0.0.1:19999/hook" 2>&1)
+WH_TOKEN=$(echo "$WH_KEY_OUT" | grep -oE '[a-f0-9]{64}')
+
+# Push with webhook key — should succeed even though webhook target is down
+WH_PUSH_OUT=$(SIRR_SERVER="$BASE" SIRR_TOKEN="$WH_TOKEN" "$SIRR" push "webhook-secret" --reads 1 2>&1)
+WH_HASH=$(echo "$WH_PUSH_OUT" | grep -oE '[a-f0-9]{64}')
+[ -n "$WH_HASH" ] && { echo "  ✅ push with webhook key (fire-and-forget, target down)"; ((PASS++)) || true; } \
+                   || { echo "  ❌ push with webhook key failed: $WH_PUSH_OUT"; ((FAIL++)) || true; }
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIN: purge + audit
+# ══════════════════════════════════════════════════════════════════════════════
+
+echo "── Admin operations ──"
+
+PURGE_OUT=$(SIRR_ADMIN_SOCKET="$SOCKET" "$SIRRD" keys purge alice --yes 2>&1)
+check_contains "$PURGE_OUT" "burned" "keys purge alice"
+
+AUDIT_ADMIN=$(SIRR_ADMIN_SOCKET="$SOCKET" "$SIRRD" audit --limit 5 2>&1)
+# Should have some events from all the operations above
+[ -n "$AUDIT_ADMIN" ] && { echo "  ✅ admin audit returns events"; ((PASS++)) || true; } \
+                       || { echo "  ❌ admin audit empty"; ((FAIL++)) || true; }
+
+# Delete keys
+SIRR_ADMIN_SOCKET="$SOCKET" "$SIRRD" keys delete alice >/dev/null 2>&1
+SIRR_ADMIN_SOCKET="$SOCKET" "$SIRRD" keys delete bob >/dev/null 2>&1
+SIRR_ADMIN_SOCKET="$SOCKET" "$SIRRD" keys delete webhook-test >/dev/null 2>&1
+
+LIST_AFTER=$(SIRR_ADMIN_SOCKET="$SOCKET" "$SIRRD" keys list 2>&1)
+check_contains "$LIST_AFTER" "no keys" "all keys deleted"
+
+echo ""
 
 # ── Results ───────────────────────────────────────────────────────────────────
-echo ""
+echo "════════════════════════════════════════"
 echo "Results: $PASS passed, $FAIL failed"
+echo "════════════════════════════════════════"
 [ $FAIL -eq 0 ] && exit 0 || exit 1

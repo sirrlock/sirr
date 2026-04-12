@@ -29,7 +29,7 @@ With ChatGPT, Copilot, Claude, or any AI coding tool:
 ```bash
 # Dead drop — push a one-time credential, get a URL back
 sirr push "postgres://user:pass@host/db" --reads 1 --ttl 1h
-# → https://sirrlock.com/secrets/a3f8...c9d1
+# → https://sirrlock.com/secret/a3f8...c9d1
 
 # Tell Claude: "analyze the schema at this URL"
 # Claude reads it via MCP → read counter hits limit → credential deleted
@@ -55,7 +55,7 @@ This isn't paranoia. This is correct threat modeling for an age where your codin
 | Burn-after-N-reads | Yes | No | No |
 | AI/MCP integration | Native | No | No |
 | Self-hosted | Yes | Yes | No |
-| Price | Free ≤100 secrets | OSS free / Enterprise $$ | $0.40/secret/month |
+| Price | Free (honor system) | OSS free / Enterprise $$ | $0.40/secret/month |
 | Operational burden | Near zero | High | Medium |
 
 ---
@@ -64,62 +64,205 @@ This isn't paranoia. This is correct threat modeling for an age where your codin
 
 ### Run the server
 
-**With a key file (recommended for production):**
-
-```bash
-# Generate the master key file once.
-openssl rand -hex 32 > master.key
-chmod 400 master.key
-
-docker run -d \
-  -p 39999:39999 \
-  -v ./sirr-data:/data \
-  -v ./master.key:/run/secrets/master.key:ro \
-  -e SIRR_MASTER_ENCRYPTION_KEY_FILE=/run/secrets/master.key \
-  ghcr.io/sirrlock/sirrd
-```
-
-Or with an environment variable (development only — visible via `docker inspect`):
+**Docker:**
 
 ```bash
 docker run -d \
-  -p 39999:39999 \
+  -p 7843:7843 \
   -v ./sirr-data:/data \
   ghcr.io/sirrlock/sirrd
 ```
 
-Or as a binary:
+**Binary:**
 
 ```bash
+# Default: public mode (anyone can push and read)
 ./sirrd serve
-# Optionally protect writes: SIRR_MASTER_API_KEY=my-key ./sirrd serve
+
+# Private mode (only API key holders can push; reads are still open)
+./sirrd serve --visibility private
+
+# Create your first API key via the admin socket
+./sirrd keys create my-key
+# → token: abc123...  (shown once, not stored)
 ```
 
-### Public dead drop (push)
+The admin socket lives at `/tmp/sirrd.sock` by default. All admin commands use it — no master API key, no network exposure.
+
+---
+
+## The Model
+
+- **Visibility** controls who can create secrets:
+  - `public` — anyone can push, anyone can read
+  - `private` — only API key holders can push; reads remain open
+  - `both` — same as private (keyed pushes create owned secrets; anonymous still allowed)
+  - `none` — lockdown: all five endpoints return 503
+- **Reads are universal** — knowing the hash IS the capability. No permission letters.
+- **Keys are credentials, period.** A valid key makes you the owner. Only owners can patch, burn, or view the audit trail of their secrets.
+- **Anonymous secrets** can be burned by anyone (public dead drops, self-service model).
+
+---
+
+## CLI Usage
+
+### `sirr` — client commands
 
 ```bash
-# Push a value, get a URL with a server-generated 256-bit hex ID
-sirr push "postgres://user:pass@host/db" --reads 1 --ttl 1h
-# → https://sirrlock.com/secrets/a3f8...c9d1
+# Push a secret, get a hash back
+sirr push "postgres://user:pass@host/db"
+sirr push "some-secret" --reads 1 --ttl 1h
+sirr push "secret" --key <api-token> --prefix db-
 
-sirr get a3f8...c9d1   # returns value
-sirr get a3f8...c9d1   # 404 — burned
+# Read a secret (consumes a read if read-limited)
+sirr get <hash>
+sirr get <hash> --json
+
+# Inspect metadata without consuming a read
+sirr inspect <hash>
+
+# View the audit trail (requires owner key)
+sirr audit <hash> --key <api-token>
+
+# Patch a secret's value (requires owner key)
+sirr patch <hash> "new-value" --key <api-token>
+
+# Burn a secret immediately
+sirr burn <hash> [--key <api-token>]
+
+# Global flags
+sirr --server http://localhost:7843 push "value"
+sirr --key <api-token> <command>
+# or: SIRR_SERVER=http://... SIRR_KEY=<token> sirr push "value"
 ```
 
-### Org team secrets (set)
+### `sirrd` — admin commands (via Unix socket)
 
 ```bash
-# Named slot in an org — requires --org or $SIRR_ORG
-sirr set DB_URL "postgres://..." --org acme --reads 5 --ttl 24h
-sirr get DB_URL --org acme         # returns value, reads remaining: 4
-sirr set DB_URL "new-value" --org acme   # 409 Conflict — duplicates rejected
+# Start the server
+sirrd serve [--visibility public|private|both|none] [--port 7843] [--socket /tmp/sirrd.sock]
 
-# Pull all org secrets into .env
-sirr pull .env --org acme
+# Change visibility at runtime (no restart needed)
+sirrd visibility set private
 
-# Run a process with org secrets injected as env vars
-sirr run --org acme -- node app.js
+# API key management
+sirrd keys create <name> [--webhook-url https://...] [--valid-after <unix>] [--valid-before <unix>]
+sirrd keys list
+sirrd keys delete <name>
+
+# View all audit events
+sirrd audit [--limit 100]
 ```
+
+---
+
+## HTTP API
+
+Five endpoints over one resource path `/secret/:hash`:
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/secret` | optional | Create a secret. Auth → owned; anonymous → dead drop. |
+| `GET` | `/secret/:hash` | none | Read value. Consumes a read. Burns if last read. |
+| `HEAD` | `/secret/:hash` | none | Inspect metadata. Does NOT consume a read. |
+| `PATCH` | `/secret/:hash` | required (owner) | Update value, reset TTL / read count. |
+| `DELETE` | `/secret/:hash` | owner or anonymous | Burn immediately. |
+| `GET` | `/secret/:hash/audit` | required (owner) | Full event history for this secret. |
+
+### Create a secret
+
+```http
+POST /secret
+Authorization: Bearer <api-key>   (optional)
+Content-Type: application/json
+
+{
+  "value": "postgres://...",
+  "ttl_seconds": 3600,
+  "reads": 1,
+  "prefix": "db-"
+}
+```
+
+```json
+// 201
+{
+  "hash": "db-a3f8c9d1...",
+  "url": "https://sirrlock.com/secret/db-a3f8c9d1...",
+  "expires_at": 1700003600,
+  "reads_remaining": 1,
+  "owned": true
+}
+```
+
+### Read a secret
+
+```http
+GET /secret/:hash
+Accept: application/json   (optional; plain text returned by default)
+```
+
+```json
+// 200: {"value": "postgres://..."}
+// 410: {"error": "secret is gone"}   (burned, expired, or not found)
+```
+
+### Inspect metadata (HEAD)
+
+```
+HEAD /secret/:hash
+
+// Response headers (200 if active, 410 if gone):
+X-Sirr-Created: 2024-01-15T10:00:00Z
+X-Sirr-TTL-Expires: 2024-01-15T11:00:00Z
+X-Sirr-Reads-Remaining: 3
+X-Sirr-Owned: true
+```
+
+### Audit trail
+
+```http
+GET /secret/:hash/audit
+Authorization: Bearer <owner-key>
+```
+
+```json
+// 200
+{
+  "hash": "db-a3f8c9d1...",
+  "created_at": 1700000000,
+  "events": [
+    {"type": "secret.create", "at": 1700000000, "ip": ""},
+    {"type": "secret.read",   "at": 1700001234, "ip": ""}
+  ]
+}
+// 404 if not found or wrong owner key
+```
+
+---
+
+## Webhooks
+
+Each API key can have an optional `webhook_url`. When set, the server POSTs a JSON event to that URL after each lifecycle event for secrets owned by that key. Fire-and-forget — the webhook never blocks the HTTP response.
+
+```bash
+sirrd keys create my-key --webhook-url https://hooks.example.com/sirr
+```
+
+Event payload:
+
+```json
+{
+  "type": "secret.created",
+  "hash": "db-a3f8c9d1...",
+  "at": 1700000000,
+  "ip": ""
+}
+```
+
+Event types: `secret.created`, `secret.read`, `secret.patched`, `secret.burned`.
+
+Anonymous secrets never fire webhooks — there is no key to attach a URL to.
 
 ---
 
@@ -141,8 +284,8 @@ npm install -g @sirrlock/mcp
     "sirr": {
       "command": "sirr-mcp",
       "env": {
-        "SIRR_SERVER": "http://localhost:39999",
-        "SIRR_MASTER_API_KEY": "your-api-key"
+        "SIRR_SERVER": "http://localhost:7843",
+        "SIRR_KEY": "your-api-key"
       }
     }
   }
@@ -154,9 +297,6 @@ Once connected:
 ```
 You: "Push my Stripe test key to sirr, one read only, 30 minutes"
 Claude: [calls push_secret("sk_test_...", reads=1, ttl=1800)] → returns URL
-
-You: "Store DB_URL in the acme org"
-Claude: [calls set_secret("DB_URL", "postgres://...", org="acme")]
 ```
 
 ### Python AI Agents (LangChain, CrewAI, AutoGen)
@@ -164,11 +304,11 @@ Claude: [calls set_secret("DB_URL", "postgres://...", org="acme")]
 ```python
 from sirr import SirrClient
 
-sirr = SirrClient(server="https://sirrlock.com", api_key=os.environ.get("SIRR_MASTER_API_KEY"))
+sirr = SirrClient(server="https://sirrlock.com", api_key=os.environ.get("SIRR_KEY"))
 
-# Dead drop — push a value, get back an ID
+# Dead drop — push a value, get back a hash
 result = sirr.push(connection_string, reads=1, ttl=3600)
-# result.id → "a3f8...c9d1", result.url → "https://sirrlock.com/secrets/a3f8...c9d1"
+# result.hash, result.url
 
 # Agent reads it — credential is gone regardless of what the agent logs or retains
 ```
@@ -178,215 +318,59 @@ result = sirr.push(connection_string, reads=1, ttl=3600)
 ```yaml
 # GitHub Actions: deploy token that can only be used once
 - run: |
-    URL=$(sirr push "${{ secrets.DEPLOY_TOKEN }}" --reads 1)
-    DEPLOY_TOKEN=$(sirr get "$URL") ./deploy.sh
+    HASH=$(sirr push "${{ secrets.DEPLOY_TOKEN }}" --reads 1 --key "${{ secrets.SIRR_KEY }}")
+    DEPLOY_TOKEN=$(sirr get "$HASH") ./deploy.sh
     # Token is gone after one read
 ```
 
 ---
 
-## Full Usage
-
-```bash
-# Public dead drop — value only, returns {id, url}
-sirr push <value> [--ttl <duration>] [--reads <n>]
-
-# Org named secrets — requires --org or $SIRR_ORG
-sirr set KEY VALUE [--org <org>] [--ttl <duration>] [--reads <n>]
-
-# Retrieve
-sirr get <id-or-key> [--org <org>]         # stdout, burns if read limit hit
-sirr pull .env [--org <org>]               # pull all secrets into .env
-sirr run [--org <org>] -- <command>        # inject all secrets as env vars
-
-# Manage
-sirr list [--org <org>]                    # metadata only, no values shown
-sirr delete <id-or-key> [--org <org>]
-sirr prune                                 # delete all expired secrets now
-sirr audit [--key <key>] [--org <org>]     # audit log (--key filters by secret)
-sirr me                                    # show current identity (works anonymously)
-
-# Key rotation (offline — stop the server first)
-sirr rotate                                # re-encrypts all records with new key
-
-# Global flags
-sirr -v                                    # print version
-sirr --org <org> <command>                 # or set $SIRR_ORG
-```
-
-TTL format: `30s`, `5m`, `2h`, `7d`, `30d`
-
----
-
-## Multi-Tenant Mode
-
-Sirr supports org-scoped secrets with role-based access control. Each org has principals (identities) with named API keys and roles that control permissions.
-
-### Bootstrap
-
-```bash
-# Auto-create a default org + admin principal + temporary keys on first boot:
-sirrd serve --init
-# Or: SIRR_AUTOINIT=true sirrd serve
-```
-
-The bootstrap prints org ID, principal ID, and two temporary API keys (valid 30 minutes). Use those keys to create permanent ones.
-
-### Org management (requires master key)
-
-```bash
-export SIRR_MASTER_API_KEY=<master-key>
-
-sirr orgs create "My Team"
-sirr orgs list
-sirr principals create <org_id> alice --role writer
-sirr me create-key --name deploy-key    # using a principal key
-```
-
-### Using org-scoped secrets
-
-```bash
-# With a principal API key:
-export SIRR_MASTER_API_KEY=<principal-key>
-export SIRR_ORG=<org_id>
-
-sirr set DB_URL "postgres://..."           # named slot (duplicates → 409 Conflict)
-sirr get DB_URL                            # retrieve by name
-sirr list                                  # list org secrets
-```
-
-### Built-in roles
-
-| Role | Permissions | Description |
-|------|-------------|-------------|
-| reader | `rla` | Read own secrets, list own, read own account |
-| writer | `rlcpdam` | Read/list/create/patch/delete own secrets + manage account |
-| admin | `rRlLcCpPaAmMdD` | Full org access (all secrets, manage principals/roles) |
-| owner | `rRlLcCpPaAmMSdD` | Admin + SirrAdmin (can create/delete orgs) |
-
-Custom roles can be created per-org with any combination of the 15 permission bits.
-
-### Disabling the public bucket
-
-Set `SIRR_ENABLE_PUBLIC_BUCKET=false` to serve only org-scoped routes.
-
----
-
-## HTTP API
-
-**Public routes** (no auth required):
-
-### `GET /secrets/:id`
-Retrieves value by server-generated 256-bit hex ID. Increments read counter. Burns record if read limit reached.
-```json
-{ "id": "a3f8...c9d1", "value": "postgres://..." }
-// 404 if expired, burned, or not found
-```
-
-### `HEAD /secrets/:id`
-Returns metadata via headers. Does NOT increment read counter.
-```
-X-Sirr-Read-Count: 3
-X-Sirr-Reads-Remaining: 7    (or "unlimited")
-X-Sirr-Created-At: 1700000000
-X-Sirr-Expires-At: 1700003600  (if TTL set)
-X-Sirr-Status: active
-// 200 or 404 (not found)
-```
-
-### `GET /health` → `{ "status": "ok" }`
-
-**Protected routes** (require `Authorization: Bearer <SIRR_MASTER_API_KEY>` if `SIRR_MASTER_API_KEY` is set):
-
-### `POST /secrets`
-Public dead drop. Accepts value only — no key field. Server generates a 256-bit hex ID.
-```json
-{ "value": "postgres://...", "ttl_seconds": 3600, "max_reads": 1 }
-// 201: { "id": "a3f8...c9d1", "url": "https://sirrlock.com/secrets/a3f8...c9d1" }
-// 402: license required (>100 secrets without SIRR_LICENSE_KEY)
-```
-
-### `POST /orgs/{org}/secrets`
-Org-scoped named secret. Rejects duplicates.
-```json
-{ "key": "DB_URL", "value": "postgres://...", "ttl_seconds": 3600, "max_reads": 5 }
-// 201: { "key": "DB_URL" }
-// 409: Conflict — duplicate key (+ secret.create_rejected audit event)
-// 402: license required
-```
-
-### `GET /secrets`
-Returns metadata only — values are never included in list responses.
-```json
-{
-  "secrets": [
-    { "id": "a3f8...c9d1", "created_at": 1700000000, "expires_at": 1700003600, "max_reads": 1, "read_count": 0 }
-  ]
-}
-```
-
-### `DELETE /secrets/:id` → `{ "deleted": true }`
-### `POST /prune` → `{ "pruned": 3 }`
-
----
-
 ## Configuration
+
+### Server (`sirrd`)
 
 | Variable | Default | Description |
 |---|---|---|
-| `SIRR_MASTER_API_KEY` | auto-generated | Protects all authenticated endpoints. Printed at startup if not set — copy and persist it. |
-| `SIRR_LICENSE_KEY` | — | Required for >100 active secrets |
-| `SIRR_PORT` | `39999` | HTTP listen port |
+| `SIRR_VISIBILITY` | `public` | Starting visibility: `public`, `private`, `both`, or `none` |
+| `SIRR_PORT` | `7843` | HTTP listen port |
 | `SIRR_HOST` | `0.0.0.0` | Bind address |
 | `SIRR_DATA_DIR` | platform default¹ | Storage directory |
-| `SIRR_CORS_ORIGINS` | `*` (all) | Comma-separated allowed origins for management endpoints |
+| `SIRR_ADMIN_SOCKET` | `/tmp/sirrd.sock` | Unix domain socket path for admin commands |
+| `SIRR_RETENTION_DAYS` | `30` | Days to keep tombstones before pruning |
 | `SIRR_LOG_LEVEL` | `info` | `trace` / `debug` / `info` / `warn` / `error` |
-| `SIRR_RATE_LIMIT_PER_SECOND` | `10` | Per-IP request rate (steady-state, all routes) |
-| `SIRR_RATE_LIMIT_BURST` | `30` | Per-IP burst allowance |
-| `SIRR_NO_BANNER` | `0` | Set to `1` to suppress the startup banner |
-| `SIRR_NO_SECURITY_BANNER` | `0` | Set to `1` to suppress the auto-generated key notice |
-| `SIRR_ENABLE_PUBLIC_BUCKET` | `true` | Set to `false` to disable legacy `/secrets` routes |
-| `SIRR_AUTOINIT` | `false` | Set to `true` to auto-create default org on first boot |
 
-**CORS design note:** sirrd is a backend service, not a browser API. `GET /secrets/{key}` deliberately returns **no** `Access-Control-Allow-Origin` header — browsers block cross-origin reads of secret values by design, regardless of `SIRR_CORS_ORIGINS`. Management endpoints (create, list, delete, keys) do respect `SIRR_CORS_ORIGINS` so a trusted admin UI on a different origin can talk to them. If you need browser clients to read secrets, run them on the same origin as sirrd or proxy through your own backend.
-
-One of `SIRR_MASTER_ENCRYPTION_KEY_FILE` or `SIRR_MASTER_ENCRYPTION_KEY` is required. If both are set, the file takes precedence. File-based key delivery is recommended for production because environment variables are visible via `docker inspect` and `/proc`.
-
-**CLI / client variables:**
+### Client (`sirr`)
 
 | Variable | Default | Description |
 |---|---|---|
 | `SIRR_SERVER` | `https://sirrlock.com` | Server base URL |
-| `SIRR_MASTER_API_KEY` | — | Same value as server's `SIRR_MASTER_API_KEY` (for write ops) |
-| `SIRR_ORG` | — | Default org for `set`/`get`/`list` commands (avoids `--org` flag) |
+| `SIRR_KEY` | — | Bearer API token for authenticated operations |
 
-**Key rotation variables** (used by `sirr rotate`):
-
-| Variable | Description |
-|---|---|
-| `SIRR_NEW_MASTER_KEY_FILE` | Path to file containing the new master key |
-| `SIRR_NEW_MASTER_KEY` | New master key value (prefer `_FILE`) |
-
-¹ `~/.local/share/sirr/` (Linux), `~/Library/Application Support/sirr/` (macOS), `%APPDATA%\sirr\` (Windows). Docker: mount `/data` and set `SIRR_DATA_DIR=/data`.
+¹ `~/.local/share/sirr/` (Linux), `~/Library/Application Support/sirr/` (macOS). Docker: mount `/data` and set `SIRR_DATA_DIR=/data`.
 
 ---
 
 ## Architecture
 
 ```
-CLI / Node SDK / Python SDK / .NET SDK / MCP Server
-              ↓  HTTP (optional API key for writes)
-         axum REST API (Rust)
+sirr CLI / Node SDK / Python SDK / .NET SDK / MCP Server
+              ↓  HTTP (optional Bearer token for owned secrets)
+         axum REST API (Rust) — 5 endpoints over /secret/:hash
               ↓
      redb embedded database (sirr.db)
               ↓
    ChaCha20Poly1305 encrypted values
    (key = random 32 bytes in sirr.key)
+
+sirrd CLI ←→ Unix domain socket (/tmp/sirrd.sock)
+                ↓ admin commands
+              Store (keys, visibility, audit)
 ```
 
 - `sirr.key` — random 32-byte encryption key, generated on first run, stored beside `sirr.db`
 - Per-record random 12-byte nonce; value field is encrypted, metadata is not
-- Reads are public (no auth). Writes optionally protected by `SIRR_MASTER_API_KEY`
+- Reads are universal (no auth). Owned operations require the owner key.
+- Admin authenticates via filesystem permissions on the Unix domain socket — no master API key.
 
 ---
 
@@ -394,32 +378,25 @@ CLI / Node SDK / Python SDK / .NET SDK / MCP Server
 
 **Business Source License 1.1**
 
+Honor-system licensing. No enforcement code. No license server calls. The server runs at any scale — the license is a matter of integrity.
+
 | | |
 |---|---|
-| Solo (free) | 1 org, 3 principals, unlimited secrets |
-| Team | 5 orgs, 25 principals |
-| Business | Unlimited orgs and principals |
-| Free | All non-production use (dev, staging, CI) |
+| Free | All use up to whatever you need |
+| Commercial | License available at [sirrlock.com/pricing](https://sirrlock.com/pricing) |
 | Source available | Forks and modifications permitted |
 | Converts to Apache 2.0 | **February 20, 2028** |
-
-License keys at [sirrlock.com/pricing](https://sirrlock.com/pricing).
-
-```bash
-SIRR_LICENSE_KEY=sirr_lic_... ./sirr serve
-```
 
 ---
 
 ## Roadmap
 
 - [ ] Web UI
-- [x] Webhooks on expiry / burn
-- [x] Team namespaces (multi-tenant orgs)
+- [x] Webhooks on lifecycle events (per-key, fire-and-forget)
 - [x] Audit log
 - [ ] Kubernetes operator
 - [ ] Terraform provider
-- [x] Patchable secrets (update value without changing key)
+- [x] Patchable secrets (update value without changing hash)
 - [ ] Secret versioning
 
 ---
@@ -438,4 +415,3 @@ SIRR_LICENSE_KEY=sirr_lic_... ./sirr serve
 ---
 
 *Secrets that whisper and disappear.*
-
