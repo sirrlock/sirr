@@ -28,6 +28,7 @@ fn make_server(vis: Visibility) -> (TestServer, Arc<Store>) {
         encryption_key: key,
         visibility,
         webhook_sender: WebhookSender::new(),
+        base_url: "http://test".to_string(),
     };
     (TestServer::new(router(state)), store)
 }
@@ -117,6 +118,7 @@ async fn visibility_transition() {
         encryption_key: key,
         visibility: visibility.clone(),
         webhook_sender: WebhookSender::new(),
+        base_url: "http://test".to_string(),
     };
     let server = TestServer::new(router(state));
 
@@ -158,6 +160,7 @@ async fn lockdown_and_recovery() {
         encryption_key: key,
         visibility: visibility.clone(),
         webhook_sender: WebhookSender::new(),
+        base_url: "http://test".to_string(),
     };
     let server = TestServer::new(router(state));
 

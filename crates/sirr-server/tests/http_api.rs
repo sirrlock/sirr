@@ -37,6 +37,7 @@ fn setup_with_visibility(vis: Visibility) -> Setup {
         encryption_key: key,
         visibility,
         webhook_sender: WebhookSender::new(),
+        base_url: "http://test".to_string(),
     };
     let server = TestServer::new(router(state));
     Setup { server, store }

@@ -12,6 +12,7 @@ pub struct ServerConfig {
     pub admin_socket: PathBuf,
     pub visibility: Visibility,
     pub retention_days: i64,
+    pub base_url: String,
 }
 
 // ── Schema version ────────────────────────────────────────────────────────────
@@ -94,6 +95,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         encryption_key: Arc::new(encryption_key),
         visibility: visibility.clone(),
         webhook_sender: crate::webhooks::WebhookSender::new(),
+        base_url: config.base_url.clone(),
     };
     let app = router(state);
 

@@ -36,6 +36,10 @@ enum Commands {
         /// Retention period in days for burned secrets and their audit events (default: 30).
         #[arg(long, default_value = "30")]
         retention_days: i64,
+        /// Base URL for secret URLs in responses (e.g. https://sirr.sirrlock.com).
+        /// Defaults to http://<bind-address>.
+        #[arg(long)]
+        base_url: Option<String>,
     },
     /// Get or set visibility mode
     Visibility {
@@ -179,10 +183,12 @@ async fn main() -> anyhow::Result<()> {
             admin_socket,
             visibility,
             retention_days,
+            base_url,
         } => {
             let vis: Visibility = visibility
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid visibility: {e}"))?;
+            let resolved_base_url = base_url.unwrap_or_else(|| format!("http://{bind}"));
             let config = ServerConfig {
                 bind_addr: bind
                     .parse()
@@ -191,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
                 admin_socket: PathBuf::from(admin_socket.unwrap_or_else(default_socket_path)),
                 visibility: vis,
                 retention_days,
+                base_url: resolved_base_url,
             };
             sirr_server::server::run(config).await?;
         }
@@ -426,6 +433,7 @@ mod tests {
             admin_socket: None,
             visibility: "public".to_string(),
             retention_days: 30,
+            base_url: None,
         };
         assert!(build_admin_request(&cmd).is_none());
     }
