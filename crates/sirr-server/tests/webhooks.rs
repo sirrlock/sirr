@@ -23,6 +23,7 @@ fn make_state(store: Arc<Store>) -> AppState {
         encryption_key: key,
         visibility,
         webhook_sender: WebhookSender::new(),
+        base_url: "http://test".to_string(),
     }
 }
 

@@ -54,26 +54,24 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Patch workspace version
+        shell: bash
+        run: sed -i.bak "s/^version = \"[^\"]*\"/version = \"${VERSION}\"/" Cargo.toml && rm -f Cargo.toml.bak
+
       - name: Install cross
         if: matrix.use_cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build (cross)
         if: matrix.use_cross
-        env:
-          SIRR_BUILD_VERSION: ${{ env.VERSION }}
         run: cross build --release --bin sirrd --bin sirr --target ${{ matrix.target }}
 
       - name: Build (cargo) — macOS (both binaries)
         if: "!matrix.use_cross && runner.os == 'macOS'"
-        env:
-          SIRR_BUILD_VERSION: ${{ env.VERSION }}
         run: cargo build --release --bin sirrd --bin sirr --target ${{ matrix.target }}
 
       - name: Build (cargo) — Windows (sirr CLI only; sirrd requires Unix socket)
         if: "!matrix.use_cross && runner.os == 'Windows'"
-        env:
-          SIRR_BUILD_VERSION: ${{ env.VERSION }}
         run: cargo build --release --bin sirr --target ${{ matrix.target }}
 
       - name: Package (Unix)

@@ -41,6 +41,7 @@ pub struct AppState {
     pub encryption_key: Arc<EncryptionKey>,
     pub visibility: Arc<tokio::sync::RwLock<Visibility>>,
     pub webhook_sender: WebhookSender,
+    pub base_url: String,
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -292,7 +293,7 @@ pub async fn create_secret(
         now,
     );
 
-    let url = format!("http://localhost:7843/secret/{hash}");
+    let url = format!("{}/secret/{hash}", state.base_url);
     (
         StatusCode::CREATED,
         Json(CreateResponse {
