@@ -561,6 +561,18 @@ impl Store {
             cfg.insert(CFG_AUDIT_COUNTER, Self::encode(&id)?.as_slice())?;
         }
         txn.commit()?;
+
+        // Live audit: logged at info level, visible with --verbose.
+        tracing::info!(
+            target: "sirr_server::store::db",
+            id = id,
+            action = %event.action,
+            hash = event.hash.as_deref().unwrap_or("-"),
+            key_id = event.key_id.as_deref().unwrap_or("-"),
+            success = event.success,
+            "audit"
+        );
+
         Ok(id)
     }
 

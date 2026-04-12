@@ -13,6 +13,7 @@ pub struct ServerConfig {
     pub visibility: Visibility,
     pub retention_days: i64,
     pub base_url: String,
+    pub verbose: bool,
 }
 
 // ── Schema version ────────────────────────────────────────────────────────────
@@ -58,8 +59,17 @@ fn bootstrap(store: &Store) -> anyhow::Result<()> {
 // ── run() ─────────────────────────────────────────────────────────────────────
 
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
-    // 1. Init tracing.
-    tracing_subscriber::fmt::init();
+    // 1. Init tracing. When --verbose, include audit events (info level).
+    {
+        use tracing_subscriber::EnvFilter;
+        let filter = if config.verbose {
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+        } else {
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,sirr_server::store::db=warn"))
+        };
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 
     // 2. Load or generate the encryption key.
     std::fs::create_dir_all(&config.data_dir)?;
@@ -111,6 +121,9 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     eprintln!("  sirrd v{version}");
     eprintln!("  listening on http://{}", config.bind_addr);
     eprintln!("  visibility:  {}", config.visibility);
+    if config.verbose {
+        eprintln!("  verbose:     on (live audit events)");
+    }
     eprintln!();
     eprintln!("  Tip: point the CLI at this server with:");
     eprintln!("    export SIRR_SERVER=http://{}", config.bind_addr);

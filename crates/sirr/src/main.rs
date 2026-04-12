@@ -59,9 +59,11 @@ enum Commands {
     /// Push a new secret (returns URL)
     Push {
         value: String,
-        #[arg(long)]
+        /// Time-to-live (e.g. 1h, 30m, 7d). Default: 1h
+        #[arg(long, default_value = "1h")]
         ttl: Option<String>,
-        #[arg(long)]
+        /// Max reads before auto-burn. Default: 1
+        #[arg(long, default_value = "1")]
         reads: Option<u32>,
         #[arg(long)]
         prefix: Option<String>,

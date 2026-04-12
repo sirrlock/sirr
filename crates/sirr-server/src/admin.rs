@@ -43,6 +43,9 @@ pub enum AdminRequest {
         since: Option<i64>,
         until: Option<i64>,
         limit: Option<usize>,
+        /// Filter by key name. When set, only events for this key are returned
+        /// and hashes are shown unmasked.
+        key_name: Option<String>,
     },
 }
 
@@ -62,6 +65,33 @@ impl AdminResponse {
         Self::Error {
             message: msg.into(),
         }
+    }
+}
+
+// ── Masking ───────────────────────────────────────────────────────────────────
+
+/// Mask a string value for audit output. Shows first 4 and last 4 characters,
+/// with `…` in between. Strings shorter than 12 chars show first 3 + `…`.
+/// When `unmask` is true, returns the full value.
+fn mask_value(s: &str, unmask: bool) -> String {
+    if unmask {
+        return s.to_owned();
+    }
+    let len = s.len();
+    if len <= 8 {
+        // Too short to meaningfully mask — show first 3 chars only.
+        let show = len.min(3);
+        format!("{}…", &s[..show])
+    } else {
+        format!("{}…{}", &s[..4], &s[len - 4..])
+    }
+}
+
+/// Mask an optional string, preserving `None` as JSON null.
+fn mask_optional(s: Option<&str>, unmask: bool) -> Value {
+    match s {
+        Some(v) => Value::String(mask_value(v, unmask)),
+        None => Value::Null,
     }
 }
 
@@ -248,15 +278,28 @@ async fn dispatch(req: AdminRequest, store: &Store, visibility: &VisibilityLock)
             since,
             until,
             limit,
+            key_name,
         } => {
+            // If --key was provided, resolve name → key_id for filtering + unmasking.
+            let owner_key_id = match &key_name {
+                Some(name) => match store.find_key_by_name(name) {
+                    Ok(Some(k)) => Some(k.id),
+                    Ok(None) => return AdminResponse::err(format!("key not found: {name}")),
+                    Err(e) => return AdminResponse::err(e.to_string()),
+                },
+                None => None,
+            };
+
             let query = AuditQuery {
                 since,
                 until,
                 limit: limit.unwrap_or(50),
+                key_id: owner_key_id.clone(),
                 ..Default::default()
             };
             match store.query_audit(&query) {
                 Ok(events) => {
+                    let unmask = owner_key_id.is_some();
                     let arr: Vec<Value> = events
                         .into_iter()
                         .map(|ev| {
@@ -264,8 +307,8 @@ async fn dispatch(req: AdminRequest, store: &Store, visibility: &VisibilityLock)
                                 "id":        ev.id,
                                 "timestamp": ev.timestamp,
                                 "action":    ev.action,
-                                "key_id":    ev.key_id,
-                                "hash":      ev.hash,
+                                "key_id":    mask_optional(ev.key_id.as_deref(), unmask),
+                                "hash":      mask_optional(ev.hash.as_deref(), unmask),
                                 "source_ip": ev.source_ip,
                                 "success":   ev.success,
                                 "detail":    ev.detail,
@@ -277,5 +320,57 @@ async fn dispatch(req: AdminRequest, store: &Store, visibility: &VisibilityLock)
                 Err(e) => AdminResponse::err(e.to_string()),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_long_hash() {
+        assert_eq!(mask_value("abcdef123456789xyz", false), "abcd…9xyz");
+    }
+
+    #[test]
+    fn mask_short_string() {
+        assert_eq!(mask_value("abc", false), "abc…");
+    }
+
+    #[test]
+    fn mask_exactly_eight_chars() {
+        assert_eq!(mask_value("12345678", false), "123…");
+    }
+
+    #[test]
+    fn mask_nine_chars_shows_ends() {
+        assert_eq!(mask_value("123456789", false), "1234…6789");
+    }
+
+    #[test]
+    fn unmask_returns_full() {
+        assert_eq!(mask_value("abcdef123456789xyz", true), "abcdef123456789xyz");
+    }
+
+    #[test]
+    fn mask_optional_none_is_null() {
+        assert_eq!(mask_optional(None, false), Value::Null);
+        assert_eq!(mask_optional(None, true), Value::Null);
+    }
+
+    #[test]
+    fn mask_optional_some_masks() {
+        assert_eq!(
+            mask_optional(Some("abcdef123456"), false),
+            Value::String("abcd…3456".to_string())
+        );
+    }
+
+    #[test]
+    fn mask_optional_some_unmasks() {
+        assert_eq!(
+            mask_optional(Some("abcdef123456"), true),
+            Value::String("abcdef123456".to_string())
+        );
     }
 }
