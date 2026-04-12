@@ -16,7 +16,7 @@ type VisibilityLock = Arc<tokio::sync::RwLock<Visibility>>;
 
 // ── Wire types ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum AdminRequest {
     VisibilityGet,
@@ -46,7 +46,7 @@ pub enum AdminRequest {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum AdminResponse {
     Ok { data: Value },

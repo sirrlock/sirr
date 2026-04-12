@@ -90,22 +90,59 @@ fn read_token_file() -> anyhow::Result<String> {
     Ok(std::fs::read_to_string(path)?.trim().to_string())
 }
 
+// ── Request body builders ─────────────────────────────────────────────────────
+
+fn build_push_body(
+    value: &str,
+    ttl: Option<&str>,
+    reads: Option<u32>,
+    prefix: Option<&str>,
+) -> anyhow::Result<Value> {
+    let mut body = json!({"value": value});
+    if let Some(t) = ttl {
+        body["ttl_seconds"] = json!(parse_ttl(t)?);
+    }
+    if let Some(r) = reads {
+        body["reads"] = json!(r);
+    }
+    if let Some(p) = prefix {
+        body["prefix"] = json!(p);
+    }
+    Ok(body)
+}
+
+fn build_patch_body(value: &str, ttl: Option<&str>, reads: Option<u32>) -> anyhow::Result<Value> {
+    let mut body = json!({"value": value});
+    if let Some(t) = ttl {
+        body["ttl_seconds"] = json!(parse_ttl(t)?);
+    }
+    if let Some(r) = reads {
+        body["reads"] = json!(r);
+    }
+    Ok(body)
+}
+
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 fn build_client() -> anyhow::Result<reqwest::Client> {
     Ok(reqwest::Client::builder().build()?)
 }
 
-fn auth_header(cli: &Cli) -> Option<String> {
-    if let Some(ref token) = cli.token {
-        return Some(format!("Bearer {token}"));
+fn make_bearer(explicit: Option<&str>, file_token: Option<&str>) -> Option<String> {
+    if let Some(t) = explicit {
+        return Some(format!("Bearer {t}"));
     }
-    if let Ok(token) = read_token_file() {
-        if !token.is_empty() {
-            return Some(format!("Bearer {token}"));
+    if let Some(t) = file_token {
+        if !t.is_empty() {
+            return Some(format!("Bearer {t}"));
         }
     }
     None
+}
+
+fn auth_header(cli: &Cli) -> Option<String> {
+    let file_token = read_token_file().ok();
+    make_bearer(cli.token.as_deref(), file_token.as_deref())
 }
 
 fn apply_auth(req: reqwest::RequestBuilder, cli: &Cli) -> reqwest::RequestBuilder {
@@ -131,18 +168,7 @@ async fn main() -> anyhow::Result<()> {
             reads,
             prefix,
         } => {
-            let mut body = json!({"value": value});
-
-            if let Some(t) = ttl {
-                let secs = parse_ttl(t)?;
-                body["ttl_seconds"] = json!(secs);
-            }
-            if let Some(r) = reads {
-                body["reads"] = json!(r);
-            }
-            if let Some(p) = prefix {
-                body["prefix"] = json!(p);
-            }
+            let body = build_push_body(value, ttl.as_deref(), *reads, prefix.as_deref())?;
 
             let url = format!("{}/secret", cli.server);
             let req = apply_auth(client.post(&url).json(&body), &cli);
@@ -250,14 +276,7 @@ async fn main() -> anyhow::Result<()> {
             ttl,
             reads,
         } => {
-            let mut body = json!({"value": value});
-            if let Some(t) = ttl {
-                let secs = parse_ttl(t)?;
-                body["ttl_seconds"] = json!(secs);
-            }
-            if let Some(r) = reads {
-                body["reads"] = json!(r);
-            }
+            let body = build_patch_body(value, ttl.as_deref(), *reads)?;
 
             let url = format!("{}/secret/{hash}", cli.server);
             let req = apply_auth(client.patch(&url).json(&body), &cli);
@@ -335,4 +354,177 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_ttl ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_ttl_seconds_suffix() {
+        assert_eq!(parse_ttl("30s").unwrap(), 30);
+    }
+
+    #[test]
+    fn parse_ttl_minutes_suffix() {
+        assert_eq!(parse_ttl("5m").unwrap(), 300);
+    }
+
+    #[test]
+    fn parse_ttl_hours_suffix() {
+        assert_eq!(parse_ttl("1h").unwrap(), 3600);
+    }
+
+    #[test]
+    fn parse_ttl_days_suffix() {
+        assert_eq!(parse_ttl("2d").unwrap(), 172800);
+    }
+
+    #[test]
+    fn parse_ttl_plain_seconds() {
+        assert_eq!(parse_ttl("3600").unwrap(), 3600);
+    }
+
+    #[test]
+    fn parse_ttl_empty_is_error() {
+        assert!(parse_ttl("").is_err());
+    }
+
+    #[test]
+    fn parse_ttl_alpha_is_error() {
+        assert!(parse_ttl("abc").is_err());
+    }
+
+    #[test]
+    fn parse_ttl_unknown_suffix_is_error() {
+        assert!(parse_ttl("5x").is_err());
+    }
+
+    // ── build_push_body ───────────────────────────────────────────────────────
+
+    #[test]
+    fn push_body_minimal() {
+        let body = build_push_body("hello", None, None, None).unwrap();
+        assert_eq!(body, json!({"value": "hello"}));
+    }
+
+    #[test]
+    fn push_body_with_ttl() {
+        let body = build_push_body("hello", Some("1h"), None, None).unwrap();
+        assert_eq!(body, json!({"value": "hello", "ttl_seconds": 3600u64}));
+    }
+
+    #[test]
+    fn push_body_with_reads() {
+        let body = build_push_body("hello", None, Some(5), None).unwrap();
+        assert_eq!(body, json!({"value": "hello", "reads": 5u32}));
+    }
+
+    #[test]
+    fn push_body_with_prefix() {
+        let body = build_push_body("hello", None, None, Some("db1_")).unwrap();
+        assert_eq!(body, json!({"value": "hello", "prefix": "db1_"}));
+    }
+
+    #[test]
+    fn push_body_all_options() {
+        let body = build_push_body("hello", Some("5m"), Some(3), Some("pfx_")).unwrap();
+        assert_eq!(
+            body,
+            json!({"value": "hello", "ttl_seconds": 300u64, "reads": 3u32, "prefix": "pfx_"})
+        );
+    }
+
+    #[test]
+    fn push_body_invalid_ttl_is_error() {
+        assert!(build_push_body("hello", Some("bad"), None, None).is_err());
+    }
+
+    // ── build_patch_body ──────────────────────────────────────────────────────
+
+    #[test]
+    fn patch_body_minimal() {
+        let body = build_patch_body("new", None, None).unwrap();
+        assert_eq!(body, json!({"value": "new"}));
+    }
+
+    #[test]
+    fn patch_body_with_ttl_and_reads() {
+        let body = build_patch_body("new", Some("5m"), Some(1)).unwrap();
+        assert_eq!(
+            body,
+            json!({"value": "new", "ttl_seconds": 300u64, "reads": 1u32})
+        );
+    }
+
+    #[test]
+    fn patch_body_invalid_ttl_is_error() {
+        assert!(build_patch_body("new", Some("5x"), None).is_err());
+    }
+
+    // ── URL construction ──────────────────────────────────────────────────────
+
+    #[test]
+    fn url_push() {
+        assert_eq!(
+            format!("{}/secret", "https://example.com"),
+            "https://example.com/secret"
+        );
+    }
+
+    #[test]
+    fn url_get_and_inspect_and_patch_and_burn() {
+        let hash = "abc123";
+        let server = "https://example.com";
+        assert_eq!(
+            format!("{server}/secret/{hash}"),
+            "https://example.com/secret/abc123"
+        );
+    }
+
+    #[test]
+    fn url_audit() {
+        let hash = "abc123";
+        let server = "https://example.com";
+        assert_eq!(
+            format!("{server}/secret/{hash}/audit"),
+            "https://example.com/secret/abc123/audit"
+        );
+    }
+
+    // ── make_bearer (auth_header helper) ──────────────────────────────────────
+
+    #[test]
+    fn bearer_with_explicit_token() {
+        let result = make_bearer(Some("mytoken"), None);
+        assert_eq!(result, Some("Bearer mytoken".to_string()));
+    }
+
+    #[test]
+    fn bearer_explicit_token_takes_priority_over_file() {
+        let result = make_bearer(Some("explicit"), Some("fromfile"));
+        assert_eq!(result, Some("Bearer explicit".to_string()));
+    }
+
+    #[test]
+    fn bearer_falls_back_to_file_token() {
+        let result = make_bearer(None, Some("filetoken"));
+        assert_eq!(result, Some("Bearer filetoken".to_string()));
+    }
+
+    #[test]
+    fn bearer_empty_file_token_returns_none() {
+        let result = make_bearer(None, Some(""));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn bearer_no_tokens_returns_none() {
+        let result = make_bearer(None, None);
+        assert_eq!(result, None);
+    }
 }

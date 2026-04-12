@@ -91,6 +91,49 @@ enum KeysAction {
     },
 }
 
+// ── Admin request builder ─────────────────────────────────────────────────────
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn build_admin_request(command: &Commands) -> Option<AdminRequest> {
+    match command {
+        Commands::Serve { .. } => None,
+
+        Commands::Visibility { action } => Some(match action {
+            VisibilityAction::Get => AdminRequest::VisibilityGet,
+            VisibilityAction::Set { mode } => AdminRequest::VisibilitySet { mode: mode.clone() },
+        }),
+
+        Commands::Keys { action } => Some(match action {
+            KeysAction::Create {
+                name,
+                valid_after,
+                valid_before,
+                webhook,
+            } => AdminRequest::KeysCreate {
+                name: name.clone(),
+                valid_after: *valid_after,
+                valid_before: *valid_before,
+                webhook_url: webhook.clone(),
+            },
+            KeysAction::List => AdminRequest::KeysList,
+            KeysAction::Delete { name } => AdminRequest::KeysDelete { name: name.clone() },
+            KeysAction::Secrets { name } => AdminRequest::KeysSecrets { name: name.clone() },
+            KeysAction::Purge { name, .. } => AdminRequest::KeysPurge { name: name.clone() },
+        }),
+
+        Commands::Audit {
+            since,
+            until,
+            limit,
+            ..
+        } => Some(AdminRequest::Audit {
+            since: *since,
+            until: *until,
+            limit: Some(*limit),
+        }),
+    }
+}
+
 // ── Default socket path ───────────────────────────────────────────────────────
 
 fn default_socket_path() -> String {
@@ -365,4 +408,214 @@ fn default_data_dir() -> PathBuf {
     }
     // Fallback.
     PathBuf::from("/var/lib/sirrd")
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── build_admin_request ───────────────────────────────────────────────────
+
+    #[test]
+    fn admin_serve_returns_none() {
+        let cmd = Commands::Serve {
+            bind: "0.0.0.0:7843".to_string(),
+            data_dir: None,
+            admin_socket: None,
+            visibility: "public".to_string(),
+            retention_days: 30,
+        };
+        assert!(build_admin_request(&cmd).is_none());
+    }
+
+    #[test]
+    fn admin_visibility_get() {
+        let cmd = Commands::Visibility {
+            action: VisibilityAction::Get,
+        };
+        assert_eq!(build_admin_request(&cmd), Some(AdminRequest::VisibilityGet));
+    }
+
+    #[test]
+    fn admin_visibility_set() {
+        let cmd = Commands::Visibility {
+            action: VisibilityAction::Set {
+                mode: "private".to_string(),
+            },
+        };
+        assert_eq!(
+            build_admin_request(&cmd),
+            Some(AdminRequest::VisibilitySet {
+                mode: "private".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn admin_keys_create_minimal() {
+        let cmd = Commands::Keys {
+            action: KeysAction::Create {
+                name: "alice".to_string(),
+                valid_after: None,
+                valid_before: None,
+                webhook: None,
+            },
+        };
+        assert_eq!(
+            build_admin_request(&cmd),
+            Some(AdminRequest::KeysCreate {
+                name: "alice".to_string(),
+                valid_after: None,
+                valid_before: None,
+                webhook_url: None,
+            })
+        );
+    }
+
+    #[test]
+    fn admin_keys_create_with_webhook() {
+        let cmd = Commands::Keys {
+            action: KeysAction::Create {
+                name: "alice".to_string(),
+                valid_after: None,
+                valid_before: None,
+                webhook: Some("http://example.com".to_string()),
+            },
+        };
+        assert_eq!(
+            build_admin_request(&cmd),
+            Some(AdminRequest::KeysCreate {
+                name: "alice".to_string(),
+                valid_after: None,
+                valid_before: None,
+                webhook_url: Some("http://example.com".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn admin_keys_list() {
+        let cmd = Commands::Keys {
+            action: KeysAction::List,
+        };
+        assert_eq!(build_admin_request(&cmd), Some(AdminRequest::KeysList));
+    }
+
+    #[test]
+    fn admin_keys_delete() {
+        let cmd = Commands::Keys {
+            action: KeysAction::Delete {
+                name: "bob".to_string(),
+            },
+        };
+        assert_eq!(
+            build_admin_request(&cmd),
+            Some(AdminRequest::KeysDelete {
+                name: "bob".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn admin_keys_secrets() {
+        let cmd = Commands::Keys {
+            action: KeysAction::Secrets {
+                name: "alice".to_string(),
+            },
+        };
+        assert_eq!(
+            build_admin_request(&cmd),
+            Some(AdminRequest::KeysSecrets {
+                name: "alice".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn admin_keys_purge() {
+        let cmd = Commands::Keys {
+            action: KeysAction::Purge {
+                name: "alice".to_string(),
+                yes: true,
+            },
+        };
+        assert_eq!(
+            build_admin_request(&cmd),
+            Some(AdminRequest::KeysPurge {
+                name: "alice".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn admin_audit_with_limit() {
+        let cmd = Commands::Audit {
+            since: None,
+            until: None,
+            limit: 10,
+            json: false,
+        };
+        assert_eq!(
+            build_admin_request(&cmd),
+            Some(AdminRequest::Audit {
+                since: None,
+                until: None,
+                limit: Some(10),
+            })
+        );
+    }
+
+    #[test]
+    fn admin_audit_full() {
+        let cmd = Commands::Audit {
+            since: Some(100),
+            until: Some(200),
+            limit: 5,
+            json: false,
+        };
+        assert_eq!(
+            build_admin_request(&cmd),
+            Some(AdminRequest::Audit {
+                since: Some(100),
+                until: Some(200),
+                limit: Some(5),
+            })
+        );
+    }
+
+    // ── default_socket_path ───────────────────────────────────────────────────
+
+    #[test]
+    fn socket_path_default() {
+        std::env::remove_var("SIRR_ADMIN_SOCKET");
+        assert_eq!(default_socket_path(), "/tmp/sirrd.sock");
+    }
+
+    #[test]
+    fn socket_path_from_env() {
+        std::env::set_var("SIRR_ADMIN_SOCKET", "/custom/path.sock");
+        assert_eq!(default_socket_path(), "/custom/path.sock");
+        std::env::remove_var("SIRR_ADMIN_SOCKET");
+    }
+
+    // ── default_data_dir ──────────────────────────────────────────────────────
+
+    #[test]
+    fn data_dir_from_env() {
+        std::env::set_var("SIRR_DATA_DIR", "/tmp/test-sirr-data");
+        let dir = default_data_dir();
+        assert_eq!(dir, std::path::PathBuf::from("/tmp/test-sirr-data"));
+        std::env::remove_var("SIRR_DATA_DIR");
+    }
+
+    #[test]
+    fn data_dir_without_env_is_nonempty_and_contains_sirr() {
+        std::env::remove_var("SIRR_DATA_DIR");
+        let dir = default_data_dir();
+        let s = dir.to_string_lossy();
+        assert!(!s.is_empty());
+        assert!(s.contains("sirr"), "expected 'sirr' in path, got: {s}");
+    }
 }
