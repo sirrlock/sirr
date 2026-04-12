@@ -11,7 +11,6 @@ use crate::store::audit::{AuditEvent, AuditQuery};
 use crate::store::crypto::EncryptionKey;
 use crate::store::keys::KeyRecord;
 use crate::store::model::SecretRecord;
-use crate::store::visibility::Visibility;
 
 // ── Table definitions ─────────────────────────────────────────────────────────
 
@@ -24,7 +23,6 @@ const CONFIG: TableDefinition<&str, &[u8]> = TableDefinition::new("config");
 
 // ── Config keys ───────────────────────────────────────────────────────────────
 
-const CFG_VISIBILITY: &str = "visibility";
 const CFG_AUDIT_COUNTER: &str = "audit_counter";
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -123,29 +121,6 @@ impl Store {
         Ok(v)
     }
 
-    // ── Visibility ────────────────────────────────────────────────────────────
-
-    /// Persist `v` to the `config` table.
-    pub fn set_visibility(&self, v: Visibility) -> Result<(), StoreError> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut tbl = txn.open_table(CONFIG)?;
-            tbl.insert(CFG_VISIBILITY, Self::encode(&v)?.as_slice())?;
-        }
-        txn.commit()?;
-        Ok(())
-    }
-
-    /// Read persisted `Visibility`; returns `Visibility::Public` if not yet set.
-    pub fn get_visibility(&self) -> Result<Visibility, StoreError> {
-        let rtxn = self.db.begin_read()?;
-        let tbl = rtxn.open_table(CONFIG)?;
-        match tbl.get(CFG_VISIBILITY)? {
-            Some(v) => Self::decode(v.value()),
-            None => Ok(Visibility::Public),
-        }
-    }
-
     // ── Secrets ───────────────────────────────────────────────────────────────
 
     /// Insert a new `SecretRecord`. The record's `hash` is used as the key.
@@ -200,6 +175,7 @@ impl Store {
             if record.is_expired(now) {
                 // Tombstone it.
                 record.burned = true;
+                record.burned_at = Some(now);
                 record.value_ciphertext = vec![];
                 record.nonce = [0u8; 12];
                 tbl.insert(hash, Self::encode(&record)?.as_slice())?;
@@ -215,6 +191,7 @@ impl Store {
 
             if burned {
                 record.burned = true;
+                record.burned_at = Some(now);
                 record.value_ciphertext = vec![];
                 record.nonce = [0u8; 12];
             }
@@ -286,11 +263,16 @@ impl Store {
         Ok(updated)
     }
 
-    /// Burn the secret: set `burned=true`, zero ciphertext+nonce.
+    /// Burn the secret: set `burned=true`, zero ciphertext+nonce, record `burned_at`.
     ///
     /// For keyed secrets, `owner_key_id` must match; pass `None` to skip the check
     /// (anonymous secrets can be burned by anyone).
-    pub fn burn_secret(&self, hash: &str, owner_key_id: Option<&str>) -> Result<(), StoreError> {
+    pub fn burn_secret(
+        &self,
+        hash: &str,
+        owner_key_id: Option<&str>,
+        now: i64,
+    ) -> Result<(), StoreError> {
         let txn = self.db.begin_write()?;
         {
             let mut tbl = txn.open_table(SECRETS)?;
@@ -313,6 +295,7 @@ impl Store {
             }
 
             record.burned = true;
+            record.burned_at = Some(now);
             record.value_ciphertext = vec![];
             record.nonce = [0u8; 12];
 
@@ -651,70 +634,66 @@ impl Store {
 
     // ── Pruning ───────────────────────────────────────────────────────────────
 
-    /// Hard-delete burned secrets older than `SIRR_TOMBSTONE_RETENTION_DAYS` (default 7).
-    /// Returns count deleted.
-    pub fn prune_tombstones(&self, now: i64) -> Result<usize, StoreError> {
-        let retention_days: i64 = std::env::var("SIRR_TOMBSTONE_RETENTION_DAYS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(7);
+    /// Hard-delete burned secrets (and their audit events) where `burned_at` is older than
+    /// `retention_days`. Active secrets and their audit trails are never pruned.
+    ///
+    /// Returns the count of secret records deleted.
+    pub fn prune(&self, now: i64, retention_days: i64) -> Result<usize, StoreError> {
         let cutoff = now - retention_days * 86_400;
 
-        let hashes_to_delete: Vec<String> = {
+        // Collect burned secrets past the retention cutoff, plus their hashes for audit lookup.
+        let (hashes_to_delete, hash_set): (Vec<String>, std::collections::HashSet<String>) = {
             let rtxn = self.db.begin_read()?;
             let tbl = rtxn.open_table(SECRETS)?;
-            let mut v = Vec::new();
+            let mut hashes = Vec::new();
             for entry in tbl.iter()? {
                 let (k, val) = entry?;
                 let record: SecretRecord = Self::decode(val.value())?;
-                if record.is_burned() && record.created_at < cutoff {
-                    v.push(k.value().to_string());
+                // Only prune if burned AND burned_at is past the cutoff.
+                if record.is_burned() {
+                    let burned_at = record.burned_at.unwrap_or(record.created_at);
+                    if burned_at < cutoff {
+                        hashes.push(k.value().to_string());
+                    }
                 }
             }
-            v
+            let set: std::collections::HashSet<String> = hashes.iter().cloned().collect();
+            (hashes, set)
         };
 
         let count = hashes_to_delete.len();
-        let txn = self.db.begin_write()?;
-        {
-            let mut tbl = txn.open_table(SECRETS)?;
-            for hash in &hashes_to_delete {
-                tbl.remove(hash.as_str())?;
-            }
+        if count == 0 {
+            return Ok(0);
         }
-        txn.commit()?;
-        Ok(count)
-    }
 
-    /// Hard-delete audit events older than `SIRR_AUDIT_RETENTION_DAYS` (default 30).
-    /// Returns count deleted.
-    pub fn prune_audit(&self, now: i64) -> Result<usize, StoreError> {
-        let retention_days: i64 = std::env::var("SIRR_AUDIT_RETENTION_DAYS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30);
-        let cutoff = now - retention_days * 86_400;
-
-        let ids_to_delete: Vec<u64> = {
+        // Collect audit event IDs associated with the secrets being pruned.
+        let audit_ids_to_delete: Vec<u64> = {
             let rtxn = self.db.begin_read()?;
             let tbl = rtxn.open_table(AUDIT)?;
-            let mut v = Vec::new();
+            let mut ids = Vec::new();
             for entry in tbl.iter()? {
                 let (k, val) = entry?;
                 let event: AuditEvent = Self::decode(val.value())?;
-                if event.timestamp < cutoff {
-                    v.push(k.value());
+                if let Some(ref h) = event.hash {
+                    if hash_set.contains(h) {
+                        ids.push(k.value());
+                    }
                 }
             }
-            v
+            ids
         };
 
-        let count = ids_to_delete.len();
+        // Delete secrets and their audit events in one write transaction.
         let txn = self.db.begin_write()?;
         {
-            let mut tbl = txn.open_table(AUDIT)?;
-            for id in &ids_to_delete {
-                tbl.remove(id)?;
+            let mut secrets_tbl = txn.open_table(SECRETS)?;
+            for hash in &hashes_to_delete {
+                secrets_tbl.remove(hash.as_str())?;
+            }
+
+            let mut audit_tbl = txn.open_table(AUDIT)?;
+            for id in &audit_ids_to_delete {
+                audit_tbl.remove(id)?;
             }
         }
         txn.commit()?;
@@ -760,6 +739,7 @@ mod tests {
             ttl_expires_at: None,
             reads_remaining: None,
             burned: false,
+            burned_at: None,
             owner_key_id: None,
             created_by_ip: None,
         }
@@ -771,29 +751,6 @@ mod tests {
     fn open_creates_store() {
         let (_store, _dir) = open_temp_store();
         // If we get here without panicking, the store opened successfully.
-    }
-
-    #[test]
-    fn visibility_round_trip_across_reopen() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("vis.db");
-
-        {
-            let store = Store::open(&path).unwrap();
-            store.set_visibility(Visibility::Private).unwrap();
-        }
-
-        {
-            let store = Store::open(&path).unwrap();
-            let v = store.get_visibility().unwrap();
-            assert_eq!(v, Visibility::Private);
-        }
-    }
-
-    #[test]
-    fn default_visibility_is_public() {
-        let (store, _dir) = open_temp_store();
-        assert_eq!(store.get_visibility().unwrap(), Visibility::Public);
     }
 
     // ── Sub-task 6 + 7: create_secret / get_secret ───────────────────────────
@@ -845,6 +802,7 @@ mod tests {
             ttl_expires_at: None,
             reads_remaining: Some(1),
             burned: false,
+            burned_at: None,
             owner_key_id: None,
             created_by_ip: None,
         };
@@ -898,6 +856,7 @@ mod tests {
             ttl_expires_at: Some(9_999_999),
             reads_remaining: Some(5),
             burned: false,
+            burned_at: None,
             owner_key_id: Some("key-001".to_string()),
             created_by_ip: None,
         };
@@ -933,6 +892,7 @@ mod tests {
             ttl_expires_at: Some(2_000_000),
             reads_remaining: Some(2),
             burned: false,
+            burned_at: None,
             owner_key_id: Some("key-002".to_string()),
             created_by_ip: None,
         };
@@ -966,6 +926,7 @@ mod tests {
             ttl_expires_at: None,
             reads_remaining: None,
             burned: false,
+            burned_at: None,
             owner_key_id: Some("alice".to_string()),
             created_by_ip: None,
         };
@@ -986,13 +947,14 @@ mod tests {
         let record = make_secret("burn_me", &key);
         store.create_secret(&record).unwrap();
 
-        store.burn_secret("burn_me", None).unwrap();
+        store.burn_secret("burn_me", None, 1_000_001).unwrap();
 
-        // Tombstone should still exist.
+        // Tombstone should still exist with burned_at set.
         let got = store.get_secret("burn_me").unwrap().unwrap();
         assert!(got.is_burned());
         assert!(got.value_ciphertext.is_empty());
         assert_eq!(got.nonce, [0u8; 12]);
+        assert_eq!(got.burned_at, Some(1_000_001));
     }
 
     #[test]
@@ -1001,7 +963,9 @@ mod tests {
         let key = generate_key();
         let record = make_secret("burn_then_read", &key);
         store.create_secret(&record).unwrap();
-        store.burn_secret("burn_then_read", None).unwrap();
+        store
+            .burn_secret("burn_then_read", None, 1_000_001)
+            .unwrap();
 
         let err = store
             .consume_read("burn_then_read", 1_000_000, &key)
@@ -1103,6 +1067,7 @@ mod tests {
                 ttl_expires_at: None,
                 reads_remaining: None,
                 burned: false,
+                burned_at: None,
                 owner_key_id: Some("key-A".to_string()),
                 created_by_ip: None,
             };
@@ -1120,6 +1085,7 @@ mod tests {
                 ttl_expires_at: None,
                 reads_remaining: None,
                 burned: false,
+                burned_at: None,
                 owner_key_id: Some("key-A".to_string()),
                 created_by_ip: None,
             };
@@ -1137,6 +1103,7 @@ mod tests {
                 ttl_expires_at: None,
                 reads_remaining: None,
                 burned: false,
+                burned_at: None,
                 owner_key_id: Some("key-B".to_string()),
                 created_by_ip: None,
             };
@@ -1169,6 +1136,7 @@ mod tests {
                 ttl_expires_at: None,
                 reads_remaining: None,
                 burned: false,
+                burned_at: None,
                 owner_key_id: Some("victim-key".to_string()),
                 created_by_ip: None,
             };
@@ -1183,15 +1151,6 @@ mod tests {
             let r = store.get_secret(&format!("purge_{i}")).unwrap().unwrap();
             assert!(r.is_burned());
         }
-    }
-
-    // ── Sub-task 17: set/get_visibility ──────────────────────────────────────
-
-    #[test]
-    fn set_and_get_visibility() {
-        let (store, _dir) = open_temp_store();
-        store.set_visibility(Visibility::Both).unwrap();
-        assert_eq!(store.get_visibility().unwrap(), Visibility::Both);
     }
 
     // ── Sub-task 18: record_audit / query_audit ───────────────────────────────
@@ -1259,49 +1218,64 @@ mod tests {
         assert_eq!(results[0].action, ACTION_SECRET_CREATE);
     }
 
-    // ── Sub-task 19: prune_tombstones ────────────────────────────────────────
+    // ── Sub-tasks 19/20: unified prune ───────────────────────────────────────
 
     #[test]
-    fn prune_tombstones_removes_old_burned_secrets() {
+    fn prune_removes_old_burned_secrets_and_their_audit_events() {
         let (store, _dir) = open_temp_store();
         let enc_key = generate_key();
-        let (ct, nonce) = crate::store::crypto::encrypt(&enc_key, b"val").unwrap();
 
-        // Secret burned at t=0.
-        let mut record = SecretRecord {
+        // Create a secret burned at t=0 (epoch — well past any retention window).
+        let record = SecretRecord {
             hash: "old_burn".to_string(),
-            value_ciphertext: ct,
-            nonce,
-            created_at: 0, // very old
+            value_ciphertext: vec![],
+            nonce: [0u8; 12],
+            created_at: 0,
             ttl_expires_at: None,
             reads_remaining: None,
             burned: true,
+            burned_at: Some(0), // burned at epoch
             owner_key_id: None,
             created_by_ip: None,
         };
-        record.value_ciphertext = vec![];
-        record.nonce = [0u8; 12];
         store.create_secret(&record).unwrap();
 
-        // now = 7 days + 1 second past the cutoff (created_at=0).
-        // Default retention = 7 days = 604800s.
-        let now = 604_801i64;
+        // Record an audit event for this hash.
+        let ev = AuditEvent::new(
+            ACTION_SECRET_CREATE,
+            None,
+            Some("old_burn".to_string()),
+            "1.1.1.1".to_string(),
+            true,
+            None,
+        );
+        store.record_audit(ev).unwrap();
 
-        // Override env var is not needed since default is 7.
-        let pruned = store.prune_tombstones(now).unwrap();
+        // now = 30 days + 1 second past epoch. Retention = 30 days.
+        // cutoff = now - 30*86400 = 1; burned_at=0 < 1, so it should be pruned.
+        let now = 30 * 86_400 + 1;
+        let pruned = store.prune(now, 30).unwrap();
         assert_eq!(pruned, 1);
 
         // Secret should be gone.
-        let result = store.get_secret("old_burn").unwrap();
-        assert!(result.is_none());
+        assert!(store.get_secret("old_burn").unwrap().is_none());
+
+        // Audit event should also be gone.
+        let query = AuditQuery {
+            hash: Some("old_burn".to_string()),
+            limit: 100,
+            ..Default::default()
+        };
+        assert!(store.query_audit(&query).unwrap().is_empty());
+
+        let _ = enc_key; // suppress unused warning
     }
 
     #[test]
-    fn prune_tombstones_keeps_recent_burned() {
+    fn prune_keeps_recent_burned_secrets() {
         let (store, _dir) = open_temp_store();
-        let enc_key = generate_key();
 
-        // Burned secret but very recent.
+        // Burned secret but burned_at is recent.
         let record = SecretRecord {
             hash: "recent_burn".to_string(),
             value_ciphertext: vec![],
@@ -1310,74 +1284,62 @@ mod tests {
             ttl_expires_at: None,
             reads_remaining: None,
             burned: true,
+            burned_at: Some(1_000_000), // burned recently
             owner_key_id: None,
             created_by_ip: None,
         };
         store.create_secret(&record).unwrap();
 
-        // now is only 1 day past created_at; retention = 7 days.
+        // now is only 1 day past burned_at; retention = 30 days.
         let now = 1_000_000 + 86_400;
-        let pruned = store.prune_tombstones(now).unwrap();
+        let pruned = store.prune(now, 30).unwrap();
         assert_eq!(pruned, 0);
 
-        let _ = enc_key; // suppress unused warning
-    }
-
-    // ── Sub-task 20: prune_audit ──────────────────────────────────────────────
-
-    #[test]
-    fn prune_audit_removes_old_events() {
-        let (store, _dir) = open_temp_store();
-
-        // Insert an event with a very old timestamp.
-        let mut ev = AuditEvent::new(
-            ACTION_SECRET_CREATE,
-            None,
-            None,
-            "1.1.1.1".to_string(),
-            true,
-            None,
-        );
-        ev.timestamp = 0; // epoch
-        store.record_audit(ev).unwrap();
-
-        // now = 30 days + 1 second past epoch. Default retention = 30 days.
-        let now = 30 * 86_400 + 1;
-        let pruned = store.prune_audit(now).unwrap();
-        assert_eq!(pruned, 1);
-
-        let query = AuditQuery {
-            limit: 100,
-            ..Default::default()
-        };
-        let results = store.query_audit(&query).unwrap();
-        assert!(results.is_empty());
+        // Secret should still be there.
+        assert!(store.get_secret("recent_burn").unwrap().is_some());
     }
 
     #[test]
-    fn prune_audit_keeps_recent_events() {
+    fn prune_does_not_touch_active_secrets() {
         let (store, _dir) = open_temp_store();
+        let enc_key = generate_key();
+        let record = make_secret("active_secret", &enc_key);
+        store.create_secret(&record).unwrap();
 
-        // A recent audit event.
+        // Even with a very old now, active secrets are never pruned.
+        let pruned = store.prune(999_999_999, 30).unwrap();
+        assert_eq!(pruned, 0);
+
+        assert!(store.get_secret("active_secret").unwrap().is_some());
+    }
+
+    #[test]
+    fn prune_audit_events_for_active_secrets_are_kept() {
+        let (store, _dir) = open_temp_store();
+        let enc_key = generate_key();
+        let record = make_secret("alive", &enc_key);
+        store.create_secret(&record).unwrap();
+
         let ev = AuditEvent::new(
             ACTION_SECRET_CREATE,
             None,
-            None,
+            Some("alive".to_string()),
             "1.1.1.1".to_string(),
             true,
             None,
         );
         store.record_audit(ev).unwrap();
 
-        // now is only 1 day from "now" (which is wall clock ≈ today).
-        // Retention is 30 days, so nothing should be pruned.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64
-            + 86_400;
-        let pruned = store.prune_audit(now).unwrap();
+        // Run prune with a very long now — active secrets not pruned.
+        let pruned = store.prune(999_999_999, 30).unwrap();
         assert_eq!(pruned, 0);
+
+        let query = AuditQuery {
+            hash: Some("alive".to_string()),
+            limit: 100,
+            ..Default::default()
+        };
+        assert_eq!(store.query_audit(&query).unwrap().len(), 1);
     }
 
     // ── extract_prefix helper ─────────────────────────────────────────────────
