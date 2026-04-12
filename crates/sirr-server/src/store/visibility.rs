@@ -140,7 +140,7 @@ mod tests {
             Visibility::Both,
             Visibility::None,
         ] {
-            let encoded = bincode::serde::encode_to_vec(&v, bincode::config::standard()).unwrap();
+            let encoded = bincode::serde::encode_to_vec(v, bincode::config::standard()).unwrap();
             let (decoded, _): (Visibility, _) =
                 bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
             assert_eq!(v, decoded);

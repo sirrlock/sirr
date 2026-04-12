@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -1253,7 +1255,7 @@ mod tests {
         let enc_key = generate_key();
 
         // Burned secret but very recent.
-        let mut record = SecretRecord {
+        let record = SecretRecord {
             hash: "recent_burn".to_string(),
             value_ciphertext: vec![],
             nonce: [0u8; 12],
