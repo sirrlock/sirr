@@ -52,17 +52,13 @@ trap cleanup EXIT
   >"$E2E_DIR/sirrd.log" 2>&1 &
 SIRRD_PID=$!
 
-# Wait for server — no /health endpoint, so try a POST and accept any HTTP response
+# Wait for server
 for i in $(seq 1 30); do
-  if curl -sf -o /dev/null -w "" "http://127.0.0.1:$PORT/secret" -X POST -H "Content-Type: application/json" -d '{"value":"ping"}' 2>/dev/null; then break; fi
-  # Also accept non-2xx as "server is up"
-  if [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/secret" -X POST -H 'Content-Type: application/json' -d '{"value":"ping"}' 2>/dev/null)" != "000" ]; then break; fi
+  if curl -sf "$BASE/health" >/dev/null 2>&1; then break; fi
   sleep 0.2
 done
 
-# Verify server is actually responding
-READY_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/secret" -X POST -H "Content-Type: application/json" -d '{"value":"ready-check"}' 2>/dev/null)
-if [ "$READY_STATUS" = "000" ]; then
+if ! curl -sf "$BASE/health" >/dev/null 2>&1; then
   echo "sirrd failed to start. Log:"
   cat "$E2E_DIR/sirrd.log"
   exit 1

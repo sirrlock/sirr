@@ -47,6 +47,8 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/health", get(health))
+        .route("/version", get(version))
         .route("/secret", post(create_secret))
         .route(
             "/secret/{hash}",
@@ -58,6 +60,16 @@ pub fn router(state: AppState) -> Router {
         .route("/secret/{hash}/audit", get(audit_secret))
         .route("/secrets", get(list_my_secrets))
         .with_state(state)
+}
+
+// ── Convenience endpoints ────────────────────────────────────────────────────
+
+async fn health() -> impl IntoResponse {
+    Json(json!({"status": "ok"}))
+}
+
+async fn version() -> impl IntoResponse {
+    Json(json!({"version": env!("CARGO_PKG_VERSION")}))
 }
 
 // ── Time helper ───────────────────────────────────────────────────────────────
