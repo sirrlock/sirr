@@ -23,8 +23,16 @@ fn parse_ttl(s: &str) -> anyhow::Result<u64> {
 // ── CLI structure ──────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "sirr", about = "Sirr CLI — ephemeral secret client", version)]
+#[command(
+    name = "sirr",
+    about = "Sirr CLI — ephemeral secret client",
+    version,
+    disable_version_flag = true
+)]
 struct Cli {
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    version: (),
+
     /// Server URL
     #[arg(
         long,
@@ -37,6 +45,10 @@ struct Cli {
     /// Bearer token for authentication
     #[arg(long, env = "SIRR_TOKEN", global = true)]
     token: Option<String>,
+
+    /// Print the target URL before each request
+    #[arg(long, global = true)]
+    verbose: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -173,6 +185,9 @@ async fn main() -> anyhow::Result<()> {
             let body = build_push_body(value, ttl.as_deref(), *reads, prefix.as_deref())?;
 
             let url = format!("{}/secret", cli.server);
+            if cli.verbose {
+                eprintln!("POST {url}");
+            }
             let req = apply_auth(client.post(&url).json(&body), &cli);
             let resp = req.send().await?;
 
@@ -191,6 +206,9 @@ async fn main() -> anyhow::Result<()> {
         // ── get ───────────────────────────────────────────────────────────────
         Commands::Get { hash } => {
             let url = format!("{}/secret/{hash}", cli.server);
+            if cli.verbose {
+                eprintln!("GET {url}");
+            }
             let req = apply_auth(client.get(&url), &cli);
             let resp = req.send().await?;
 
@@ -213,6 +231,9 @@ async fn main() -> anyhow::Result<()> {
         // ── inspect ───────────────────────────────────────────────────────────
         Commands::Inspect { hash } => {
             let url = format!("{}/secret/{hash}", cli.server);
+            if cli.verbose {
+                eprintln!("HEAD {url}");
+            }
             let req = apply_auth(client.head(&url), &cli);
             let resp = req.send().await?;
 
@@ -238,6 +259,9 @@ async fn main() -> anyhow::Result<()> {
         // ── audit ─────────────────────────────────────────────────────────────
         Commands::Audit { hash } => {
             let url = format!("{}/secret/{hash}/audit", cli.server);
+            if cli.verbose {
+                eprintln!("GET {url}");
+            }
             let req = apply_auth(client.get(&url), &cli);
             let resp = req.send().await?;
 
@@ -281,6 +305,9 @@ async fn main() -> anyhow::Result<()> {
             let body = build_patch_body(value, ttl.as_deref(), *reads)?;
 
             let url = format!("{}/secret/{hash}", cli.server);
+            if cli.verbose {
+                eprintln!("PATCH {url}");
+            }
             let req = apply_auth(client.patch(&url).json(&body), &cli);
             let resp = req.send().await?;
 
@@ -308,6 +335,9 @@ async fn main() -> anyhow::Result<()> {
         // ── burn ──────────────────────────────────────────────────────────────
         Commands::Burn { hash } => {
             let url = format!("{}/secret/{hash}", cli.server);
+            if cli.verbose {
+                eprintln!("DELETE {url}");
+            }
             let req = apply_auth(client.delete(&url), &cli);
             let resp = req.send().await?;
 
@@ -326,6 +356,9 @@ async fn main() -> anyhow::Result<()> {
         // ── list ──────────────────────────────────────────────────────────────
         Commands::List => {
             let url = format!("{}/secrets", cli.server);
+            if cli.verbose {
+                eprintln!("GET {url}");
+            }
             let req = apply_auth(client.get(&url), &cli);
             let resp = req.send().await?;
 

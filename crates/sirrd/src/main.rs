@@ -11,9 +11,13 @@ use sirr_server::ServerConfig;
 #[command(
     name = "sirrd",
     about = "Sirr daemon — ephemeral secret server",
-    version
+    version,
+    disable_version_flag = true
 )]
 struct Cli {
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    version: (),
+
     #[command(subcommand)]
     command: Commands,
 }
