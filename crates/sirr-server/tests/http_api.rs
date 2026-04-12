@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use sirr_server::{
     router,
     store::{crypto, Store, Visibility},
-    AppState,
+    AppState, WebhookSender,
 };
 use tempfile::tempdir;
 
@@ -36,6 +36,7 @@ fn setup_with_visibility(vis: Visibility) -> Setup {
         store: store.clone(),
         encryption_key: key,
         visibility,
+        webhook_sender: WebhookSender::new(),
     };
     let server = TestServer::new(router(state));
     Setup { server, store }
