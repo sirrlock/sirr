@@ -38,6 +38,7 @@ fn active_anon() -> SecretRecord {
         ttl_expires_at: None,
         reads_remaining: None,
         burned: false,
+        burned_at: None,
         owner_key_id: None,
         created_by_ip: None,
     }
@@ -53,6 +54,7 @@ fn active_keyed(owner: &KeyRecord) -> SecretRecord {
         ttl_expires_at: None,
         reads_remaining: None,
         burned: false,
+        burned_at: None,
         owner_key_id: Some(owner.id.clone()),
         created_by_ip: None,
     }
@@ -68,6 +70,7 @@ fn burned_secret() -> SecretRecord {
         ttl_expires_at: None,
         reads_remaining: None,
         burned: true,
+        burned_at: Some(NOW - 3600),
         owner_key_id: None,
         created_by_ip: None,
     }
@@ -83,6 +86,7 @@ fn expired_secret() -> SecretRecord {
         ttl_expires_at: Some(NOW - 3600), // expired 1 hour ago
         reads_remaining: None,
         burned: false,
+        burned_at: None,
         owner_key_id: None,
         created_by_ip: None,
     }
@@ -98,6 +102,7 @@ fn burned_keyed(owner: &KeyRecord) -> SecretRecord {
         ttl_expires_at: None,
         reads_remaining: None,
         burned: true,
+        burned_at: Some(NOW - 3600),
         owner_key_id: Some(owner.id.clone()),
         created_by_ip: None,
     }
