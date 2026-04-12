@@ -19,7 +19,7 @@ sirr/                           # github.com/sirrlock/sirr
 │       └── src/
 │           ├── lib.rs          # pub mod declarations and re-exports
 │           ├── server.rs       # Bootstrap, key file, store open, spawn server + admin socket
-│           ├── handlers.rs     # Five HTTP endpoints over /secret/:hash + AppState
+│           ├── handlers.rs     # Six HTTP endpoints: /secret/:hash + /secrets + AppState
 │           ├── authz.rs        # Single authorize() function with ~20-row decision table
 │           ├── admin.rs        # Unix domain socket server + admin command dispatch
 │           ├── webhooks.rs     # WebhookSender — fire-and-forget per-key webhooks
@@ -73,6 +73,7 @@ cargo fmt --all                                # Formatter
 ./target/release/sirr audit <hash> --key <token>
 ./target/release/sirr patch <hash> "new-value" --key <token>
 ./target/release/sirr burn <hash> [--key <token>]
+./target/release/sirr list --key <token>
 ```
 
 ## Architecture
@@ -149,7 +150,7 @@ cargo test --all   # 115+ tests across 8 suites
 # - store/visibility.rs unit tests
 # - authz.rs unit tests
 # - tests/authz_matrix.rs — full decision table
-# - tests/http_api.rs — 5-endpoint HTTP integration
+# - tests/http_api.rs — 6-endpoint HTTP integration
 # - tests/webhooks.rs — wiremock-based webhook delivery
 # - tests/end_to_end.rs — full lifecycle, visibility, lockdown, prune
 ```

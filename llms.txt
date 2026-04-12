@@ -28,13 +28,11 @@ Four modes set at startup or changed at runtime via admin socket:
 - `public`  — anyone can push; reads are universal (no auth needed for reads)
 - `private` — only API key holders can push; reads remain open
 - `both`    — both anonymous and keyed pushes allowed; keyed secrets are owned
-- `none`    — lockdown: all five HTTP endpoints return 503
+- `none`    — lockdown: all six HTTP endpoints return 503
 
 Knowing a secret's hash IS the read capability. No permission letters, no roles.
 
-## HTTP API — Five Endpoints
-
-All operations target /secret/:hash.
+## HTTP API — Six Endpoints
 
 POST   /secret            Create a secret. Bearer token → owned; no token → anonymous dead drop.
 GET    /secret/:hash      Read + consume. Returns plaintext or JSON. 410 if burned/expired.
@@ -42,6 +40,7 @@ HEAD   /secret/:hash      Metadata only. Does NOT consume a read.
 PATCH  /secret/:hash      Update value (owner key required).
 DELETE /secret/:hash      Burn immediately (owner key or anonymous for unowned).
 GET    /secret/:hash/audit  Full event history (owner key required).
+GET    /secrets           List all secrets owned by the calling key. Auth required (401 if anonymous). Includes burned tombstones until pruned.
 
 ### Create Request
 
@@ -84,6 +83,24 @@ X-Sirr-Owned: true
   ]
 }
 
+### List Response (200) — GET /secrets
+
+Array of secret metadata. Never includes values or ciphertext.
+
+[
+  {
+    "hash": "db1_abc123...",
+    "created_at": 1712846400,
+    "ttl_expires_at": 1712850000,
+    "reads_remaining": 3,
+    "burned": false,
+    "burned_at": null,
+    "owned": true
+  }
+]
+
+Errors: 401 if no/invalid token, 503 if visibility=none.
+
 ## CLI — sirr (client)
 
 sirr push "value"                         Push anonymous dead drop
@@ -98,6 +115,7 @@ sirr audit <hash> --key <token>           Audit trail (owner required)
 sirr patch <hash> "new-value" --key <t>   Update value (owner required)
 sirr burn <hash>                          Burn anonymous secret
 sirr burn <hash> --key <token>            Burn owned secret
+sirr list --key <token>                   List all owned secrets (metadata only)
 
 # Global flags:
 --server http://...    or SIRR_SERVER=...
