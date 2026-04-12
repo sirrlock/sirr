@@ -3,15 +3,11 @@ FROM scratch
 ARG TARGETARCH
 COPY dist/${TARGETARCH}/sirrd /sirrd
 
-# Data directory — mount a volume here for persistence.
-# /run/secrets — mount key file here: -v ./master.key:/run/secrets/master.key:ro
-VOLUME ["/data", "/run/secrets"]
+VOLUME ["/data"]
 
-ENV SIRR_DATA_DIR=/data \
-    SIRR_HOST=0.0.0.0 \
-    SIRR_PORT=39999
+ENV SIRR_DATA_DIR=/data
 
-EXPOSE 39999
+EXPOSE 7843
 
 ENTRYPOINT ["/sirrd"]
-CMD ["serve"]
+CMD ["serve", "--bind", "0.0.0.0:7843", "--data-dir", "/data", "--admin-socket", "/data/sirrd.sock"]
