@@ -37,3 +37,9 @@ jobs:
 
       - name: test
         run: cargo test --all
+
+      - name: e2e smoke test
+        if: runner.os != 'Windows'
+        run: |
+          cargo build --release
+          bash tests/e2e.sh

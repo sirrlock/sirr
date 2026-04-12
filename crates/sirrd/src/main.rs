@@ -1,20 +1,17 @@
-use anyhow::{Context, Result};
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
+use sirr_server::admin::{AdminRequest, AdminResponse};
+use sirr_server::store::Visibility;
+use sirr_server::ServerConfig;
 
-// ── CLI definition ─────────────────────────────────────────────────────────────
-
-/// Build version: CI sets SIRR_BUILD_VERSION at compile time; local builds use Cargo.toml version.
-const BUILD_VERSION: &str = match option_env!("SIRR_BUILD_VERSION") {
-    Some(v) => v,
-    None => env!("CARGO_PKG_VERSION"),
-};
+// ── CLI structure ─────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(
     name = "sirrd",
-    about = "Sirrd — ephemeral secret vault server daemon",
-    version = BUILD_VERSION
+    about = "Sirr daemon — ephemeral secret server",
+    version
 )]
 struct Cli {
     #[command(subcommand)]
@@ -23,142 +20,349 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the Sirr HTTP server
+    /// Start the sirrd daemon
     Serve {
-        /// Port to listen on (default: $SIRR_PORT or 39999)
-        #[arg(long, env = "SIRR_PORT", default_value = "39999")]
-        port: u16,
-        /// Host to bind (default: $SIRR_HOST or 0.0.0.0)
-        #[arg(long, env = "SIRR_HOST", default_value = "0.0.0.0")]
-        host: String,
-        /// Log level: error, warn, info, debug, verbose (default: $SIRR_LOG_LEVEL or warn)
-        #[arg(long, env = "SIRR_LOG_LEVEL")]
-        log_level: Option<String>,
-        /// Auto-initialize with default org and principal
+        #[arg(long, default_value = "0.0.0.0:7843")]
+        bind: String,
         #[arg(long)]
-        init: bool,
+        data_dir: Option<String>,
+        #[arg(long)]
+        admin_socket: Option<String>,
+        /// Initial visibility mode: public | private | both | none (default: public).
+        /// Hot-switchable at runtime via `sirrd visibility set <mode>`.
+        /// Resets to this value on restart.
+        #[arg(long, default_value = "public")]
+        visibility: String,
+        /// Retention period in days for burned secrets and their audit events (default: 30).
+        #[arg(long, default_value = "30")]
+        retention_days: i64,
     },
-    /// Rotate the encryption key (offline). Re-encrypts all records with a new
-    /// master key. Requires direct access to the sirr.key and sirr.db files.
-    Rotate,
+    /// Get or set visibility mode
+    Visibility {
+        #[command(subcommand)]
+        action: VisibilityAction,
+    },
+    /// Manage API keys
+    Keys {
+        #[command(subcommand)]
+        action: KeysAction,
+    },
+    /// View audit log
+    Audit {
+        #[arg(long)]
+        since: Option<i64>,
+        #[arg(long)]
+        until: Option<i64>,
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
+#[derive(Subcommand)]
+enum VisibilityAction {
+    Get,
+    Set { mode: String },
+}
+
+#[derive(Subcommand)]
+enum KeysAction {
+    Create {
+        name: String,
+        #[arg(long)]
+        valid_after: Option<i64>,
+        #[arg(long)]
+        valid_before: Option<i64>,
+        #[arg(long)]
+        webhook: Option<String>,
+    },
+    List,
+    Delete {
+        name: String,
+    },
+    Secrets {
+        name: String,
+    },
+    Purge {
+        name: String,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+// ── Default socket path ───────────────────────────────────────────────────────
+
+fn default_socket_path() -> String {
+    std::env::var("SIRR_ADMIN_SOCKET").unwrap_or_else(|_| "/tmp/sirrd.sock".to_string())
+}
+
+// ── Admin client ──────────────────────────────────────────────────────────────
+
+async fn send_admin(socket_path: &str, req: &AdminRequest) -> anyhow::Result<AdminResponse> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let stream = UnixStream::connect(socket_path).await.map_err(|e| {
+        anyhow::anyhow!("cannot connect to admin socket at {socket_path}: {e}\n(is sirrd running?)")
+    })?;
+
+    let (reader, mut writer) = stream.into_split();
+
+    let mut json = serde_json::to_string(req)?;
+    json.push('\n');
+    writer.write_all(json.as_bytes()).await?;
+    writer.shutdown().await?;
+
+    let mut buf = String::new();
+    BufReader::new(reader).read_line(&mut buf).await?;
+
+    let resp: AdminResponse = serde_json::from_str(buf.trim())
+        .map_err(|e| anyhow::anyhow!("invalid response from daemon: {e}\nraw: {buf}"))?;
+    Ok(resp)
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let effective_log_level = if let Commands::Serve { ref log_level, .. } = cli.command {
-        let raw = log_level
-            .clone()
-            .or_else(|| std::env::var("SIRR_LOG_LEVEL").ok())
-            .unwrap_or_else(|| "warn".into());
-        if raw.eq_ignore_ascii_case("verbose") {
-            "debug".to_owned()
-        } else {
-            raw
-        }
-    } else {
-        std::env::var("SIRR_LOG_LEVEL").unwrap_or_else(|_| "warn".into())
-    };
-
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(&effective_log_level))
-        .init();
-
     match cli.command {
+        // ── serve ─────────────────────────────────────────────────────────────
         Commands::Serve {
-            port,
-            host,
-            log_level: _,
-            init,
-        } => cmd_serve(host, port, effective_log_level, init).await,
-
-        Commands::Rotate => cmd_rotate().await,
-    }
-}
-
-// ── Command implementations ───────────────────────────────────────────────────
-
-async fn cmd_serve(host: String, port: u16, log_level: String, init: bool) -> Result<()> {
-    let no_banner = std::env::var("SIRR_NO_BANNER")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
-    let no_security_banner = std::env::var("SIRR_NO_SECURITY_BANNER")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
-    // If SIRR_MASTER_API_KEY is not set, generate a random key so the server is
-    // never left open.  The key is shown in the security notice and must be
-    // persisted by the operator if they want it to survive a restart.
-    let env_api_key = std::env::var("SIRR_MASTER_API_KEY").ok();
-    let (api_key, auto_generated_key) = match env_api_key {
-        Some(k) => (Some(k), None),
-        None => {
-            let key = {
-                let mut bytes = [0u8; 16];
-                rand::Rng::fill(&mut rand::thread_rng(), &mut bytes);
-                format!("sirr_key_{}", hex::encode(bytes))
+            bind,
+            data_dir,
+            admin_socket,
+            visibility,
+            retention_days,
+        } => {
+            let vis: Visibility = visibility
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid visibility: {e}"))?;
+            let config = ServerConfig {
+                bind_addr: bind
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid bind address: {e}"))?,
+                data_dir: data_dir.map(PathBuf::from).unwrap_or_else(default_data_dir),
+                admin_socket: PathBuf::from(admin_socket.unwrap_or_else(default_socket_path)),
+                visibility: vis,
+                retention_days,
             };
-            (Some(key.clone()), Some(key))
+            sirr_server::server::run(config).await?;
         }
-    };
 
-    let auto_init = init
-        || std::env::var("SIRR_AUTOINIT")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
+        // ── visibility ────────────────────────────────────────────────────────
+        Commands::Visibility { action } => {
+            let socket = default_socket_path();
+            match action {
+                VisibilityAction::Get => {
+                    let resp = send_admin(&socket, &AdminRequest::VisibilityGet).await?;
+                    match resp {
+                        AdminResponse::Ok { data } => {
+                            println!("visibility: {}", data["mode"].as_str().unwrap_or("?"))
+                        }
+                        AdminResponse::Error { message } => {
+                            eprintln!("error: {message}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                VisibilityAction::Set { mode } => {
+                    let resp =
+                        send_admin(&socket, &AdminRequest::VisibilitySet { mode: mode.clone() })
+                            .await?;
+                    match resp {
+                        AdminResponse::Ok { .. } => {
+                            println!("visibility set to: {mode}")
+                        }
+                        AdminResponse::Error { message } => {
+                            eprintln!("error: {message}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
 
-    let cfg = sirr_server::ServerConfig {
-        host,
-        port,
-        api_key,
-        auto_generated_key,
-        license_key: std::env::var("SIRR_LICENSE_KEY").ok(),
-        data_dir: std::env::var("SIRR_DATA_DIR").ok().map(Into::into),
-        log_level,
-        no_banner,
-        no_security_banner,
-        auto_init,
-        version: BUILD_VERSION.to_string(),
-        ..Default::default()
-    };
+        // ── keys ──────────────────────────────────────────────────────────────
+        Commands::Keys { action } => {
+            let socket = default_socket_path();
+            match action {
+                KeysAction::Create {
+                    name,
+                    valid_after,
+                    valid_before,
+                    webhook,
+                } => {
+                    let resp = send_admin(
+                        &socket,
+                        &AdminRequest::KeysCreate {
+                            name: name.clone(),
+                            valid_after,
+                            valid_before,
+                            webhook_url: webhook,
+                        },
+                    )
+                    .await?;
+                    match resp {
+                        AdminResponse::Ok { data } => {
+                            eprintln!("Store this token — it will not be shown again:");
+                            println!("{}", data["token"].as_str().unwrap_or("???"));
+                            eprintln!("key name: {name}");
+                            eprintln!("key id:   {}", data["id"].as_str().unwrap_or("?"));
+                        }
+                        AdminResponse::Error { message } => {
+                            eprintln!("error: {message}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
 
-    sirr_server::run(cfg).await
+                KeysAction::List => {
+                    let resp = send_admin(&socket, &AdminRequest::KeysList).await?;
+                    match resp {
+                        AdminResponse::Ok { data } => {
+                            if let Some(keys) = data.as_array() {
+                                if keys.is_empty() {
+                                    println!("no keys");
+                                } else {
+                                    for k in keys {
+                                        println!(
+                                            "{:12} {:26} created: {}",
+                                            k["name"].as_str().unwrap_or("-"),
+                                            k["id"].as_str().unwrap_or("-"),
+                                            k["created_at"],
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        AdminResponse::Error { message } => {
+                            eprintln!("error: {message}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+
+                KeysAction::Delete { name } => {
+                    let resp =
+                        send_admin(&socket, &AdminRequest::KeysDelete { name: name.clone() })
+                            .await?;
+                    match resp {
+                        AdminResponse::Ok { .. } => println!("deleted key: {name}"),
+                        AdminResponse::Error { message } => {
+                            eprintln!("error: {message}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+
+                KeysAction::Secrets { name } => {
+                    let resp = send_admin(&socket, &AdminRequest::KeysSecrets { name }).await?;
+                    match resp {
+                        AdminResponse::Ok { data } => {
+                            println!("{}", serde_json::to_string_pretty(&data)?)
+                        }
+                        AdminResponse::Error { message } => {
+                            eprintln!("error: {message}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+
+                KeysAction::Purge { name, yes } => {
+                    if !yes {
+                        eprintln!("purge all secrets for key '{name}'?");
+                        eprintln!("use --yes to confirm");
+                        std::process::exit(1);
+                    }
+                    let resp = send_admin(&socket, &AdminRequest::KeysPurge { name: name.clone() })
+                        .await?;
+                    match resp {
+                        AdminResponse::Ok { data } => {
+                            println!(
+                                "burned {} secrets owned by {name}",
+                                data["burned"].as_u64().unwrap_or(0)
+                            )
+                        }
+                        AdminResponse::Error { message } => {
+                            eprintln!("error: {message}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── audit ─────────────────────────────────────────────────────────────
+        Commands::Audit {
+            since,
+            until,
+            limit,
+            json,
+        } => {
+            let socket = default_socket_path();
+            let resp = send_admin(
+                &socket,
+                &AdminRequest::Audit {
+                    since,
+                    until,
+                    limit: Some(limit),
+                },
+            )
+            .await?;
+            match resp {
+                AdminResponse::Ok { data } => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&data)?);
+                    } else if let Some(events) = data.as_array() {
+                        if events.is_empty() {
+                            println!("(no audit events)");
+                        } else {
+                            for e in events {
+                                println!(
+                                    "{} {} {} {}",
+                                    e["timestamp"],
+                                    e["action"].as_str().unwrap_or("-"),
+                                    e["hash"].as_str().unwrap_or("-"),
+                                    e["source_ip"].as_str().unwrap_or("-"),
+                                );
+                            }
+                        }
+                    }
+                }
+                AdminResponse::Error { message } => {
+                    eprintln!("error: {message}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
-async fn cmd_rotate() -> Result<()> {
-    // Resolve data directory.
-    let data_dir_env = std::env::var("SIRR_DATA_DIR").ok().map(Into::into);
-    let data_dir = sirr_server::resolve_data_dir(data_dir_env.as_ref())?;
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-    // Load the current encryption key from sirr.key.
-    let key_path = data_dir.join("sirr.key");
-    let old_bytes =
-        std::fs::read(&key_path).context("read sirr.key — is the server initialized?")?;
-    let old_key = sirr_server::store::crypto::load_key(&old_bytes)
-        .ok_or_else(|| anyhow::anyhow!("sirr.key is corrupt (expected 32 bytes)"))?;
-
-    // Open the store with the old key.
-    let db_path = data_dir.join("sirr.db");
-    let store = sirr_server::store::Store::open(&db_path, old_key).context("open store")?;
-
-    // Determine new key version (increment from current max).
-    let current_version = store.max_key_version()?;
-    let new_version = current_version
-        .checked_add(1)
-        .context("key version overflow (max 255 rotations)")?;
-
-    // Generate a new random key and re-encrypt all records.
-    let new_key = sirr_server::store::crypto::generate_key();
-    let count = store.rotate(&new_key, new_version)?;
-
-    // Write the new key to sirr.key.
-    std::fs::write(&key_path, new_key.as_bytes()).context("write new sirr.key")?;
-
-    println!("rotated {count} secret(s) to key version {new_version}");
-    println!("new encryption key written to {}", key_path.display());
-    Ok(())
+fn default_data_dir() -> PathBuf {
+    // Check SIRR_DATA_DIR env var first.
+    if let Ok(d) = std::env::var("SIRR_DATA_DIR") {
+        return PathBuf::from(d);
+    }
+    // Platform data dir via HOME.
+    if let Ok(home) = std::env::var("HOME") {
+        #[cfg(target_os = "macos")]
+        return PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("sirrd");
+        #[cfg(not(target_os = "macos"))]
+        return PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("sirrd");
+    }
+    // Fallback.
+    PathBuf::from("/var/lib/sirrd")
 }

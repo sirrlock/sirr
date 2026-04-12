@@ -5,8 +5,7 @@
 Sirr is a self-hosted ephemeral secret vault. Two binaries: `sirrd` (server) and `sirr` (CLI client).
 Stack: Rust (axum + redb + ChaCha20Poly1305).
 
-BSL 1.1 license on `sirrd` — free ≤100 secrets/instance, license required above that.
-MIT license on `sirr` CLI client.
+BSL 1.1 license on `sirrd`. MIT license on `sirr` CLI client.
 
 ## Monorepo Layout
 
@@ -14,23 +13,30 @@ MIT license on `sirr` CLI client.
 sirr/                           # github.com/sirrlock/sirr
 ├── Cargo.toml                  # Rust workspace
 ├── crates/
-│   ├── sirr/                   # sirr CLI client binary (MIT, reqwest-based, no server deps)
-│   ├── sirrd/                  # sirrd daemon binary (BSL-1.1, axum server, redb store, crypto)
+│   ├── sirr/                   # sirr CLI client binary (MIT, reqwest-based)
+│   ├── sirrd/                  # sirrd daemon binary (BSL-1.1)
 │   └── sirr-server/            # Library: axum server, redb store, crypto
 │       └── src/
-│           ├── server.rs       # axum router, CORS, auto-init bootstrap
-│           ├── auth.rs         # ResolvedAuth middleware (master key + principal key)
-│           ├── handlers.rs     # public-bucket handlers
-│           ├── org_handlers.rs # org-scoped CRUD handlers (secrets, principals, roles, keys)
+│           ├── lib.rs          # pub mod declarations and re-exports
+│           ├── server.rs       # Bootstrap, key file, store open, spawn server + admin socket
+│           ├── handlers.rs     # Five HTTP endpoints over /secret/:hash + AppState
+│           ├── authz.rs        # Single authorize() function with ~20-row decision table
+│           ├── admin.rs        # Unix domain socket server + admin command dispatch
+│           ├── webhooks.rs     # WebhookSender — fire-and-forget per-key webhooks
+│           ├── dirs.rs         # data_dir() resolution honoring SIRR_DATA_DIR
 │           └── store/
-│               ├── db.rs       # redb store (secrets + org tables)
-│               ├── org.rs      # OrgRecord, PrincipalRecord, PrincipalKeyRecord, RoleRecord
-│               ├── permissions.rs  # PermBit + Permissions 15-bit bitflag
-│               ├── model.rs    # SecretRecord, SecretMeta (owner_id, org_id, allowed_keys)
-│               └── crypto.rs   # ChaCha20Poly1305 encrypt/decrypt
+│               ├── mod.rs      # Re-exports
+│               ├── db.rs       # redb store: secrets, keys, audit, config tables
+│               ├── model.rs    # SecretRecord (hash, ciphertext, owner_key_id, ...)
+│               ├── keys.rs     # KeyRecord with webhook_url, validity window, blake3 hash
+│               ├── audit.rs    # AuditEvent, AuditQuery, ACTION_* constants
+│               ├── visibility.rs  # Visibility enum (Public/Private/Both/None)
+│               └── crypto.rs   # ChaCha20Poly1305 encrypt/decrypt + key generation
+├── tests/
+│   └── http_api.rs             # Integration tests for 5 HTTP endpoints
 ├── Dockerfile                  # FROM scratch + musl binary
 ├── Dockerfile.release          # Used by CI release workflow
-├── docker-compose.yml          # Production setup with key file mount
+├── docker-compose.yml          # Production setup
 └── .github/workflows/
     ├── ci.yml                  # fmt + clippy + test (3 OS)
     └── release.yml             # cross-platform binaries + Docker + crates.io + package managers
@@ -43,21 +49,30 @@ sirr/                           # github.com/sirrlock/sirr
 cargo build --release --bin sirrd --bin sirr   # Both binaries
 cargo build --release --bin sirrd              # Server only
 cargo build --release --bin sirr               # CLI client only
-cargo test --all                               # All unit tests
+cargo test --all                               # All tests
 cargo clippy --all-targets                     # Linter
 cargo fmt --all                                # Formatter
 
 # Run server locally
 ./target/release/sirrd serve
-# With auto-init (creates default org + admin principal + temp keys):
-./target/release/sirrd serve --init
-# Or via env: SIRR_AUTOINIT=true ./target/release/sirrd serve
-# Optionally protect writes: SIRR_MASTER_API_KEY=my-key ./target/release/sirrd serve
+./target/release/sirrd serve --visibility private
+./target/release/sirrd serve --visibility both
+
+# Admin commands (via Unix socket, sirrd must be running)
+./target/release/sirrd keys create my-key
+./target/release/sirrd keys list
+./target/release/sirrd keys delete my-key
+./target/release/sirrd visibility set private
+./target/release/sirrd visibility get
 
 # Use CLI client
-./target/release/sirr push "some-secret-value"   # public dead drop → returns URL
-./target/release/sirr set FOO bar --org acme      # org named slot
-./target/release/sirr get FOO --org acme
+./target/release/sirr push "some-secret-value"
+./target/release/sirr push "value" --reads 1 --ttl 1h --key <token>
+./target/release/sirr get <hash>
+./target/release/sirr inspect <hash>
+./target/release/sirr audit <hash> --key <token>
+./target/release/sirr patch <hash> "new-value" --key <token>
+./target/release/sirr burn <hash> [--key <token>]
 ```
 
 ## Architecture
@@ -67,50 +82,87 @@ sirr.key (random 32 bytes, generated on first boot)
 key + per-record nonce --ChaCha20Poly1305--> encrypted value stored in redb
 ```
 
-- `crates/sirr-server/src/store/crypto.rs` — ChaCha20Poly1305 encrypt/decrypt + key generation
-- `crates/sirr-server/src/store/db.rs` — redb open/read/write/patch/head/prune + GetResult enum + org/principal/role/key CRUD (watch borrow lifetimes — AccessGuard must be dropped before mutating the table)
-- `crates/sirr-server/src/store/model.rs` — SecretRecord with `delete` flag, `owner_id`, `org_id`, `allowed_keys`; is_expired/is_burned/is_sealed checks
-- `crates/sirr-server/src/store/org.rs` — OrgRecord, PrincipalRecord, PrincipalKeyRecord, RoleRecord structs + built-in role definitions
-- `crates/sirr-server/src/store/permissions.rs` — PermBit enum (15 bits) + Permissions bitflag with letter-string serde
-- `crates/sirr-server/src/server.rs` — axum router, CORS, auto-init bootstrap, key management (sirr.key)
-- `crates/sirr-server/src/auth.rs` — ResolvedAuth middleware: master key + principal key lookup + role resolution
-- `crates/sirr-server/src/org_handlers.rs` — org-scoped CRUD handlers (orgs, principals, roles, keys, secrets, webhooks, audit)
-- `crates/sirrd/src/main.rs` — clap CLI: `serve` (with `--init`) + `rotate` subcommands (server-side ops only)
-- `crates/sirr/src/main.rs` — clap CLI: `push` (public dead drop), `set` (org named slot), `get`, `pull`, `run`, `list`, `delete`, `prune`, `audit` (`--key` filter), `webhooks`, `keys`, `orgs`, `principals`, `roles`, `me` (works anonymously). Global `--org` / `$SIRR_ORG` flag, `-v` for version. Default server: `https://sirrlock.com`
+### Authorization model
+
+The `authorize()` function in `authz.rs` takes `(Action, Option<&SecretRecord>, &Caller, Visibility, now)` and returns `AuthDecision`. The decision matrix:
+
+- **Create**: public → anyone; private/both → keyed only; none → 503
+- **Read (GET)**: public/private/both → anyone (reads are universal); none → 503
+- **Inspect (HEAD)**: same as read
+- **Patch**: keyed caller must be owner; record must exist + not burned/expired
+- **Burn**: keyed caller must be owner; anonymous caller can burn anonymous secret
+- **Audit**: keyed caller must be owner; record must exist
+
+### Visibility
+
+`Visibility` is an `Arc<RwLock<Visibility>>` shared between handlers and the admin socket. Changed at runtime by the admin socket — no restart needed.
+
+### Admin socket
+
+Unix domain socket at `SIRR_ADMIN_SOCKET` (default `/tmp/sirrd.sock`). Authenticated by filesystem permissions (only users who can write to the socket can issue commands). Framed protocol: newline-delimited JSON.
+
+### Webhooks
+
+`WebhookSender` holds a shared `reqwest::Client` (10-second timeout). `fire()` spawns a tokio task and never blocks. Only keyed secrets trigger webhooks (anonymous dead drops have no key to attach a URL to). Fires after: `secret.created`, `secret.read`, `secret.patched`, `secret.burned`.
 
 ## Key Constraints
 
 - `AccessGuard` from redb borrows the table immutably. Always `.to_vec()` the bytes before any mutation on the same table.
-- License tiers are now org/principal-count based (Solo: 1 org / 1 principal, Solo+: 1 / 5, Team: 1 / unlimited, Business: unlimited / unlimited). Free tier = Solo.
-- **Public bucket** is value-only: `POST /secrets` accepts `{value}` (no `key` field), returns `{id, url}` with a server-generated 256-bit hex ID.
-- **Org secrets** reject duplicates: `POST /orgs/{org}/secrets` returns 409 Conflict + `secret.create_rejected` audit event on duplicate key.
-- **CLI split**: `push` = public dead drop (value only, returns URL), `set` = org named slot (requires `--org` / `$SIRR_ORG`). The `share` command has been removed — `push`/`set` return URLs directly.
-- Default server is `https://sirrlock.com`. Global `--org` / `$SIRR_ORG` flag. `-v` for version. `me` works anonymously. `audit --key` filters by secret key.
-- `Store::get()` returns `GetResult` enum: `Value(String)`, `Sealed`, or `NotFound` — handler maps to 200, 410, 404.
-- Encryption key is a random 32-byte key stored as `sirr.key`. No KDF — Argon2id is unnecessary when keys are already 256-bit random from OsRng.
-- Auth: `SIRR_MASTER_API_KEY` env var acts as master key. Org routes require either master key or principal key (via `require_auth` middleware). Public bucket reads are unauthenticated.
-- Deleting an org requires no principals; deleting a principal requires no active keys (cascading deletes not allowed).
+- The `store/crypto.rs` module is load-bearing — do not modify the encrypt/decrypt interface.
+- `dirs.rs` is load-bearing — do not change the data_dir resolution logic.
+- Schema version is stored in the `config` table. Current version: `"2"`. Stale version (from old org model) exits with an error message and code 1.
+- `find_key_by_id()` performs two separate read transactions (id→hash→record). This is intentional to avoid redb borrow lifetime issues with multi-table access.
+- Keys are stored in three parallel tables: `keys_by_id` (ULID → record), `keys_by_hash` (blake3 hash → ULID), `keys_by_name` (name → ULID). All three must be kept in sync on create/delete.
+- The bearer token is shown exactly once at key creation and is never stored — only the blake3 hash.
+- Webhook URLs are stored on the `KeyRecord` — not as a separate table. Each key has at most one webhook URL.
+- Anonymous secrets (`owner_key_id: None`) never trigger webhooks.
 
-## Multi-Tenant Architecture
+## New Architecture vs Old
 
-- **Public bucket** (`/secrets/*`): value-only dead drops with server-generated 256-bit hex IDs, no auth for reads, master key for writes
-- **Org buckets** (`/orgs/{org_id}/secrets/*`): named key slots, 409 Conflict on duplicates, require principal auth via `require_auth` middleware
-- **Roles**: reader, writer, admin, owner (built-in) + custom per-org. Permissions are a 15-bit bitflag serialized as a letter string (e.g. `"rRlLcCpPaAmMdD"`)
-- **Keys**: unlimited named keys per principal, time-windowed (`valid_after`/`valid_before`), hard-deletable
-- **`SIRR_ENABLE_PUBLIC_BUCKET`**: env var to disable public bucket (default: true)
-- **`SIRR_AUTOINIT`** / `--init`: auto-create default org + admin principal + 2 temporary keys on first boot
+**Removed entirely:**
+- `org_handlers.rs` — all org-scoped CRUD
+- `auth.rs` — master key + principal resolution middleware
+- `store/org.rs` — OrgRecord, PrincipalRecord, RoleRecord
+- `store/permissions.rs` — 15-bit bitflag
+- `store/webhooks.rs` — webhook subscription model (replaced by `webhook_url` on KeyRecord)
+- `validator.rs` — online license validator
+- `license.rs` — no licensing enforcement; honor system only
+
+**Replaced:**
+- `webhooks.rs` (403 LOC complex subscription model) → `webhooks.rs` (60 LOC fire-and-forget)
+
+**New:**
+- `authz.rs` — single `authorize()` function
+- `admin.rs` — Unix domain socket admin server
+- `store/visibility.rs` — Visibility enum + persistence
+- `store/keys.rs` — KeyRecord with webhook_url field
 
 ## Testing
 
 ```bash
-cargo test --all                   # unit tests
+cargo test --all   # 115+ tests across 8 suites
 
-# Manual smoke test
-./target/release/sirrd serve &
-sleep 1
+# Test suites:
+# - store/model.rs unit tests
+# - store/keys.rs unit tests
+# - store/audit.rs unit tests
+# - store/visibility.rs unit tests
+# - authz.rs unit tests
+# - tests/authz_matrix.rs — full decision table
+# - tests/http_api.rs — 5-endpoint HTTP integration
+# - tests/webhooks.rs — wiremock-based webhook delivery
+# - tests/end_to_end.rs — full lifecycle, visibility, lockdown, prune
+```
 
-# Store and retrieve (burn after 1 read)
-# (requires sirr CLI from separate client)
+## Crate Versions (pinned)
+
+```
+axum = "0.8"
+redb = "2"          # NOT v3 — API changed significantly
+bincode = "2" with serde feature
+chacha20poly1305 = "0.10"
+reqwest = "0.12"    # webhook HTTP client (rustls-tls, no default features)
+wiremock = "0.6"    # dev-dependency for webhook tests
 ```
 
 ## Pre-Commit Checklist
@@ -121,27 +173,10 @@ sleep 1
 2. **CLAUDE.md** (this file) — Are there new architectural constraints or gotchas worth recording?
 3. **llms.txt** — Does it reflect the current feature set? (LLMs may use this to understand the project)
 
-## License Key System
-
-- Free tier: ≤100 active secrets per instance (no license key required)
-- Licensed: unlimited secrets with valid `SIRR_LICENSE_KEY`
-- License keys are issued at [sirrlock.com/pricing](https://sirrlock.com/pricing)
-- Key format: `sirr_lic_<40-hex-chars>` (validated against sirrlock.com API or offline)
-- Server behavior: at >100 secrets without a valid license, POST /secrets returns 402 Payment Required
-
-## Crate Versions (pinned)
-
-```
-axum = "0.8"
-redb = "2"          # NOT v3 — API changed significantly
-bincode = "2" with serde feature
-chacha20poly1305 = "0.10"
-```
-
 ## Release Process
 
 CI releases on every push to main. Version: `1.0.<run_number>`.
 
 1. Push to main → CI builds all targets, publishes Docker + crates.io + updates Homebrew/Scoop
-2. To publish to crates.io: bump `version` in workspace `Cargo.toml` (CI skips if version already published)
+2. Windows targets build `sirr` CLI only (no `sirrd` — it requires a Unix socket)
 3. Secrets needed in repo settings: `CRATES_IO_TOKEN`, `SIRR_PACKAGE_MANAGERS_KEY`, `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`
