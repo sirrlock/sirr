@@ -30,6 +30,7 @@ use crate::store::audit::{
 };
 use crate::store::crypto::EncryptionKey;
 use crate::store::{SecretRecord, Store, Visibility};
+use crate::webhooks::{WebhookEvent, WebhookSender};
 
 // ── AppState ──────────────────────────────────────────────────────────────────
 
@@ -38,6 +39,7 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub encryption_key: Arc<EncryptionKey>,
     pub visibility: Arc<tokio::sync::RwLock<Visibility>>,
+    pub webhook_sender: WebhookSender,
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -134,6 +136,34 @@ fn decision_to_response(decision: &AuthDecision) -> Response {
     }
 }
 
+// ── Webhook helper ────────────────────────────────────────────────────────────
+
+/// If `owner_key_id` is `Some` and the key has a `webhook_url`, fire a
+/// fire-and-forget webhook event. Anonymous secrets never trigger webhooks.
+fn maybe_fire_webhook(
+    state: &AppState,
+    owner_key_id: Option<&str>,
+    event_type: &str,
+    hash: &str,
+    at: i64,
+) {
+    let Some(key_id) = owner_key_id else { return };
+    let key = match state.store.find_key_by_id(key_id) {
+        Ok(Some(k)) => k,
+        _ => return,
+    };
+    let Some(url) = key.webhook_url else { return };
+    state.webhook_sender.fire(
+        url,
+        WebhookEvent {
+            event_type: event_type.to_string(),
+            hash: hash.to_string(),
+            at,
+            ip: String::new(),
+        },
+    );
+}
+
 // ── POST /secret ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -200,7 +230,7 @@ pub async fn create_secret(
         };
 
     let ttl_expires_at = body.ttl_seconds.map(|secs| now + secs as i64);
-    let owner_key_id = match &caller {
+    let owner_key_id: Option<String> = match &caller {
         Caller::Keyed(key) => Some(key.id.clone()),
         Caller::Anonymous => None,
     };
@@ -215,7 +245,7 @@ pub async fn create_secret(
         reads_remaining: body.reads,
         burned: false,
         burned_at: None,
-        owner_key_id,
+        owner_key_id: owner_key_id.clone(),
         created_by_ip: None, // IP extraction added in Phase 4 with ConnectInfo
     };
 
@@ -238,6 +268,15 @@ pub async fn create_secret(
         None,
     );
     let _ = state.store.record_audit(event);
+
+    // Fire webhook if the owner key has one configured.
+    maybe_fire_webhook(
+        &state,
+        owner_key_id.as_deref(),
+        "secret.created",
+        &hash,
+        now,
+    );
 
     let url = format!("http://localhost:7843/secret/{hash}");
     (
@@ -268,6 +307,14 @@ pub async fn read_secret(
 
     let now = now_secs();
 
+    // Peek at the record first to capture owner_key_id for webhook firing.
+    let owner_key_id_for_webhook = state
+        .store
+        .get_secret(&hash)
+        .ok()
+        .flatten()
+        .and_then(|s| s.owner_key_id);
+
     match state.store.consume_read(&hash, now, &state.encryption_key) {
         Ok((plaintext, _burned)) => {
             // Record audit event for the successful read.
@@ -280,6 +327,15 @@ pub async fn read_secret(
                 None,
             );
             let _ = state.store.record_audit(event);
+
+            // Fire webhook if owner key has one.
+            maybe_fire_webhook(
+                &state,
+                owner_key_id_for_webhook.as_deref(),
+                "secret.read",
+                &hash,
+                now,
+            );
 
             // Decide response format based on Accept header.
             let wants_json = headers
@@ -521,13 +577,16 @@ pub async fn patch_secret(
             // Record audit event.
             let event = AuditEvent::new(
                 ACTION_SECRET_PATCH,
-                Some(owner_key_id),
-                Some(hash),
+                Some(owner_key_id.clone()),
+                Some(hash.clone()),
                 String::new(),
                 true,
                 None,
             );
             let _ = state.store.record_audit(event);
+
+            // Fire webhook if the owner key has one configured.
+            maybe_fire_webhook(&state, Some(&owner_key_id), "secret.patched", &hash, now);
 
             let owned = updated.owner_key_id.is_some();
             let url = format!("http://localhost:7843/secret/{}", updated.hash);
@@ -598,13 +657,22 @@ pub async fn burn_secret(
         Ok(()) => {
             let event = AuditEvent::new(
                 ACTION_SECRET_BURN,
-                owner_key_id_opt,
-                Some(hash),
+                owner_key_id_opt.clone(),
+                Some(hash.clone()),
                 String::new(),
                 true,
                 None,
             );
             let _ = state.store.record_audit(event);
+
+            // Fire webhook if owner key has one configured.
+            maybe_fire_webhook(
+                &state,
+                owner_key_id_opt.as_deref(),
+                "secret.burned",
+                &hash,
+                now,
+            );
 
             StatusCode::NO_CONTENT.into_response()
         }

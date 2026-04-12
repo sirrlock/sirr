@@ -32,8 +32,10 @@ hex = "0.4"
 http = "1"
 blake3 = "1"
 ulid = "1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 [dev-dependencies]
 axum-test = "19"
 tokio = { workspace = true }
 tempfile = "3"
+wiremock = "0.6"
