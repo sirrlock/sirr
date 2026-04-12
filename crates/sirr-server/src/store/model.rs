@@ -18,6 +18,8 @@ pub struct SecretRecord {
     pub reads_remaining: Option<u32>,
     /// True once the secret has been burned (read limit hit, TTL expired, or explicit DELETE).
     pub burned: bool,
+    /// Unix seconds when the secret was burned. `None` for active secrets.
+    pub burned_at: Option<i64>,
     /// `Some(key.id)` for keyed secrets; `None` for anonymous dead-drops.
     pub owner_key_id: Option<String>,
     /// Audit metadata: IP that created the secret.
@@ -58,6 +60,7 @@ mod tests {
             ttl_expires_at: None,
             reads_remaining: None,
             burned: false,
+            burned_at: None,
             owner_key_id: None,
             created_by_ip: Some("127.0.0.1".to_string()),
         }
@@ -109,6 +112,7 @@ mod tests {
             ttl_expires_at: Some(1_712_850_000),
             reads_remaining: Some(3),
             burned: false,
+            burned_at: None,
             owner_key_id: Some("01HZ1234".to_string()),
             created_by_ip: Some("10.0.0.1".to_string()),
         };
