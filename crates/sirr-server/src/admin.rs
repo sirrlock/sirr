@@ -12,6 +12,8 @@ use serde_json::{json, Value};
 
 use crate::store::{AuditQuery, Store, Visibility};
 
+type VisibilityLock = Arc<tokio::sync::RwLock<Visibility>>;
+
 // ── Wire types ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,7 +67,11 @@ impl AdminResponse {
 
 // ── Socket listener ───────────────────────────────────────────────────────────
 
-pub fn spawn_admin_socket(store: Arc<Store>, path: PathBuf) -> tokio::task::JoinHandle<()> {
+pub fn spawn_admin_socket(
+    store: Arc<Store>,
+    visibility: VisibilityLock,
+    path: PathBuf,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Remove stale socket file if it exists.
         let _ = std::fs::remove_file(&path);
@@ -96,8 +102,9 @@ pub fn spawn_admin_socket(store: Arc<Store>, path: PathBuf) -> tokio::task::Join
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let store = store.clone();
+                    let visibility = visibility.clone();
                     tokio::spawn(async move {
-                        handle_admin_connection(stream, store).await;
+                        handle_admin_connection(stream, store, visibility).await;
                     });
                 }
                 Err(e) => {
@@ -110,7 +117,11 @@ pub fn spawn_admin_socket(store: Arc<Store>, path: PathBuf) -> tokio::task::Join
 
 // ── Connection handler ────────────────────────────────────────────────────────
 
-async fn handle_admin_connection(stream: tokio::net::UnixStream, store: Arc<Store>) {
+async fn handle_admin_connection(
+    stream: tokio::net::UnixStream,
+    store: Arc<Store>,
+    visibility: VisibilityLock,
+) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let (reader, mut writer) = stream.into_split();
@@ -122,7 +133,7 @@ async fn handle_admin_connection(stream: tokio::net::UnixStream, store: Arc<Stor
     }
 
     let resp = match serde_json::from_str::<AdminRequest>(line.trim()) {
-        Ok(req) => dispatch(req, &store),
+        Ok(req) => dispatch(req, &store, &visibility).await,
         Err(e) => AdminResponse::err(format!("invalid request: {e}")),
     };
 
@@ -142,23 +153,21 @@ async fn handle_admin_connection(stream: tokio::net::UnixStream, store: Arc<Stor
 
 // ── Command dispatch ──────────────────────────────────────────────────────────
 
-fn dispatch(req: AdminRequest, store: &Store) -> AdminResponse {
+async fn dispatch(req: AdminRequest, store: &Store, visibility: &VisibilityLock) -> AdminResponse {
     match req {
         // ── Visibility ────────────────────────────────────────────────────────
-        AdminRequest::VisibilityGet => match store.get_visibility() {
-            Ok(v) => AdminResponse::ok(json!({"mode": v.to_string()})),
-            Err(e) => AdminResponse::err(e.to_string()),
-        },
+        AdminRequest::VisibilityGet => {
+            let v = *visibility.read().await;
+            AdminResponse::ok(json!({"mode": v.to_string()}))
+        }
 
         AdminRequest::VisibilitySet { mode } => {
             let vis: Visibility = match mode.parse() {
                 Ok(v) => v,
                 Err(e) => return AdminResponse::err(e.to_string()),
             };
-            match store.set_visibility(vis) {
-                Ok(()) => AdminResponse::ok(json!({"mode": vis.to_string()})),
-                Err(e) => AdminResponse::err(e.to_string()),
-            }
+            *visibility.write().await = vis;
+            AdminResponse::ok(json!({"mode": vis.to_string()}))
         }
 
         // ── Keys ──────────────────────────────────────────────────────────────

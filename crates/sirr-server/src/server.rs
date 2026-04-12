@@ -10,6 +10,8 @@ pub struct ServerConfig {
     pub bind_addr: std::net::SocketAddr,
     pub data_dir: PathBuf,
     pub admin_socket: PathBuf,
+    pub visibility: Visibility,
+    pub retention_days: i64,
 }
 
 // ── Schema version ────────────────────────────────────────────────────────────
@@ -21,7 +23,7 @@ const CFG_SCHEMA_VERSION: &str = "schema_version";
 
 /// Seed or validate the store after opening.
 ///
-/// First boot: write schema_version and initial visibility.
+/// First boot: write schema_version.
 /// Subsequent boots: check schema_version; exit with code 1 if stale.
 fn bootstrap(store: &Store) -> anyhow::Result<()> {
     // Check for schema_version in the config table.
@@ -30,16 +32,8 @@ fn bootstrap(store: &Store) -> anyhow::Result<()> {
     match schema_ver.as_deref() {
         None => {
             // First boot — fresh database.
-            // Seed schema version.
             store.set_config_str(CFG_SCHEMA_VERSION, SCHEMA_VERSION)?;
-
-            // Seed visibility from env var (default Public).
-            let vis = initial_visibility();
-            store.set_visibility(vis)?;
-
-            tracing::info!(
-                "sirrd: fresh store initialized (schema v{SCHEMA_VERSION}, visibility={vis})"
-            );
+            tracing::info!("sirrd: fresh store initialized (schema v{SCHEMA_VERSION})");
         }
         Some(v) if v < SCHEMA_VERSION => {
             // Stale schema — fatal.
@@ -53,26 +47,11 @@ fn bootstrap(store: &Store) -> anyhow::Result<()> {
             std::process::exit(1);
         }
         Some(_) => {
-            // Normal boot — check for visibility override.
-            if std::env::var("SIRR_VISIBILITY_RESET").as_deref() == Ok("true") {
-                let vis = initial_visibility();
-                store.set_visibility(vis)?;
-                tracing::info!(
-                    "sirrd: SIRR_VISIBILITY_RESET=true — visibility overridden to {vis}"
-                );
-            }
+            // Normal boot — nothing extra to do.
         }
     }
 
     Ok(())
-}
-
-/// Read `SIRR_VISIBILITY` env var; default to `Public`.
-fn initial_visibility() -> Visibility {
-    std::env::var("SIRR_VISIBILITY")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(Visibility::Public)
 }
 
 // ── run() ─────────────────────────────────────────────────────────────────────
@@ -105,21 +84,26 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 
     let store = Arc::new(store);
 
-    // 4. Build HTTP router.
+    // 4. Build shared visibility lock (seeded from CLI flag).
+    let visibility = Arc::new(tokio::sync::RwLock::new(config.visibility));
+    tracing::info!("sirrd: visibility={}", config.visibility);
+
+    // 5. Build HTTP router.
     let state = AppState {
         store: store.clone(),
         encryption_key: Arc::new(encryption_key),
+        visibility: visibility.clone(),
     };
     let app = router(state);
 
-    // 5. Spawn admin socket task.
-    crate::admin::spawn_admin_socket(store, config.admin_socket);
+    // 6. Spawn admin socket task.
+    crate::admin::spawn_admin_socket(store, visibility, config.admin_socket);
 
-    // 6. Bind TCP listener.
+    // 7. Bind TCP listener.
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!("sirrd: HTTP listening on {}", config.bind_addr);
 
-    // 7. Serve with graceful shutdown on SIGINT/SIGTERM.
+    // 8. Serve with graceful shutdown on SIGINT/SIGTERM.
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;

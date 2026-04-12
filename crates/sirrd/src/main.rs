@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use sirr_server::admin::{AdminRequest, AdminResponse};
+use sirr_server::store::Visibility;
 use sirr_server::ServerConfig;
 
 // ── CLI structure ─────────────────────────────────────────────────────────────
@@ -27,6 +28,14 @@ enum Commands {
         data_dir: Option<String>,
         #[arg(long)]
         admin_socket: Option<String>,
+        /// Initial visibility mode: public | private | both | none (default: public).
+        /// Hot-switchable at runtime via `sirrd visibility set <mode>`.
+        /// Resets to this value on restart.
+        #[arg(long, default_value = "public")]
+        visibility: String,
+        /// Retention period in days for burned secrets and their audit events (default: 30).
+        #[arg(long, default_value = "30")]
+        retention_days: i64,
     },
     /// Get or set visibility mode
     Visibility {
@@ -125,13 +134,20 @@ async fn main() -> anyhow::Result<()> {
             bind,
             data_dir,
             admin_socket,
+            visibility,
+            retention_days,
         } => {
+            let vis: Visibility = visibility
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid visibility: {e}"))?;
             let config = ServerConfig {
                 bind_addr: bind
                     .parse()
                     .map_err(|e| anyhow::anyhow!("invalid bind address: {e}"))?,
                 data_dir: data_dir.map(PathBuf::from).unwrap_or_else(default_data_dir),
                 admin_socket: PathBuf::from(admin_socket.unwrap_or_else(default_socket_path)),
+                visibility: vis,
+                retention_days,
             };
             sirr_server::server::run(config).await?;
         }

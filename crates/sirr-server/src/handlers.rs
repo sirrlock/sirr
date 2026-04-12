@@ -29,7 +29,7 @@ use crate::store::audit::{
     ACTION_SECRET_READ,
 };
 use crate::store::crypto::EncryptionKey;
-use crate::store::{SecretRecord, Store};
+use crate::store::{SecretRecord, Store, Visibility};
 
 // ── AppState ──────────────────────────────────────────────────────────────────
 
@@ -37,6 +37,7 @@ use crate::store::{SecretRecord, Store};
 pub struct AppState {
     pub store: Arc<Store>,
     pub encryption_key: Arc<EncryptionKey>,
+    pub visibility: Arc<tokio::sync::RwLock<Visibility>>,
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -160,13 +161,7 @@ pub async fn create_secret(
 ) -> Response {
     let caller = extract_caller(&headers, &state.store);
 
-    let visibility = match state.store.get_visibility() {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("failed to read visibility: {e}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+    let visibility = *state.visibility.read().await;
 
     let now = now_secs();
     let decision = authorize(Action::Create, None, &caller, visibility, now);
@@ -219,6 +214,7 @@ pub async fn create_secret(
         ttl_expires_at,
         reads_remaining: body.reads,
         burned: false,
+        burned_at: None,
         owner_key_id,
         created_by_ip: None, // IP extraction added in Phase 4 with ConnectInfo
     };
@@ -264,13 +260,7 @@ pub async fn read_secret(
     Path(hash): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let visibility = match state.store.get_visibility() {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("failed to read visibility: {e}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+    let visibility = *state.visibility.read().await;
 
     if !visibility.allows_any_request() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -328,13 +318,7 @@ pub async fn read_secret(
 
 /// Metadata inspection. Does NOT consume a read.
 pub async fn inspect_secret(State(state): State<AppState>, Path(hash): Path<String>) -> Response {
-    let visibility = match state.store.get_visibility() {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("failed to read visibility: {e}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+    let visibility = *state.visibility.read().await;
 
     if !visibility.allows_any_request() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -422,13 +406,7 @@ pub async fn audit_secret(
 ) -> Response {
     let caller = extract_caller(&headers, &state.store);
 
-    let visibility = match state.store.get_visibility() {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("failed to read visibility: {e}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+    let visibility = *state.visibility.read().await;
 
     if !visibility.allows_any_request() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -500,13 +478,7 @@ pub async fn patch_secret(
 ) -> Response {
     let caller = extract_caller(&headers, &state.store);
 
-    let visibility = match state.store.get_visibility() {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("failed to read visibility: {e}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+    let visibility = *state.visibility.read().await;
 
     if !visibility.allows_any_request() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -592,13 +564,7 @@ pub async fn burn_secret(
 ) -> Response {
     let caller = extract_caller(&headers, &state.store);
 
-    let visibility = match state.store.get_visibility() {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("failed to read visibility: {e}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+    let visibility = *state.visibility.read().await;
 
     if !visibility.allows_any_request() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -625,7 +591,10 @@ pub async fn burn_secret(
         Caller::Anonymous => None, // anonymous secret — anyone can burn
     };
 
-    match state.store.burn_secret(&hash, owner_key_id_opt.as_deref()) {
+    match state
+        .store
+        .burn_secret(&hash, owner_key_id_opt.as_deref(), now)
+    {
         Ok(()) => {
             let event = AuditEvent::new(
                 ACTION_SECRET_BURN,

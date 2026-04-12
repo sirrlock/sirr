@@ -29,12 +29,13 @@ fn setup() -> Setup {
 fn setup_with_visibility(vis: Visibility) -> Setup {
     let dir = tempdir().unwrap();
     let store = Arc::new(Store::open(dir.path().join("test.db")).unwrap());
-    store.set_visibility(vis).unwrap();
 
     let key = Arc::new(crypto::generate_key());
+    let visibility = Arc::new(tokio::sync::RwLock::new(vis));
     let state = AppState {
         store: store.clone(),
         encryption_key: key,
+        visibility,
     };
     let server = TestServer::new(router(state));
     Setup { server, store }
