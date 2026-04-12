@@ -602,6 +602,53 @@ impl Store {
         Ok(results)
     }
 
+    // ── Generic config ────────────────────────────────────────────────────────
+
+    /// Read an arbitrary string value from the config table. Returns `None` if absent.
+    pub fn get_config_str(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let rtxn = self.db.begin_read()?;
+        let tbl = rtxn.open_table(CONFIG)?;
+        match tbl.get(key)? {
+            Some(v) => {
+                let s = String::from_utf8_lossy(v.value()).into_owned();
+                Ok(Some(s))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Write an arbitrary string value to the config table.
+    pub fn set_config_str(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut tbl = txn.open_table(CONFIG)?;
+            tbl.insert(key, value.as_bytes())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    // ── Key lookup by name ────────────────────────────────────────────────────
+
+    /// Look up a key by its operator-assigned name.
+    pub fn find_key_by_name(&self, name: &str) -> Result<Option<KeyRecord>, StoreError> {
+        let key_id = {
+            let rtxn = self.db.begin_read()?;
+            let by_name = rtxn.open_table(KEYS_BY_NAME)?;
+            match by_name.get(name)? {
+                Some(v) => v.value().to_string(),
+                None => return Ok(None),
+            }
+        };
+
+        let rtxn = self.db.begin_read()?;
+        let by_id = rtxn.open_table(KEYS_BY_ID)?;
+        match by_id.get(key_id.as_str())? {
+            Some(v) => Ok(Some(Self::decode(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
     // ── Pruning ───────────────────────────────────────────────────────────────
 
     /// Hard-delete burned secrets older than `SIRR_TOMBSTONE_RETENTION_DAYS` (default 7).
