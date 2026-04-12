@@ -201,8 +201,7 @@ async fn main() -> anyhow::Result<()> {
             // Pretty-print X-Sirr-* headers.
             for (name, value) in resp.headers() {
                 let name_str = name.as_str();
-                if name_str.starts_with("x-sirr-") {
-                    let label = &name_str["x-sirr-".len()..];
+                if let Some(label) = name_str.strip_prefix("x-sirr-") {
                     println!("{label}: {}", value.to_str().unwrap_or("?"));
                 }
             }
