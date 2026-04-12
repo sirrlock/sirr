@@ -104,7 +104,18 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 
     // 7. Bind TCP listener.
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
-    tracing::info!("sirrd: HTTP listening on {}", config.bind_addr);
+
+    // Startup banner.
+    let version = env!("CARGO_PKG_VERSION");
+    eprintln!();
+    eprintln!("  sirrd v{version}");
+    eprintln!("  listening on http://{}", config.bind_addr);
+    eprintln!("  visibility:  {}", config.visibility);
+    eprintln!();
+    eprintln!("  Tip: point the CLI at this server with:");
+    eprintln!("    export SIRR_SERVER=http://{}", config.bind_addr);
+    eprintln!("    sirr push \"my-secret\"");
+    eprintln!();
 
     // 8. Serve with graceful shutdown on SIGINT/SIGTERM.
     axum::serve(listener, app)
