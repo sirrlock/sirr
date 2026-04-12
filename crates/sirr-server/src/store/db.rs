@@ -485,6 +485,23 @@ impl Store {
         Ok((count, histogram))
     }
 
+    /// Return all secrets owned by `key_id`, including burned tombstones.
+    ///
+    /// Never returns anonymous secrets (those with `owner_key_id = None`).
+    pub fn list_secrets_by_owner(&self, key_id: &str) -> Result<Vec<SecretRecord>, StoreError> {
+        let rtxn = self.db.begin_read()?;
+        let tbl = rtxn.open_table(SECRETS)?;
+        let mut results = Vec::new();
+        for entry in tbl.iter()? {
+            let (_, v) = entry?;
+            let record: SecretRecord = Self::decode(v.value())?;
+            if record.owner_key_id.as_deref() == Some(key_id) {
+                results.push(record);
+            }
+        }
+        Ok(results)
+    }
+
     /// Burn every active secret owned by `key_id`. Returns count burned.
     pub fn purge_secrets_for_key(&self, key_id: &str) -> Result<usize, StoreError> {
         // Collect hashes to burn first (avoid mixing read + write iterators).
@@ -1363,5 +1380,63 @@ mod tests {
     #[test]
     fn extract_prefix_without_underscore() {
         assert_eq!(extract_prefix("abcdef1234"), "(unprefixed)");
+    }
+
+    // ── list_secrets_by_owner ─────────────────────────────────────────────────
+
+    #[test]
+    fn list_secrets_by_owner_returns_only_matching_records() {
+        let (store, _dir) = open_temp_store();
+        let key = generate_key();
+
+        // Two secrets for key A, one for key B, one anonymous.
+        let mut s1 = make_secret("hash_a1", &key);
+        s1.owner_key_id = Some("key_a".to_string());
+        let mut s2 = make_secret("hash_a2", &key);
+        s2.owner_key_id = Some("key_a".to_string());
+        let mut s3 = make_secret("hash_b1", &key);
+        s3.owner_key_id = Some("key_b".to_string());
+        let s4 = make_secret("hash_anon", &key); // owner_key_id = None
+
+        store.create_secret(&s1).unwrap();
+        store.create_secret(&s2).unwrap();
+        store.create_secret(&s3).unwrap();
+        store.create_secret(&s4).unwrap();
+
+        let owned_by_a = store.list_secrets_by_owner("key_a").unwrap();
+        assert_eq!(owned_by_a.len(), 2);
+        let hashes: Vec<&str> = owned_by_a.iter().map(|r| r.hash.as_str()).collect();
+        assert!(hashes.contains(&"hash_a1"));
+        assert!(hashes.contains(&"hash_a2"));
+    }
+
+    #[test]
+    fn list_secrets_by_owner_includes_burned_tombstones() {
+        let (store, _dir) = open_temp_store();
+        let key = generate_key();
+
+        let mut s = make_secret("hash_burn", &key);
+        s.owner_key_id = Some("key_x".to_string());
+        store.create_secret(&s).unwrap();
+
+        // Burn it.
+        store
+            .burn_secret("hash_burn", Some("key_x"), 1_000_001)
+            .unwrap();
+
+        let results = store.list_secrets_by_owner("key_x").unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].burned);
+    }
+
+    #[test]
+    fn list_secrets_by_owner_empty_for_unknown_key() {
+        let (store, _dir) = open_temp_store();
+        let enc_key = generate_key();
+        let record = make_secret("hash_other", &enc_key);
+        store.create_secret(&record).unwrap();
+
+        let results = store.list_secrets_by_owner("nonexistent_key").unwrap();
+        assert!(results.is_empty());
     }
 }

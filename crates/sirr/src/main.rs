@@ -71,6 +71,8 @@ enum Commands {
     },
     /// Burn a secret (delete permanently)
     Burn { hash: String },
+    /// List all secrets owned by your key (requires token)
+    List,
     /// Store authentication token
     Login,
 }
@@ -318,6 +320,53 @@ async fn main() -> anyhow::Result<()> {
                 let text = resp.text().await?;
                 eprintln!("error {status}: {text}");
                 std::process::exit(1);
+            }
+        }
+
+        // ── list ──────────────────────────────────────────────────────────────
+        Commands::List => {
+            let url = format!("{}/secrets", cli.server);
+            let req = apply_auth(client.get(&url), &cli);
+            let resp = req.send().await?;
+
+            let status = resp.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                eprintln!("not authorized — this command requires a token (sirr login or --token)");
+                std::process::exit(1);
+            }
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                eprintln!("server is in lockdown mode");
+                std::process::exit(1);
+            }
+            if !status.is_success() {
+                let text = resp.text().await?;
+                eprintln!("error {status}: {text}");
+                std::process::exit(1);
+            }
+
+            let items: Vec<Value> = resp.json().await?;
+            if items.is_empty() {
+                println!("no secrets");
+            } else {
+                println!(
+                    "{:<66}  {:>10}  {:>5}  burned",
+                    "hash", "created_at", "reads"
+                );
+                println!("{}", "-".repeat(100));
+                for item in &items {
+                    let hash = item["hash"].as_str().unwrap_or("-");
+                    let created = item["created_at"].as_i64().unwrap_or(0);
+                    let reads = item["reads_remaining"]
+                        .as_u64()
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "∞".to_string());
+                    let burned = if item["burned"].as_bool().unwrap_or(false) {
+                        "yes"
+                    } else {
+                        "no"
+                    };
+                    println!("{hash:<66}  {created:>10}  {reads:>5}  {burned}");
+                }
             }
         }
 

@@ -905,3 +905,117 @@ async fn url_in_create_response_contains_hash() {
     let url = body["url"].as_str().unwrap();
     assert!(url.contains(hash), "url should contain the hash");
 }
+
+// ── GET /secrets ──────────────────────────────────────────────────────────────
+
+/// Helper: create a secret in the store via POST and return its hash.
+async fn create_owned_secret(s: &Setup, token: &str) -> String {
+    let (name, value) = auth_header(token);
+    let resp = s
+        .server
+        .post("/secret")
+        .add_header(name, value)
+        .json(&json!({"value": "owned-secret"}))
+        .await;
+    resp.assert_status_success();
+    resp.json::<Value>()["hash"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn list_my_secrets_returns_owned_only() {
+    let s = setup_with_visibility(Visibility::Both);
+    let (_k_a, tok_a) = s.store.create_key("alice", None, None, None).unwrap();
+    let (_k_b, tok_b) = s.store.create_key("bob", None, None, None).unwrap();
+
+    let hash_a1 = create_owned_secret(&s, &tok_a).await;
+    let hash_a2 = create_owned_secret(&s, &tok_a).await;
+    let _hash_b = create_owned_secret(&s, &tok_b).await;
+
+    let (name, value) = auth_header(&tok_a);
+    let resp = s.server.get("/secrets").add_header(name, value).await;
+    resp.assert_status_success();
+
+    let items: Vec<Value> = resp.json();
+    assert_eq!(items.len(), 2, "should only see Alice's secrets");
+    let returned_hashes: Vec<&str> = items.iter().map(|v| v["hash"].as_str().unwrap()).collect();
+    assert!(returned_hashes.contains(&hash_a1.as_str()));
+    assert!(returned_hashes.contains(&hash_a2.as_str()));
+}
+
+#[tokio::test]
+async fn list_my_secrets_requires_auth() {
+    let s = setup_with_visibility(Visibility::Both);
+    let resp = s.server.get("/secrets").await;
+    resp.assert_status(StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn list_my_secrets_includes_burned() {
+    let s = setup_with_visibility(Visibility::Both);
+    let (_k, tok) = s.store.create_key("owner", None, None, None).unwrap();
+
+    let hash = create_owned_secret(&s, &tok).await;
+
+    // Burn the secret.
+    let (name, value) = auth_header(&tok);
+    s.server
+        .method(Method::DELETE, &format!("/secret/{hash}"))
+        .add_header(name, value)
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    // List should still include the burned tombstone.
+    let (name, value) = auth_header(&tok);
+    let resp = s.server.get("/secrets").add_header(name, value).await;
+    resp.assert_status_success();
+
+    let items: Vec<Value> = resp.json();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["burned"], json!(true));
+    assert!(items[0]["burned_at"].is_number());
+}
+
+#[tokio::test]
+async fn list_my_secrets_excludes_values() {
+    let s = setup_with_visibility(Visibility::Both);
+    let (_k, tok) = s.store.create_key("owner", None, None, None).unwrap();
+
+    create_owned_secret(&s, &tok).await;
+
+    let (name, value) = auth_header(&tok);
+    let resp = s.server.get("/secrets").add_header(name, value).await;
+    resp.assert_status_success();
+
+    let items: Vec<Value> = resp.json();
+    assert_eq!(items.len(), 1);
+    // Must not contain any value-related fields.
+    assert!(items[0].get("value_ciphertext").is_none());
+    assert!(items[0].get("value").is_none());
+    assert!(items[0].get("nonce").is_none());
+    assert!(items[0].get("owner_key_id").is_none());
+    assert!(items[0].get("created_by_ip").is_none());
+    // Must contain expected metadata fields.
+    assert!(items[0]["hash"].is_string());
+    assert!(items[0]["created_at"].is_number());
+    assert_eq!(items[0]["owned"], json!(true));
+}
+
+#[tokio::test]
+async fn list_my_secrets_empty_for_new_key() {
+    let s = setup_with_visibility(Visibility::Both);
+    let (_k, tok) = s.store.create_key("fresh", None, None, None).unwrap();
+
+    let (name, value) = auth_header(&tok);
+    let resp = s.server.get("/secrets").add_header(name, value).await;
+    resp.assert_status_success();
+
+    let items: Vec<Value> = resp.json();
+    assert!(items.is_empty(), "new key should have no secrets");
+}
+
+#[tokio::test]
+async fn list_my_secrets_503_when_locked() {
+    let s = setup_with_visibility(Visibility::None);
+    let resp = s.server.get("/secrets").await;
+    resp.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+}

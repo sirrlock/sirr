@@ -1,12 +1,13 @@
 //! HTTP handlers for the Sirr secret API.
 //!
-//! Five endpoints over one resource:
+//! Six endpoints over one resource:
 //!   POST   /secret              — create
 //!   GET    /secret/{hash}       — read value (consumes a read)
 //!   HEAD   /secret/{hash}       — metadata only (does NOT consume a read)
 //!   GET    /secret/{hash}/audit — audit trail (owner only)
 //!   PATCH  /secret/{hash}       — update value (owner only)
 //!   DELETE /secret/{hash}       — burn
+//!   GET    /secrets             — list all secrets owned by the calling key
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -55,6 +56,7 @@ pub fn router(state: AppState) -> Router {
                 .delete(burn_secret),
         )
         .route("/secret/{hash}/audit", get(audit_secret))
+        .route("/secrets", get(list_my_secrets))
         .with_state(state)
 }
 
@@ -681,6 +683,69 @@ pub async fn burn_secret(
         Err(crate::store::StoreError::WrongOwner) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!("burn_secret failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+// ── GET /secrets ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct SecretMetadata {
+    pub hash: String,
+    pub created_at: i64,
+    pub ttl_expires_at: Option<i64>,
+    pub reads_remaining: Option<u32>,
+    pub burned: bool,
+    pub burned_at: Option<i64>,
+    pub owned: bool,
+}
+
+pub async fn list_my_secrets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let visibility = *state.visibility.read().await;
+
+    if !visibility.allows_any_request() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "server is in lockdown mode (visibility=none)"})),
+        )
+            .into_response();
+    }
+
+    let caller = extract_caller(&headers, &state.store);
+
+    let key_id = match &caller {
+        Caller::Keyed(key) => key.id.clone(),
+        Caller::Anonymous => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "authentication required"})),
+            )
+                .into_response();
+        }
+    };
+
+    match state.store.list_secrets_by_owner(&key_id) {
+        Ok(records) => {
+            let items: Vec<SecretMetadata> = records
+                .into_iter()
+                .map(|r| SecretMetadata {
+                    hash: r.hash,
+                    created_at: r.created_at,
+                    ttl_expires_at: r.ttl_expires_at,
+                    reads_remaining: r.reads_remaining,
+                    burned: r.burned,
+                    burned_at: r.burned_at,
+                    owned: true,
+                })
+                .collect();
+            Json(items).into_response()
+        }
+        Err(e) => {
+            tracing::error!("list_secrets_by_owner failed: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
