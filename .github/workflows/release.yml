@@ -64,11 +64,17 @@ jobs:
           SIRR_BUILD_VERSION: ${{ env.VERSION }}
         run: cross build --release --bin sirrd --bin sirr --target ${{ matrix.target }}
 
-      - name: Build (cargo)
-        if: "!matrix.use_cross"
+      - name: Build (cargo) — macOS (both binaries)
+        if: "!matrix.use_cross && runner.os == 'macOS'"
         env:
           SIRR_BUILD_VERSION: ${{ env.VERSION }}
         run: cargo build --release --bin sirrd --bin sirr --target ${{ matrix.target }}
+
+      - name: Build (cargo) — Windows (sirr CLI only; sirrd requires Unix socket)
+        if: "!matrix.use_cross && runner.os == 'Windows'"
+        env:
+          SIRR_BUILD_VERSION: ${{ env.VERSION }}
+        run: cargo build --release --bin sirr --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -92,18 +98,13 @@ jobs:
           rm sirr
           (sha256sum "$SIRR_ARCHIVE" 2>/dev/null || shasum -a 256 "$SIRR_ARCHIVE") > "$SIRR_ARCHIVE.sha256"
 
-      - name: Package (Windows)
+      - name: Package (Windows — sirr CLI only)
         if: runner.os == 'Windows'
         shell: pwsh
         env:
           FRIENDLY_NAME: ${{ matrix.friendly_name }}
           TARGET: ${{ matrix.target }}
         run: |
-          $sirrdSrc = "target\$env:TARGET\release\sirrd.exe"
-          $sirrdZip = "sirrd-$env:FRIENDLY_NAME.zip"
-          Compress-Archive -Path $sirrdSrc -DestinationPath $sirrdZip
-          (Get-FileHash $sirrdZip -Algorithm SHA256).Hash.ToLower() + "  $sirrdZip" | Out-File "$sirrdZip.sha256" -Encoding ascii
-
           $sirrSrc = "target\$env:TARGET\release\sirr.exe"
           $sirrZip = "sirr-$env:FRIENDLY_NAME.zip"
           Compress-Archive -Path $sirrSrc -DestinationPath $sirrZip
@@ -405,7 +406,6 @@ jobs:
       - name: Extract sha256 hashes
         id: sha256
         run: |
-          echo "sirrd_win_x64=$(awk '{print $1}'  artifacts/sirrd-windows-x64.zip.sha256)"  >> $GITHUB_OUTPUT
           echo "sirr_win_x64=$(awk '{print $1}'   artifacts/sirr-windows-x64.zip.sha256)"   >> $GITHUB_OUTPUT
           echo "sirr_win_arm64=$(awk '{print $1}' artifacts/sirr-windows-arm64.zip.sha256)" >> $GITHUB_OUTPUT
 
@@ -419,7 +419,6 @@ jobs:
       - name: Update manifests
         env:
           VERSION:          ${{ steps.version.outputs.version }}
-          SIRRD_WIN_X64:    ${{ steps.sha256.outputs.sirrd_win_x64 }}
           SIRR_WIN_X64:     ${{ steps.sha256.outputs.sirr_win_x64 }}
           SIRR_WIN_ARM64:   ${{ steps.sha256.outputs.sirr_win_arm64 }}
         run: |
@@ -434,13 +433,7 @@ jobs:
                   f.write('\n')
               print(f"Updated {path} to v{ver}")
 
-          with open('scoop-bucket/bucket/sirrd.json') as f:
-              m = json.load(f)
-          m['version'] = ver
-          m['architecture']['64bit']['url'] = f'https://github.com/sirrlock/sirr/releases/download/v{ver}/sirrd-windows-x64.zip'
-          m['architecture']['64bit']['hash'] = os.environ['SIRRD_WIN_X64']
-          write('scoop-bucket/bucket/sirrd.json', m)
-
+          # sirrd is not shipped for Windows (requires Unix socket)
           with open('scoop-bucket/bucket/sirr.json') as f:
               m = json.load(f)
           m['version'] = ver
