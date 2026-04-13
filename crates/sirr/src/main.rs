@@ -37,7 +37,7 @@ struct Cli {
     #[arg(
         long,
         env = "SIRR_SERVER",
-        default_value = "https://sirrlock.com",
+        default_value = "https://sirr.sirrlock.com",
         global = true
     )]
     server: String,

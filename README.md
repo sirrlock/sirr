@@ -29,7 +29,7 @@ With ChatGPT, Copilot, Claude, or any AI coding tool:
 ```bash
 # Dead drop — push a one-time credential, get a URL back
 sirr push "postgres://user:pass@host/db" --reads 1 --ttl 1h
-# → https://sirrlock.com/secret/a3f8...c9d1
+# → https://sirr.sirrlock.com/secret/a3f8...c9d1
 
 # Tell Claude: "analyze the schema at this URL"
 # Claude reads it via MCP → read counter hits limit → credential deleted
@@ -188,7 +188,7 @@ Content-Type: application/json
 // 201
 {
   "hash": "db-a3f8c9d1...",
-  "url": "https://sirrlock.com/secret/db-a3f8c9d1...",
+  "url": "https://sirr.sirrlock.com/secret/db-a3f8c9d1...",
   "expires_at": 1700003600,
   "reads_remaining": 1,
   "owned": true
@@ -304,7 +304,7 @@ Claude: [calls push_secret("sk_test_...", reads=1, ttl=1800)] → returns URL
 ```python
 from sirr import SirrClient
 
-sirr = SirrClient(server="https://sirrlock.com", api_key=os.environ.get("SIRR_KEY"))
+sirr = SirrClient(server="https://sirr.sirrlock.com", api_key=os.environ.get("SIRR_KEY"))
 
 # Dead drop — push a value, get back a hash
 result = sirr.push(connection_string, reads=1, ttl=3600)
@@ -343,7 +343,7 @@ result = sirr.push(connection_string, reads=1, ttl=3600)
 
 | Variable | Default | Description |
 |---|---|---|
-| `SIRR_SERVER` | `https://sirrlock.com` | Server base URL |
+| `SIRR_SERVER` | `https://sirr.sirrlock.com` | Server base URL |
 | `SIRR_KEY` | — | Bearer API token for authenticated operations |
 
 ¹ `~/.local/share/sirr/` (Linux), `~/Library/Application Support/sirr/` (macOS). Docker: mount `/data` and set `SIRR_DATA_DIR=/data`.

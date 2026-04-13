@@ -159,7 +159,7 @@ tools/call "check_secret" {name: "FOO"}
 tools/call "share_secret" {value: "hunter2"}
 → POST https://sirrlock.com/api/public/secret
   Body: {"value": "hunter2"}
-← 200 {"key": "x9f2..."} → "Share link: https://sirrlock.com/s/x9f2... (burns after one read)"
+← 200 {"key": "x9f2..."} → "Share link: https://sirr.sirrlock.com/s/x9f2... (burns after one read)"
 ```
 
 Note: this is the only tool that makes an **external** HTTP call (to sirrlock.com). All others are internal to sirrd.
