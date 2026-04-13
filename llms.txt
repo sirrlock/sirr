@@ -59,7 +59,7 @@ Content-Type: application/json
 
 {
   "hash": "db-a3f8c9d1...",
-  "url": "https://sirrlock.com/secret/db-a3f8c9d1...",
+  "url": "https://sirr.sirrlock.com/secret/db-a3f8c9d1...",
   "expires_at": 1700003600,
   "reads_remaining": 1,
   "owned": true
@@ -168,7 +168,7 @@ SIRR_LOG_LEVEL        trace/debug/info/warn/error (default: info)
 
 ### Client (sirr)
 
-SIRR_SERVER           Server URL (default: https://sirrlock.com)
+SIRR_SERVER           Server URL (default: https://sirr.sirrlock.com)
 SIRR_KEY              Bearer API token for authenticated operations
 
 ## SDKs
