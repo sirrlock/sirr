@@ -166,6 +166,18 @@ reqwest = "0.12"    # webhook HTTP client (rustls-tls, no default features)
 wiremock = "0.6"    # dev-dependency for webhook tests
 ```
 
+## Commit Attribution
+
+**Never attribute commits to Claude, Anthropic, or any AI assistant.** This applies to every
+commit in this repo, with no exceptions:
+
+- Do **not** add `Co-Authored-By: Claude` (or any AI/assistant) trailers.
+- Do **not** add "Generated with Claude Code", 🤖 badges, or `claude.ai/code` session links.
+- Do **not** set the commit author or committer to Claude/Anthropic — commits are authored by
+  the human maintainer only.
+
+Commit messages describe the change, nothing else. No AI attribution in any form.
+
 ## Pre-Commit Checklist
 
 **After a successful build and before every commit, review and update if needed:**
